@@ -1,0 +1,23 @@
+.build/
+build/
+.swiftpm/
+*.xcodeproj/
+DerivedData/
+.signing-identity
+
+# The model eval stays on this Mac (see CLAUDE.md): cases, results, tools, and hooks
+evals/
+scripts/eval*
+Sources/IrisEval/
+Sources/IrisEngine/Engine+Eval.swift
+.claude/settings.local.json
+
+# Reference frames (the coffee zine, the notch creature) stay on this Mac: someone else's work (see DESIGN.md)
+design-reference/
+__pycache__/
+
+# Release zips from scripts/release.sh
+dist/
+
+# The private words public-copy.sh searches for (the words themselves are private)
+.public-deny

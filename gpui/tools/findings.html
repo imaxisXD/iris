@@ -1,0 +1,70 @@
+<style>
+.card{background:#fffcf9;border:1px solid #e1d9d2;padding:18px 22px;margin:18px 0;max-width:1100px}
+.card h2{font-size:17px;margin:0 0 10px}.card table{border-collapse:collapse;font-size:13px}
+.card td,.card th{padding:5px 14px 5px 0;text-align:left;vertical-align:top;border-bottom:1px solid #efe8e2}
+.card th{color:#6b5f58;font-weight:600}.card li{margin:4px 0}
+.vid{display:flex;gap:16px;align-items:flex-start}.vid img{width:540px;border:1px solid #e1d9d2}
+</style>
+
+<h1>Iris's answer panel, rebuilt in GPUI</h1>
+<p><i>These are the findings of the first trial (the answer panel alone, 17 November). Every surface the Rune copy has has since been built; <code>tools/report.py</code> makes the page that sets them all beside the Swift app.</i></p>
+
+<div class=card>
+<h2>The verdict</h2>
+<p>All 22 states of the panel draw in GPUI and match the Swift app closely: the same paper, pen lines, pink marker behind Iris's words, struck-out words, brush lettering, keycaps, tape label, brush-stroke button, red-pen notes and shadow. <b>Every state's paper is exactly as tall as Swift's</b>, to the point. Text and marks land within half a point of Swift's.</p>
+<p>The riso printing is the same Rust code the Rune port uses (ported from Swift seed for seed), so the screen dots, wobbles and bristles land where Swift puts them. GPUI handles the layout, the text (through the Mac's own text engine) and the pen lines as vector paths.</p>
+</div>
+
+<div class=card>
+<h2>Live, on the test display</h2>
+<div class=vid><img src="live.png"><div>
+<p>The live panel: a borderless floating panel that never brings Iris to the front; the app in front stayed in front through every click. Only the paper is drawn, and its shadow falls on what's underneath (shown here over dark grey).</p>
+<p>Top: Fix. Bottom: Friendly, picked with a click. The draft waits 350 ms, then the answer lands.</p>
+<p>A live window capture and GPUI's offscreen picture of the same state match on 99.6% of pixels. The only stronger difference is the 1-pixel window edge macOS draws, so the pictures below are what people would see.</p>
+</div></div>
+<div class=vid style="margin-top:14px"><img src="fly.png"><div>
+<p>The pink marker flying from Fix to Shorter, slowed 20 times so it could be caught mid-flight. It slides on the Swift panel's spring and stretches to the new word's width, as SwiftUI's matched move does.</p>
+</div></div>
+</div>
+
+<div class=card>
+<h2>Measured</h2>
+<table>
+<tr><th>What</th><th>GPUI panel</th><th>Rune panel (other thread), for scale</th></tr>
+<tr><td>App size</td><td><b>7.0 MB</b> (3.2 MB zipped), built for size, without the picture-drawing tools</td><td>14 MB (7.6 MB zipped)</td></tr>
+<tr><td>Memory, live panel (three launches, 70 tone switches, sampled every second)</td><td><b>37 to 41 MB</b> once open. About 145 MB while something moves (the marker, the waiting dots), of which about 110 MB is graphics memory GPUI holds while it draws; back to 50 to 55 MB within a second. After 50 switches it still settles at 50 MB, so nothing piles up.</td><td>55 MB when it opens, 95 MB after switching tones, a 263 MB spike while it starts. Measured by the other thread, perhaps with another tool, so compare loosely.</td></tr>
+<tr><td>Animation (same runs: about 3,000 moving frames)</td><td>About 0.5 ms of work per frame, and 1 ms or less for 95 frames in 100. A frame is due every 16.7 ms. 40 of about 3,000 were late (1.3%, up to 67 ms), nearly all at one moment: the frame where the answer lands, 0.4 s after the click.</td><td>0.4 ms a frame; 2 of 215 late</td></tr>
+<tr><td>Drawing all 22 states offscreen</td><td>About 2 seconds for all of them, with nothing on screen</td><td>-</td></tr>
+<tr><td>Accessibility</td><td>Tones are radio buttons in a "Tone" group. The answer, the keys line and "into Slack" are readable. Replace is a button. Pressing a tone through accessibility switches it.</td><td>Same</td></tr>
+<tr><td>Windows</td><td>The whole app, including GPUI's Windows support, type-checks for 64-bit Windows from this Mac. One build step was replaced with a stand-in: GPUI embeds an app manifest using Microsoft's resource compiler, which this Mac doesn't have. Nothing was built or run on Windows. GPUI's offscreen pictures exist only on Mac and Linux, and finding an app's icon is Mac-only for now (Windows would show Iris's own apps icon).</td><td>Type-checks; not run</td></tr>
+</table>
+<p>Measured on the virtual test display, which reports when frames are sent, not when they reach a screen. The panel keeps each printed picture so it never prints one twice and never throws one away. Memory with lots of different real text is not measured yet.</p>
+</div>
+
+<div class=card>
+<h2>What still differs</h2>
+<ul>
+<li><b>Half-point offsets</b>: some small-caps labels and brush words sit up to half a point higher or lower than Swift's. The difference column shows them as outlines.</li>
+<li><b>Key symbols</b> (⌘ ↵ ⇥) are set in Menlo, as the Mac does for Swift; the ⌘ prints a touch heavier.</li>
+<li><b>App icons</b> are read from the app's icon file, so they print a touch more saturated than macOS's own rendering.</li>
+<li><b>Not built yet</b>: the flower that grows by your text and unrolls the panel, Replace and Quick Fix actually pasting, hover washes, the focus ring, the press squeeze, and the panel taking keys (Tab, 1–5, Return). The keys are wired, but testing them would mean the panel taking your keyboard, so they're untested.</li>
+<li>The paper grain and the waiting dots are the same drawings caught at a different moment or offset, so the difference column shows them.</li>
+</ul>
+</div>
+
+<div class=card>
+<h2>What GPUI did well, and where it pushed back</h2>
+<ul>
+<li><b>An offscreen renderer that uses the real Metal and the Mac's text engine.</b> Every picture here was drawn that way, apart from the live captures, and it matches the live window.</li>
+<li><b>Small and quick</b>: half the size of the Rune build. Layout is boxes in rows and columns, text goes through the Mac's own text engine, and pen lines are drawn as vector paths.</li>
+<li>Five snags, each worked around in our code with no change to GPUI:
+<ol>
+<li><b>No variable-font axes.</b> Iris's Martian Mono is a variable font set narrow and at a particular weight. GPUI can't set those axes, so the app ships three fixed cuts of it (renamed, as the font's licence asks).</li>
+<li><b>No letter spacing</b>, so tracked labels are set one letter per cell.</li>
+<li><b>Nothing can be turned.</b> GPUI can't rotate text or pictures, so the bits Iris sets a degree off straight (the tape, "looks good", the red-pen notes, the app icon) are printed whole as one picture from the font outlines.</li>
+<li><b>Windows that aren't in front run at 30 frames a second</b> by default. Iris's panel is never in front, so it opts out.</li>
+<li><b>The floating panel takes the keyboard when it opens</b>, even when told not to. The real Iris panel should take Tab and Return, so that's useful later. A test panel opened beside someone's work must not, so the test panel refuses the keyboard unless asked.</li>
+</ol></li>
+<li>GPUI's last packaged release is a year old, so this pins today's Zed source. The first build downloads over 400 MB of it, and GPUI changes often, so moving to a newer version will sometimes mean fixing our code.</li>
+</ul>
+</div>
