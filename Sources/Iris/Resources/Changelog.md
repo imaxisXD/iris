@@ -21,6 +21,9 @@ When you press the shortcut, the panel opens the moment Iris has its answer, mos
 ## Messages stay on your screen
 A message beside a box near the edge of your screen, or by your pointer there, now always fits on the screen, so you can read all of it.
 
+- When Iris can't fix something, it says why at the bottom left of the panel, where "looks good" appears, so you always know where to look.
+- Typing in a window that floats above the others, like a launcher's, Iris and its messages open in front of it, never behind.
+
 # 0.4.0 · Delivered to your door
 date: 2026-11-20
 

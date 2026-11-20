@@ -624,6 +624,23 @@ pub fn red_note(note: &str, size: f32, scale: f32) -> (Div, f32) {
     (e, w)
 }
 
+/// A failed check at the panel's bottom left, where "looks good" sits: the red ring round "?"
+/// (the problem's pen mark, as on setup and the message by your text) and the note in red
+/// brush, two degrees off straight.
+pub fn problem_note(note: &str, scale: f32) -> (Div, f32) {
+    let size = 24.0;
+    let (words, ww) = red_note(note, size, scale);
+    let lh = line_box(size, BRUSH_LINE);
+    let qh = line_box(20.0, BRUSH_LINE);
+    let qw = brush_w("?", 20.0);
+    let mark = sized(24.0, 24.0)
+        .child(at(t("?", brush(20.0).line(qh), hue::RED_TEXT), (24.0 - qw) / 2.0, (24.0 - qh) / 2.0))
+        .child(at(crate::toast::brush_ring(ink::RED, 9, 24.0, 24.0, 1.0, scale), 0.0, 0.0));
+    let h = lh.max(24.0);
+    let w = 24.0 + 8.0 + ww;
+    (sized(w, h).child(at(mark, 0.0, (h - 24.0) / 2.0)).child(at(words, 32.0, (h - lh) / 2.0)), w)
+}
+
 /// `Badge(tone: .warn)`: a tinted label with a pen outline (being phased out in Swift; drawn
 /// as Swift draws it). `w` is the width it was given.
 pub fn badge(words: &str, w: f32) -> Div {

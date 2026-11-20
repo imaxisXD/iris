@@ -11,6 +11,7 @@ let package = Package(
     name: "Iris",
     platforms: [.macOS("15.0")],
     products: [
+        // The SwiftUI app: deprecated, a reference only (Iris is the GPUI app, gpui/; CLAUDE.md).
         .executable(name: "Iris", targets: ["Iris"]),
     ] + (hasEval ? [.executable(name: "iris-eval", targets: ["IrisEval"])] : []),
     dependencies: [

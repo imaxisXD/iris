@@ -167,6 +167,10 @@ fn capture(target: Option<i32>, cx: &mut App, then: impl FnOnce(Captured, &mut A
             CAPTURING.with(|c| c.set(false));
             match read {
                 Ok(mut captured) => {
+                    // What Iris shows by this box stands over its window (`host_level`).
+                    if !captured.own {
+                        crate::host_level::set_host(captured.pid);
+                    }
                     if crate::live_setup::pretend_read_only() {
                         captured.can_replace = false;
                     }
@@ -251,6 +255,11 @@ fn show_with(captured: Captured, frame: Option<[f64; 4]>, make: impl FnOnce(Capt
     let shift = ((x - nx) as f32, (y - ny) as f32);
     let origin = point(px(nx as f32), px(ny as f32));
     news(&format!("panel open: {} chars from {}", captured.text.chars().count(), captured.app_name.clone().unwrap_or_else(|| "an app".into())));
+    // Over the window that holds the box, when that stands above Iris's own level.
+    let host = (!captured.own).then_some(captured.pid);
     let h = crate::open_opening_with(origin, cx, move |cx| OpeningView { shift, ..make(captured, cx) });
+    if let (Some(h), Some(pid)) = (&h, host) {
+        let _ = h.update(cx, |_, window, _| crate::host_level::raise(window, Some(pid), frame));
+    }
     live::set_open_panel(h);
 }

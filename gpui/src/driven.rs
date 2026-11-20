@@ -616,6 +616,11 @@ pub fn practice_box() {
         let _: () = msg_send![window, setContentView: &*scroll];
         let outer: NSRect = msg_send![window, frameRectForContentRect: frame];
         let _: () = msg_send![window, setFrame: outer, display: true];
+        // A box in a window that floats above the others, as a menu bar calendar's or a
+        // launcher's does (`IRIS_PRACTICE_LEVEL`, a window level: 101 is a pop-up's).
+        if let Some(level) = std::env::var("IRIS_PRACTICE_LEVEL").ok().and_then(|l| l.parse::<isize>().ok()) {
+            let _: () = msg_send![window, setLevel: level];
+        }
         let _: () = msg_send![window, orderFrontRegardless];
         // The box has the app's focus (what Accessibility reads) without the app coming forward.
         let _: Bool = msg_send![window, makeFirstResponder: text];

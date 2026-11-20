@@ -198,6 +198,7 @@ pub fn ask(word: &str, near: Option<[f64; 4]>, cx: &mut App) {
     let word = word.to_string();
     let Ok(handle) = cx.open_window(options, |window, cx| {
         crate::no_system_shadow(window);
+        crate::host_level::raise(window, None, near);
         cx.new(|_| KeepView { word, near, born: Instant::now(), leaving: None, anim: Default::default() })
     }) else { return };
     SHOWN.with(|s| *s.borrow_mut() = Some(handle));

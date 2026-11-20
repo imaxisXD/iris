@@ -133,6 +133,7 @@ pub fn show(message: Message, note: Option<&str>, near: Option<[f64; 4]>, cx: &m
     };
     let Ok(handle) = cx.open_window(options, |window, cx| {
         crate::no_system_shadow(window);
+        crate::host_level::raise(window, None, near);
         cx.new(|_| NoteView { message, born: std::time::Instant::now(), leaving: None })
     }) else { return };
     let id = NEXT.with(|n| {

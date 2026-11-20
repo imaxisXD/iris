@@ -15,6 +15,7 @@ mod components;
 mod confirm;
 mod flow;
 mod garden;
+mod host_level;
 mod hotkey;
 mod icons;
 mod learn_words;

@@ -261,23 +261,9 @@ fn content(p: &Panel, scale: f32) -> Div {
             }
             c
         }
-        Phase::Failed(f) => red_pen_note(&p.original, &f.note, f.can_retry, scale),
+        // The draft in grey, untouched: what went wrong is the red pen at the bottom left.
+        Phase::Failed(_) => paragraph(&plain(&p.original), hue::I9, scale),
     }
-}
-
-/// `RedPenNote` for a draft longer than a word or two: the draft in grey, the note in red brush
-/// under it, curling down to Try again when another go could work.
-fn red_pen_note(draft: &str, note: &str, can_retry: bool, scale: f32) -> Div {
-    let (note_el, _) = red_note(note, 25.0, scale);
-    let mut line = div().flex().flex_row().items_end().gap(z(6.0)).w(z(TEXT_W));
-    if can_retry {
-        let arrow = div().relative().top(z(10.0))
-            .child(drawn(26.0, 22.0, crate::pen::hand_arrow_down(26.0, 22.0), Some(1.7), col(riso::ink::RED)));
-        line = line.justify_end().pr(z(48.0)).child(note_el).child(arrow);
-    } else {
-        line = line.child(note_el);
-    }
-    div().flex().flex_col().gap(z(2.0)).child(paragraph(&plain(draft), hue::I9, scale)).child(line)
 }
 
 // MARK: - The bottom row
@@ -338,6 +324,7 @@ fn footer(p: &Panel, look: &Look) -> Div {
             Some(done_note(&w, 20.0, scale))
         }
         Note::LooksGood => Some(looks_good(scale)),
+        Note::Problem(words) => Some(problem_note(words, scale)),
         Note::Keys { next_tone, try_again } => {
             let mut r = div().flex().flex_row().flex_none().gap(z(12.0));
             let mut w = 0.0;
@@ -374,6 +361,11 @@ fn footer(p: &Panel, look: &Look) -> Div {
     let mut fixed = 0.0;
     if let Some((_, w)) = &fixed_note { fixed += w; children += 1; }
     if let Some((_, w)) = &button { fixed += w; children += 1; }
+    // Tab's hint at the right when a failed check offers no Try again: with it, the row is the
+    // note and the one button, whatever the note's length.
+    let hint_w = key_hint_w("⇥", "Next tone");
+    let hint = f.next_tone && button.is_none();
+    if hint { fixed += hint_w; children += 1; }
     children += 1; // the spacer
     let mut flex: Vec<(usize, f32, f32)> = Vec::new(); // (which, natural, fixed part)
     if let Some(words) = badge_words {
@@ -434,6 +426,9 @@ fn footer(p: &Panel, look: &Look) -> Div {
         r = r.child(div().flex().flex_row().flex_none().items_center().child(tape)
             .id("app").role(Role::Label).aria_label(spoken));
     }
+    if hint {
+        r = r.child(div().id("next-tone").role(Role::Label).aria_label("Tab for the next tone").child(key_hint("⇥", "Next tone", scale)));
+    }
     if let Some((b, _)) = button {
         let (title, keys) = match f.action {
             Action::TryAgain => ("Try again", "Command+R"),
@@ -455,7 +450,6 @@ fn spoken(p: &Panel) -> String {
     match &p.phase {
         Phase::Done(a) => a.text.clone(),
         Phase::Generating(partial) if !partial.is_empty() => partial.clone(),
-        Phase::Failed(f) => format!("{}. Your text wasn't changed.", f.note),
         _ => p.original.clone(),
     }
 }
@@ -466,6 +460,7 @@ fn note_words(n: &Note) -> String {
         Note::Copied => "copied".into(),
         Note::Retry(r) => r.clone(),
         Note::LooksGood => "Looks good, nothing to fix".into(),
+        Note::Problem(words) => format!("{words}. Your text wasn't changed."),
         Note::Keys { next_tone, try_again } => {
             let mut v = Vec::new();
             if *next_tone { v.push("Tab for the next tone"); }

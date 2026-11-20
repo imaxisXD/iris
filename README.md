@@ -137,7 +137,7 @@ The signing step gives your builds a stable identity, so the Accessibility permi
 
 ## For developers
 
-Iris is two programs in one app. Its interface is written in Rust with [GPUI](https://www.gpui.rs) (`gpui/`): the panel, the menu bar slip, setup, Settings and every message, the shortcuts, reading and pasting text. The model runs in a small Swift helper beside it (`gpui/brain`), which is the Swift engine below; the two talk in lines of JSON. The earlier SwiftUI interface (`Sources/Iris`) is kept for the checks that still drive it.
+Iris is two programs in one app. Its interface is written in Rust with [GPUI](https://www.gpui.rs) (`gpui/`): the panel, the menu bar slip, setup, Settings and every message, the shortcuts, reading and pasting text. The model runs in a small Swift helper beside it (`gpui/brain`), which is the Swift engine below; the two talk in lines of JSON. The earlier SwiftUI interface (`Sources/Iris`) is deprecated: it gets no changes and is kept only as a reference until it's removed.
 
 | Part | What it does |
 |---|---|

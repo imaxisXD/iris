@@ -8,6 +8,9 @@
 //! - "rewrite all of this": Fix comes back as a different sentence (a big rewrite);
 //! - text with none of those: Fix finds nothing to change ("looks good");
 //! - a draft mostly in another language: it comes back marked as translated, with no verdict;
+//! - one letter: the check fails as the model's does on it ("just one letter? give me a
+//!   sentence", no Try again), and a draft with "take too long" in it runs out of time ("ran
+//!   out of time. one more go?", with Try again), so a failed check can be driven too;
 //! - any tone: the fixed text with the tone's name in front, so every tone has something to paste.
 //!
 //! The brain is never started (`brain::start`): its entity is seeded as a Mac that has finished
@@ -28,6 +31,7 @@ pub const DELAY: Duration = Duration::from_millis(350);
 
 pub const FIXES: [(&str, &str); 5] = [("i have", "I have"), ("its look", "it looks"), ("need to", "needs to"), ("teh ", "the "), ("recieve", "receive")];
 pub const REWRITE_CUE: &str = "rewrite all of this";
+pub const TIMEOUT_CUE: &str = "take too long";
 const REWRITTEN: &str = "Here is a completely different sentence that says the same thing in other words.";
 /// Drafts in another language the stand-in can "translate", so a translated answer reads as one.
 const TRANSLATIONS: [(&str, &str); 1] = [("bhai order kal tak aa jayega, customer ko bol do", "The order will arrive by tomorrow, please tell the customer.")];
@@ -74,10 +78,28 @@ pub fn answer_later(id: i64, text: &str, mode: &Mode) {
     let (text, mode) = (text.to_string(), mode.clone());
     acx.clone().foreground_executor().spawn(async move {
         acx.background_executor().timer(DELAY).await;
+        if let Some(p) = failure(&text) {
+            let _ = acx.update(|cx| brain::deliver(id, Event::Failed(p), cx));
+            return;
+        }
         let foreign = looks_non_english(&text);
         let (a, changed) = answer(&text, &mode, foreign);
         let _ = acx.update(|cx| brain::deliver(id, Event::Finished(a, changed), cx));
     }).detach();
+}
+
+/// A check that fails, in the words the model's failures have (`ProblemNote`), or none.
+pub fn failure(text: &str) -> Option<brain::Problem> {
+    let read = text.trim();
+    let (note, lead, detail, can_retry, circled) = if read.chars().count() == 1 {
+        ("just one letter? give me a sentence", "too short to rewrite",
+         format!("Iris read \u{201C}{read}\u{201D}, which is too short to rewrite. Your text wasn't changed."), false, true)
+    } else if read.to_lowercase().contains(TIMEOUT_CUE) {
+        ("ran out of time. one more go?", "ran out of time", "Iris stopped and left your text alone. Try again.".into(), true, false)
+    } else {
+        return None;
+    };
+    Some(brain::Problem { note: note.into(), lead: lead.into(), detail, can_retry, circled, check_failed: true })
 }
 
 /// The canned answer for `text` in `mode` (`MockAnswers.answer`), and how many words it changed.

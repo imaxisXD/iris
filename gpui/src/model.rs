@@ -211,6 +211,8 @@ pub enum Note {
     Copied,
     Retry(String),
     LooksGood,
+    /// A failed check, in the red pen where "looks good" sits (`ProblemNote.note`).
+    Problem(String),
     Translated,
     BigRewrite,
     Keys { next_tone: bool, try_again: bool },
@@ -238,6 +240,8 @@ pub struct Footer {
     pub note: Note,
     pub app: Option<AppLabel>,
     pub action: Action,
+    /// Tab's hint at the right: a failed check's note has the left.
+    pub next_tone: bool,
 }
 
 impl Panel {
@@ -285,12 +289,13 @@ impl Panel {
             } else {
                 Note::Keys { next_tone: tones > 1, try_again: true }
             }
-        } else if matches!(self.phase, Phase::Failed(_)) {
-            Note::Keys { next_tone: tones > 1, try_again: false }
+        } else if let Phase::Failed(f) = &self.phase {
+            Note::Problem(f.note.to_string())
         } else {
             Note::None
         };
-        Footer { note, app, action }
+        let next_tone = matches!(note, Note::Problem(_)) && tones > 1;
+        Footer { note, app, action, next_tone }
     }
 }
 
@@ -361,7 +366,22 @@ pub fn states() -> Vec<State> {
         s(&format!("{tone} · after ⌘R, came out the same"),
           Panel { retry_note: Some("Came out the same".into()), ..toned(base(original, friendly_done())) }),
         s(&format!("{tone} · failed, can try again"), toned(base(original, Phase::Failed(TIMED_OUT)))),
+        // Every other way a check fails (`ProblemNote`), each in the red pen at the bottom left.
+        s("Fix · too short", base("examples pls", failed("too short. give me a sentence", false))),
+        s(&format!("{tone} · too short"), toned(base("examples pls", failed("too short. give me a sentence", false)))),
+        s("Fix · one letter", base("k", failed("just one letter? give me a sentence", false))),
+        s("Fix · nothing in the box", base("", failed("nothing here to rewrite", false))),
+        s("Fix · couldn't make sense of it", base(original, failed("couldn't make sense of this. one more go?", true))),
+        s("Fix · came back empty", base(original, failed("came back empty. one more go?", true))),
+        s("Fix · dropped a name or link", base(original, failed("dropped a name or link. one more go?", true))),
+        s("Fix · no room for the model", base(original, failed("no room for my model on this mac", false))),
+        s("Fix · no internet for the model", base(original, failed("no internet for my model. one more go?", true))),
+        s("Fix · couldn't finish", base(original, failed("couldn't finish that. one more go?", true))),
     ]
+}
+
+fn failed(note: &'static str, can_retry: bool) -> Phase {
+    Phase::Failed(Failure { note: std::borrow::Cow::Borrowed(note), can_retry })
 }
 
 #[cfg(test)]
@@ -388,12 +408,14 @@ mod tests {
     #[test]
     fn every_state_shows_what_the_swift_check_expects() {
         let s = states();
-        assert_eq!(s.len(), 22);
+        assert_eq!(s.len(), 32);
         let f = s[8].panel.footer();
         assert_eq!((f.note, f.action), (Note::LooksGood, Action::Done));
         assert_eq!(f.app, Some(AppLabel::NothingToChange("Slack".into())));
         let f = s[11].panel.footer();
-        assert_eq!((f.note, f.action), (Note::Keys { next_tone: true, try_again: false }, Action::TryAgain));
+        assert_eq!((f.note, f.action, f.next_tone), (Note::Problem("ran out of time. one more go?".into()), Action::TryAgain, true));
+        let f = s[22].panel.footer();
+        assert_eq!((f.note, f.action, f.app), (Note::Problem("too short. give me a sentence".into()), Action::None, None));
         assert_eq!(s[5].panel.footer().note, Note::BigRewrite);
         assert_eq!(s[4].panel.footer().action, Action::Copy);
     }

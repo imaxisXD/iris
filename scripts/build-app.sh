@@ -16,11 +16,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$ROOT/scripts/lib.sh"
 # Iris is the GPUI app now (gpui/: its UI in Rust, the Swift engine as its brain). This script
 # builds it as build/Iris.app, for update.sh, ship.sh and release.sh alike. IRIS_SWIFT_APP=1
-# builds the earlier SwiftUI app instead (the checks that still drive it: self-check.sh,
-# panel-check.sh).
+# builds the earlier SwiftUI app instead, which is deprecated (CLAUDE.md): a reference only, for
+# the checks that still drive it (self-check.sh, panel-check.sh).
 if [[ -z "${IRIS_SWIFT_APP:-}" ]]; then
   exec "$ROOT/gpui/scripts/build-app.sh" --as-iris
 fi
+echo "warning: the SwiftUI app (Sources/Iris) is deprecated. Iris is the GPUI app (gpui/); this builds the old one, as a reference only." >&2
 CONFIG="${CONFIG:-Release}"
 DERIVED="$ROOT/.build/xcode"
 PRODUCTS="$DERIVED/Build/Products/$CONFIG"
