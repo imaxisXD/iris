@@ -77,6 +77,12 @@ pub struct Settings {
     pub idle_minutes: u32,
     pub load_at_launch: bool,
     pub onboarded: bool,
+    /// How many times the flower has arrived on this Mac (`BudShow`'s `budArrivals`), for
+    /// `opening::arrival_is_full`; none: not counted here yet (the Swift app's count is used).
+    pub bud_arrivals: Option<u32>,
+    /// The start of the day it last arrived, in seconds since 1970 (`budLastDay`, as Swift
+    /// stored it: local midnight).
+    pub bud_last_day: Option<f64>,
 }
 
 /// Whether this is the Iris people install (`local.iris.app`), not a development build. A
@@ -113,6 +119,8 @@ impl Default for Settings {
             idle_minutes: 30,
             load_at_launch: true,
             onboarded: false,
+            bud_arrivals: None,
+            bud_last_day: None,
         }
     }
 }
@@ -164,6 +172,17 @@ impl Settings {
     }
 }
 
+/// The Swift app's count of the flower's arrivals and the day of the last one, for an Iris
+/// that moved over before it counted them itself (its settings came along without them).
+pub fn swift_bud_arrivals() -> (Option<u32>, Option<f64>) {
+    if !is_installed_iris() || std::env::var("IRIS_HOME").is_ok() {
+        return (None, None);
+    }
+    swift_preferences("local.iris.app")
+        .and_then(swift_shapes)
+        .map_or((None, None), |s| (s.bud_arrivals, s.bud_last_day))
+}
+
 /// The settings the Swift app kept in its preferences (`AppSettings`, domain `local.iris.app`),
 /// in this app's shapes: the same names (the glossary was `glossaryList`), its JSON blobs (the
 /// shortcuts, custom tones, per-app tones, the apps Iris is off in) read as JSON. None when
@@ -180,6 +199,14 @@ pub fn swift_shapes(mut stored: serde_json::Map<String, Value>) -> Option<Settin
     }
     if let Some(g) = stored.remove("glossaryList") {
         stored.insert("glossary".into(), g);
+    }
+    // The flower's count and day are bookkeeping: one that doesn't read as a count or a time
+    // is left behind, never the reason the rest can't come along.
+    if stored.get("budArrivals").is_some_and(|v| v.as_u64().is_none_or(|n| n > u32::MAX as u64)) {
+        stored.remove("budArrivals");
+    }
+    if stored.get("budLastDay").is_some_and(|v| !v.is_number()) {
+        stored.remove("budLastDay");
     }
     // An explicit "no Quick Fix shortcut" is stored as JSON null; nothing stored is the default.
     let mut s: Settings = serde_json::from_value(Value::Object(stored.clone())).ok()?;
@@ -199,7 +226,7 @@ fn swift_preferences(domain: &str) -> Option<serde_json::Map<String, Value>> {
     let app = CFString::new(domain);
     let keys = ["placement", "showPanelWhenClean", "showChanges", "hiddenNotes", "openShortcut", "quickFixShortcut",
                 "customTones", "toneOrder", "hiddenTones", "defaultMode", "appModes", "styleRules", "glossaryList",
-                "excludedApps", "model", "idleMinutes", "loadAtLaunch", "onboarded"];
+                "excludedApps", "model", "idleMinutes", "loadAtLaunch", "onboarded", "budArrivals", "budLastDay"];
     let mut out = serde_json::Map::new();
     for key in keys {
         let k = CFString::new(key);
@@ -325,6 +352,11 @@ mod tests {
         assert_eq!(s.idle_minutes, 60);
         assert_eq!(s.excluded_apps[0].bundle_id, "com.example");
         // Nothing stored about Quick Fix: its default keys.
+        // The flower's count comes along; one that isn't a count is left behind, never the rest.
+        let s = swift_shapes(serde_json::from_str(r#"{"onboarded": true, "budArrivals": 101, "budLastDay": 1794940200}"#).unwrap()).unwrap();
+        assert_eq!((s.bud_arrivals, s.bud_last_day), (Some(101), Some(1794940200.0)));
+        let s = swift_shapes(serde_json::from_str(r#"{"onboarded": true, "budArrivals": -3, "budLastDay": "x"}"#).unwrap()).unwrap();
+        assert!(s.onboarded && s.bud_arrivals.is_none() && s.bud_last_day.is_none());
         let s = swift_shapes(serde_json::from_str(r#"{"onboarded": true}"#).unwrap()).unwrap();
         assert_eq!(s.quick_fix_shortcut, Settings::default().quick_fix_shortcut);
     }

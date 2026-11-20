@@ -22,6 +22,7 @@ thread_local! {
 /// The open shortcut: the panel for the text box you're in (`target`, under test: the app a
 /// test named). Pressed again while the panel is open, it puts the panel away.
 pub fn open_panel(target: Option<i32>, cx: &mut App) {
+    crate::live::pressed();
     if let Some(h) = live::open_panel()
         && h.update(cx, |v, window, cx| v.key("escape", window, cx)).is_ok()
     {
@@ -39,6 +40,7 @@ pub fn open_panel(target: Option<i32>, cx: &mut App) {
 /// The Quick Fix shortcut: Fix, pasted in place when that's certainly what you meant
 /// (`QuickFixLanding`); the panel when a person should look; a message otherwise.
 pub fn quick_fix(target: Option<i32>, cx: &mut App) {
+    crate::live::pressed();
     if !crate::live_setup::can_check(cx) {
         return crate::live_setup::show(cx);
     }

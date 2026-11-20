@@ -29,6 +29,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 unicode-segmentation = "1"
 raw-window-handle = "0.6"
+# The flower's arrival: the local day (the first one each day is full) and its now-and-then roll.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+fastrand = "2"
 
 # Zed's own patches of crates GPUI uses (a git dependency doesn't inherit them).
 [patch.crates-io]

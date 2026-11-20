@@ -12,6 +12,15 @@ date: <YYYY-MM-DD>
 - <a small thing, also in this version>
 -->
 
+# 0.4.1 · Right there
+date: 2026-11-20
+
+## The panel opens as soon as the answer is ready
+When you press the shortcut, the panel opens the moment Iris has its answer, most times about a second sooner. The flower's full arrival plays your first few times, the first time each day and now and then after that, so it stays a treat instead of a wait.
+
+## Messages stay on your screen
+A message beside a box near the edge of your screen, or by your pointer there, now always fits on the screen, so you can read all of it.
+
 # 0.4.0 · Delivered to your door
 date: 2026-11-20
 

@@ -79,6 +79,8 @@ pub fn show(message: Message, note: Option<&str>, near: Option<[f64; 4]>, cx: &m
     }
     let (w, h) = toast::size(&message);
     let (ww, wh) = (w + 2.0 * PAD, h + 2.0 * PAD);
+    // The point the message belongs to: the box, or the pointer. Its screen keeps it in view.
+    let pointer = if near.is_none() && !crate::textbridge::under_test() { Some(crate::menubar::pointer()) } else { None };
     let origin = match near {
         // Its right edge 14 past the box's, its bottom 4 into the box's top.
         Some([x, y, bw, _]) => (x + bw - ww as f64 + PAD as f64, y + 4.0 - wh as f64),
@@ -88,11 +90,27 @@ pub fn show(message: Message, note: Option<&str>, near: Option<[f64; 4]>, cx: &m
             (x - ww as f64 / 2.0, y - wh as f64 / 2.0)
         }
         None => {
-            let (px_, py) = crate::menubar::pointer();
+            let (px_, py) = pointer.unwrap_or_default();
             (px_ - ww as f64 / 2.0, py - 8.0 - wh as f64)
         }
     };
     let origin = (origin.0, origin.1.max(25.0));
+    // Kept on its screen sideways too: beside a narrow box near the screen's edge, or by the
+    // pointer there, most of it fell off the screen (seen on a Mac and on Windows). Its shadow's
+    // margin may hang over the edge, never the paper.
+    let anchor = match (near, pointer) {
+        (Some([x, y, bw, bh]), _) => Some((x + bw / 2.0, y + bh / 2.0)),
+        (None, Some(p)) => Some(p),
+        _ => None,
+    };
+    let origin = match anchor {
+        Some((ax, ay)) => {
+            let [vx, _, vw, _] = crate::visible_frame_at(ax, ay);
+            let (lo, hi) = (vx - PAD as f64, vx + vw - ww as f64 + PAD as f64);
+            (if hi > lo { origin.0.clamp(lo, hi) } else { origin.0 }, origin.1)
+        }
+        None => origin,
+    };
     // Under test nothing opens on someone's screen: a place off the test display becomes its middle.
     let origin = match crate::test_display() {
         Some((dx, dy)) if crate::textbridge::under_test() && !crate::on_test_display(origin.0, origin.1) => {

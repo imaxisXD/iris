@@ -38,8 +38,13 @@ const FOLDED: (f32, f32, f32) = (0.22, 0.04, -4.0);
 
 #[derive(Clone, Copy)]
 pub struct Script {
+    /// The full arrival (the drop and its splash) or the quick one (`arrival_is_full`).
     pub full: bool,
+    /// When the answer came, so the flower opened (`f64::INFINITY`: not yet).
     pub bloom: f64,
+    /// When there was something else to read with the flower still shut: a failure, or the
+    /// model waking up (`f64::INFINITY`: not yet). The panel unrolls for it without a bloom.
+    pub readable: f64,
     /// When the panel went: Replace pressed (`replaced`), or put away (Escape, a click away).
     pub replace: f64,
     pub replaced: bool,
@@ -47,10 +52,10 @@ pub struct Script {
     pub backdrop: bool,
 }
 
-pub const FULL: Script = Script { full: true, bloom: 0.9, replace: 3.0, replaced: true, backdrop: true };
+pub const FULL: Script = Script { full: true, bloom: 0.9, readable: f64::INFINITY, replace: 3.0, replaced: true, backdrop: true };
 /// Put away (Escape) instead of replaced: the panel folds back into the flower.
-pub const AWAY: Script = Script { full: true, bloom: 0.9, replace: 3.0, replaced: false, backdrop: true };
-pub const QUICK: Script = Script { full: false, bloom: 0.5, replace: 2.2, replaced: true, backdrop: true };
+pub const AWAY: Script = Script { full: true, bloom: 0.9, readable: f64::INFINITY, replace: 3.0, replaced: false, backdrop: true };
+pub const QUICK: Script = Script { full: false, bloom: 0.5, readable: f64::INFINITY, replace: 2.2, replaced: true, backdrop: true };
 
 /// The panel the moment opens on: the stand-in draft, fixed.
 pub fn panel_state() -> Panel {
@@ -182,12 +187,57 @@ pub fn set_below(below: bool) {
     BELOW.set(below);
 }
 
+/// How long the flower stands alone before the panel may open (`PanelMotion.budMoment`): its
+/// whole arrival when it plays in full, a moment when it's the quick one.
+pub fn bud_moment(full: bool) -> f64 {
+    if full { 0.6 } else { 0.1 }
+}
+
+/// After the flower opens, the paper follows this much later (`PanelMotion.afterBloom`).
+pub fn after_bloom(full: bool) -> f64 {
+    if full { 0.26 } else { 0.06 }
+}
+
+/// A slow answer still unfolds the panel (and streams into it) this long after the press
+/// (`PanelMotion.unfoldAnyway`).
+pub const UNFOLD_ANYWAY: f64 = 1.1;
+
+/// When the panel starts to unroll (`PanelController.unfold` with `PanelMotion.unrollDelay`): as
+/// soon as there's something to read, never before the flower has had its moment, and a beat
+/// after it blooms, so you see bud, bloom, panel; a slow answer at `UNFOLD_ANYWAY`. Each thing to
+/// read before the panel has opened puts the opening off or brings it closer, as Swift's
+/// `unfold()` cancels the one it had planned; one that comes after it has opened changes nothing,
+/// so the answer can be worked out at any moment from what has happened so far.
+pub fn unfold_at(script: &Script) -> f64 {
+    let mut at = UNFOLD_ANYWAY;
+    let mut events = [(script.readable, false), (script.bloom, true)];
+    events.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (when, blooms) in events {
+        if when >= at {
+            break;
+        }
+        at = when.max(bud_moment(script.full)) + if blooms { after_bloom(script.full) } else { 0.0 };
+    }
+    at
+}
+
+/// Whether the flower plays its full arrival (the drop and its splash) or the quick one
+/// (`BudArrival.isFull`): the first five times ever, the first time each day, and now and then
+/// after that (`roll` is 0 about one time in `ARRIVAL_NOW_AND_THEN`), so it stays a treat
+/// instead of a wait. `arrivals`: how many there have been before this one.
+pub fn arrival_is_full(arrivals: u32, first_today: bool, roll: u32) -> bool {
+    arrivals < ARRIVAL_FIRST_FULL || first_today || roll == 0
+}
+
+/// How many arrivals are always full (`BudArrival.firstFull`).
+pub const ARRIVAL_FIRST_FULL: u32 = 5;
+/// After those, about one in this many is full anyway (`BudArrival.nowAndThen`).
+pub const ARRIVAL_NOW_AND_THEN: u32 = 15;
+
 /// How far the panel has unrolled at `t` (0 folded … 1 open, overshooting a little), and how
 /// solid it is. Replace closes it at once; put away, it folds back down into the flower.
 pub fn unroll(t: f64, script: &Script) -> (f64, f64) {
-    let after_bloom = if script.full { 0.26 } else { 0.06 };
-    let moment = if script.full { 0.6 } else { 0.1 };
-    let unroll_at = script.bloom + (moment - script.bloom).max(0.0) + after_bloom;
+    let unroll_at = unfold_at(script);
     if t < script.replace {
         (curve::spring(t - unroll_at, 0.34, 0.14), curve::ease_out((t - unroll_at) / 0.07))
     } else if script.replaced {
@@ -312,5 +362,46 @@ mod tests {
         let ((x, _), _) = screen_place(Some([0.0, 25.0, 1728.0, 1000.0]), false, false, (900.0, 500.0), SCREEN, 200.0);
         assert!(x + BOX.0 as f64 > 900.0);
         set_below(false);
+    }
+
+    /// The moment so far, as the live panel builds it: arrival, answer, something else to read.
+    fn so_far(full: bool, bloom: Option<f64>, readable: Option<f64>) -> super::Script {
+        super::Script { full, bloom: bloom.unwrap_or(f64::INFINITY), readable: readable.unwrap_or(f64::INFINITY),
+                        replace: f64::INFINITY, replaced: false, backdrop: false }
+    }
+
+    #[test]
+    fn the_panel_unrolls_when_there_is_something_to_read() {
+        use super::{UNFOLD_ANYWAY, after_bloom, bud_moment, unfold_at};
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // The quick arrival with an answer in 0.35 s: a beat after the bloom, not a second later.
+        assert!(close(unfold_at(&so_far(false, Some(0.35), None)), 0.35 + after_bloom(false)));
+        // An answer at once still lets the flower have its moment: the quick one, and the full one.
+        assert!(close(unfold_at(&so_far(false, Some(0.0), None)), bud_moment(false) + after_bloom(false)));
+        assert!(close(unfold_at(&so_far(true, Some(0.0), None)), 0.6 + 0.26));
+        // The design frames (bloom at 0.9) unroll where they always have.
+        assert!(close(unfold_at(&super::FULL), 1.16) && close(unfold_at(&super::QUICK), 0.56));
+        // The model waking up: the panel opens after the flower's moment to say so, no bloom.
+        assert!(close(unfold_at(&so_far(false, None, Some(0.0))), bud_moment(false)));
+        assert!(close(unfold_at(&so_far(true, Some(3.0), Some(0.0))), bud_moment(true)));
+        // A failure, the flower shut.
+        assert!(close(unfold_at(&so_far(false, None, Some(0.4))), 0.4));
+        // Nothing yet: a slow answer unfolds anyway, and one that comes after changes nothing.
+        assert!(close(unfold_at(&so_far(false, None, None)), UNFOLD_ANYWAY));
+        assert!(close(unfold_at(&so_far(true, Some(1.5), None)), UNFOLD_ANYWAY));
+        // An answer just before then puts it off to a beat after the bloom (Swift's unfold()
+        // cancels the slow-answer one it had planned).
+        assert!(close(unfold_at(&so_far(true, Some(1.0), None)), 1.0 + after_bloom(true)));
+    }
+
+    #[test]
+    fn the_full_arrival_stays_a_treat() {
+        use super::arrival_is_full;
+        // The first five ever are full, whatever the day or the roll.
+        assert!((0..5).all(|n| arrival_is_full(n, false, 7)));
+        // After that: the first each day, or the roll's one in fifteen.
+        assert!(!arrival_is_full(5, false, 7));
+        assert!(arrival_is_full(101, true, 7));
+        assert!(arrival_is_full(101, false, 0));
     }
 }

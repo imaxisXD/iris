@@ -153,11 +153,58 @@ pub struct OpeningView {
     pub anim: Rc<std::cell::RefCell<crate::interact::Anim>>,
     /// Where the drawing sits in its window: moved when the window was kept on the screen.
     pub shift: (f32, f32),
+    /// When the shortcut that opened it was pressed, until the panel has started to unroll
+    /// (then it's said, for tests and `IRIS_NEWS`: how long a press takes to show something).
+    pub pressed: Option<Instant>,
+    /// This arrival plays in full (`next_arrival`) or quick.
+    pub full: bool,
+    /// When the answer came and the flower opened, in seconds into the moment.
+    pub bloomed: Option<f64>,
+    /// When there was first something else to read with the flower shut: a failure, or the
+    /// model waking up.
+    pub readable: Option<f64>,
 }
 
 thread_local! {
+    /// When the open or Quick Fix shortcut was last pressed (`pressed`).
+    static PRESSED: Cell<Option<Instant>> = const { Cell::new(None) };
     /// The panel that's open, for a second press of the shortcut and for tests' keys.
     static OPEN: std::cell::RefCell<Option<WindowHandle<OpeningView>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether this arrival of the flower plays in full (`BudShow.next`), counted on this Mac: the
+/// first five ever, the first each day, and now and then after (`opening::arrival_is_full`).
+/// An Iris that moved over from the Swift app carries on from that app's count.
+pub fn next_arrival() -> bool {
+    let s = crate::app::settings();
+    let (count, last_day) = match s.bud_arrivals {
+        Some(n) => (n, s.bud_last_day),
+        None => {
+            let (n, day) = crate::store::swift_bud_arrivals();
+            (n.unwrap_or(0), day)
+        }
+    };
+    let today = local_midnight();
+    let first_today = last_day != Some(today);
+    crate::app::change(|s| {
+        s.bud_arrivals = Some(count.saturating_add(1));
+        s.bud_last_day = Some(today);
+    });
+    opening::arrival_is_full(count, first_today, fastrand::u32(0..opening::ARRIVAL_NOW_AND_THEN))
+}
+
+/// The start of today here, in seconds since 1970 (`Calendar.current.startOfDay`).
+fn local_midnight() -> f64 {
+    use chrono::{Local, TimeZone};
+    let now = Local::now();
+    let midnight = now.date_naive().and_hms_opt(0, 0, 0).expect("midnight");
+    // A day that starts in a clock change has no 00:00; its first moment is the next one.
+    Local.from_local_datetime(&midnight).earliest().map_or(now.timestamp(), |m| m.timestamp()) as f64
+}
+
+/// A shortcut was pressed: the panel it opens says how long it took to unroll.
+pub fn pressed() {
+    PRESSED.with(|p| p.set(Some(Instant::now())));
 }
 
 /// The open panel, if there is one.
@@ -187,9 +234,12 @@ pub fn news(s: &str) {
 impl OpeningView {
     pub fn new(cx: &mut Context<Self>) -> OpeningView {
         let mut v = OpeningView::new_blank(cx);
-        // With the brain running, the panel opens on the real answer for its draft.
+        // With the brain running, the panel opens on the real answer for its draft; without
+        // it, on the stand-in's, the flower opening as the design frames have it.
         if crate::brain::get(cx).is_some() {
             v.ask(0, false, cx);
+        } else {
+            v.bloomed = Some(opening::FULL.bloom);
         }
         v
     }
@@ -208,6 +258,10 @@ impl OpeningView {
             captured: None,
             anim: Default::default(),
             shift: (0.0, 0.0),
+            pressed: PRESSED.with(|p| p.take()),
+            full: true,
+            bloomed: None,
+            readable: None,
         }
     }
 
@@ -220,6 +274,7 @@ impl OpeningView {
         v.panel.can_replace = captured.can_replace;
         v.panel.selected = starting;
         v.captured = Some(captured);
+        v.full = next_arrival();
         v.ask(starting, false, cx);
         v
     }
@@ -234,6 +289,8 @@ impl OpeningView {
         v.panel.selected = 0;
         v.panel.phase = Phase::Done(answer);
         v.captured = Some(captured);
+        v.full = next_arrival();
+        v.bloomed = Some(0.0);
         v
     }
 
@@ -249,6 +306,10 @@ impl OpeningView {
         let b = brain.read(cx);
         let mode = b.tones.get(tone).cloned().unwrap_or_else(crate::brain::Mode::fix);
         self.panel.phase = if matches!(b.engine, crate::brain::Engine::Ready(_)) { Phase::Generating(String::new()) } else { Phase::Preparing };
+        if matches!(self.panel.phase, Phase::Preparing) {
+            // The panel explains the wait (downloading, waking up).
+            self.read_now();
+        }
         let this = cx.entity().downgrade();
         let id = crate::brain::check(&self.panel.original, &mode, retry, move |event, cx| {
             let _ = this.update(cx, |v, cx| {
@@ -257,10 +318,17 @@ impl OpeningView {
                     crate::brain::Event::Finished(a, _) => {
                         v.panel.phase = Phase::Done(a);
                         v.check = None;
+                        // The answer is in: the flower opens (once: a later tone doesn't open
+                        // it again), and the panel follows.
+                        if v.bloomed.is_none() {
+                            v.bloomed = Some(v.t());
+                        }
                     }
                     crate::brain::Event::Failed(p) => {
                         v.panel.phase = Phase::Failed(model::Failure { note: p.note.into(), can_retry: p.can_retry });
                         v.check = None;
+                        // A failed check leaves the flower shut; the panel says what's wrong.
+                        v.read_now();
                     }
                 }
                 cx.notify();
@@ -273,9 +341,25 @@ impl OpeningView {
         self.start.elapsed().as_secs_f64()
     }
 
+    /// Something to read with the flower shut, now (the first time counts).
+    fn read_now(&mut self) {
+        if self.readable.is_none() {
+            self.readable = Some(self.t());
+        }
+    }
+
+    /// The moment so far: the flower opens when the answer comes and the panel unrolls when
+    /// there's something to read (`opening::unfold_at`), as the Swift app's bud and panel do.
     fn script(&self) -> Script {
         let (replace, replaced) = self.went.unwrap_or((f64::INFINITY, false));
-        Script { full: true, bloom: 0.9, replace, replaced, backdrop: false }
+        Script {
+            full: self.full,
+            bloom: self.bloomed.unwrap_or(f64::INFINITY),
+            readable: self.readable.unwrap_or(f64::INFINITY),
+            replace,
+            replaced,
+            backdrop: false,
+        }
     }
 
     fn open(&self) -> bool {
@@ -418,6 +502,11 @@ impl Render for OpeningView {
         let script = self.script();
         let scale = window.scale_factor();
         let rig = self.feed.at(t, &script, scale, window);
+        if self.went.is_none() && opening::unroll(t, &script).0 > 0.0
+            && let Some(at) = self.pressed.take()
+        {
+            news(&format!("panel unrolls {} ms after the press ({} ms after its window)", at.elapsed().as_millis(), (t * 1000.0) as u64));
+        }
         let entity = cx.entity();
         let pick_fn = {
             let e = entity.clone();
