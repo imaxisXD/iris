@@ -1,3 +1,5 @@
+// On Windows Iris is a windowed app: no console beside it.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 //! Iris's answer panel in GPUI: a trial of the cross-platform interface.
 //!
 //! - `iris --snap <dir> [--scale 2]` draws every state the Swift app's design check draws
@@ -17,6 +19,8 @@ mod flow;
 mod garden;
 mod host_level;
 mod hotkey;
+mod keys;
+mod words;
 mod icons;
 mod learn_words;
 mod letters;
@@ -54,6 +58,14 @@ mod setup;
 mod slip;
 mod store;
 mod textbridge;
+#[cfg(windows)]
+mod tray;
+#[cfg(windows)]
+mod spelling_win;
+#[cfg(windows)]
+mod apps_win;
+#[cfg(windows)]
+mod update_win;
 mod tones;
 mod toast;
 mod updater;
@@ -99,7 +111,11 @@ pub fn app_icon(bundle: &str) -> Option<(Vec<u8>, u32)> {
         return hit;
     }
     let found = load_icon(bundle);
-    ICONS.lock().unwrap().insert(bundle.to_string(), found.clone());
+    let mut cache = ICONS.lock().unwrap();
+    if cache.len() >= 128 {
+        cache.clear();
+    }
+    cache.insert(bundle.to_string(), found.clone());
     found
 }
 
@@ -139,8 +155,7 @@ struct PanelView {
     live: bool,
     /// Live: when the made-up answer for the picked tone lands.
     due: Option<Instant>,
-    /// The tone the marker last left, and how many moves so far (each move animates afresh).
-    flight: Option<(usize, usize)>,
+    anim: std::rc::Rc<std::cell::RefCell<crate::interact::Anim>>,
     focus: FocusHandle,
 }
 
@@ -163,8 +178,6 @@ impl PanelView {
             return;
         }
         PICKED.with(|p| p.set(Some(Instant::now())));
-        let moves = self.flight.map_or(0, |f| f.1) + 1;
-        self.flight = Some((self.panel.selected, moves));
         self.panel.selected = tone;
         self.panel.retry_note = None;
         self.panel.copied = false;
@@ -188,6 +201,9 @@ impl PanelView {
 
 impl Render for PanelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.live {
+            riso::let_go_of_last_frame(window);
+        }
         let tracing = std::env::var("IRIS_TRACE").is_ok();
         if std::env::var("IRIS_DEBUG").is_ok() {
             eprintln!("render: window active {}", window.is_window_active());
@@ -201,24 +217,37 @@ impl Render for PanelView {
             let e = entity.clone();
             crate::interact::act(move |_, cx| e.update(cx, |v, cx| v.pick(i, cx)))
         };
-        let look = panel::Look { scale, icon: &app_icon, pick: if self.live { Some(&pick_fn) } else { None }, flight: self.flight, act: None };
+        let look = panel::Look { scale, icon: &app_icon, pick: if self.live { Some(&pick_fn) } else { None }, act: None };
         let working = matches!(self.panel.phase, Phase::Preparing | Phase::Generating(_));
         if self.live && working {
             // The waiting dots move: draw again next frame.
             window.request_animation_frame();
         }
-        let body = panel::panel(&self.panel, &look);
+        let panel_state = &self.panel;
+        let body = if self.live {
+            let anim = self.anim.clone();
+            crate::interact::build(&anim, crate::live_slip::reduce_motion(), window, cx, || panel::panel(panel_state, &look))
+        } else {
+            panel::panel(panel_state, &look)
+        };
         let root = div().track_focus(&self.focus).key_context("Panel")
             .on_any_mouse_down(|e, _, _| if std::env::var("IRIS_DEBUG").is_ok() { eprintln!("mouse down at {:?}", e.position) })
             .on_key_down(cx.listener(|v, e: &KeyDownEvent, window, cx| {
-                let n = model::TONES.len();
+                let n = v.panel.tones.len().max(1);
                 let key = e.keystroke.key.as_str();
                 match key {
                     "tab" => {
                         let next = if e.keystroke.modifiers.shift { (v.panel.selected + n - 1) % n } else { (v.panel.selected + 1) % n };
                         v.pick(next, cx);
                     }
-                    "1" | "2" | "3" | "4" | "5" => v.pick(key.parse::<usize>().unwrap() - 1, cx),
+                    "right" if !e.keystroke.modifiers.platform => v.pick((v.panel.selected + 1) % n, cx),
+                    "left" if !e.keystroke.modifiers.platform => v.pick((v.panel.selected + n - 1) % n, cx),
+                    "1" | "2" | "3" | "4" | "5" | "6" => {
+                        let idx = key.parse::<usize>().unwrap() - 1;
+                        if idx < n {
+                            v.pick(idx, cx);
+                        }
+                    }
                     "escape" | "enter" => window.remove_window(),
                     _ => {}
                 }
@@ -268,7 +297,7 @@ fn snap(dir: &str, scale: f32) -> anyhow::Result<()> {
     cx.update(|cx| cx.text_system().add_fonts(fonts()))?;
     for (i, st) in model::states().into_iter().enumerate() {
         let win = cx.open_window(size(px(672.0), px(340.0)), |_, cx| {
-            cx.new(|cx| PanelView { panel: st.panel, live: false, due: None, flight: None, focus: cx.focus_handle() })
+            cx.new(|cx| PanelView { panel: st.panel, live: false, due: None, anim: Default::default(), focus: cx.focus_handle() })
         })?;
         cx.run_until_parked();
         let shot = cx.capture_screenshot(win.into())?;
@@ -374,7 +403,7 @@ fn live(origin: Option<(f32, f32)>) {
         };
         let states = model::states();
         cx.open_window(options, |window, cx| {
-            let view = cx.new(|cx| PanelView { panel: states[1].panel.clone(), live: true, due: None, flight: None, focus: cx.focus_handle() });
+            let view = cx.new(|cx| PanelView { panel: states[1].panel.clone(), live: true, due: None, anim: Default::default(), focus: cx.focus_handle() });
             let focus = view.read(cx).focus.clone();
             window.focus(&focus, cx);
             view
@@ -394,6 +423,11 @@ pub fn start(cx: &mut App) {
     for family in ["Iris Mono 430", "Iris Mono 450", "Iris Mono 560", "Caveat Brush", "Rubik Doodle Shadow", "Menlo", ".SystemUIFont"] {
         let _ = cx.text_system().resolve_font(&font(family));
     }
+    cx.on_window_closed(|_, id| {
+        riso::forget_window(id);
+        confirm::forget_window(id);
+    })
+    .detach();
 }
 
 /// Iris is paper in Dark Mode too: its windows' title bar buttons and menus draw light, as the
@@ -533,6 +567,9 @@ pub fn open_opening_keys(origin: Point<Pixels>, keys: bool, cx: &mut App, make: 
         if keys {
             let focus = view.read(cx).focus.clone();
             window.focus(&focus, cx);
+            // Once it's on screen: a window not shown yet can't take the keyboard.
+            #[cfg(windows)]
+            window.on_next_frame(|window, _| take_keyboard(window));
         }
         view
     })
@@ -598,8 +635,59 @@ pub fn no_system_shadow(window: &Window) {
             }
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    // Windows 11 draws a thin border round every window, even a see-through one, and a frame
+    // of its own (a light veil, a top edge and a shadow) round the whole window, most of which
+    // is see-through room for the flower and the fold: a grey box round the panel. Neither here.
+    #[cfg(windows)]
+    if let Some(hwnd) = win32_handle(window) {
+        use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_NCRENDERING_POLICY};
+        let none: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
+        let no_frame = DWMNCRP_DISABLED.0;
+        unsafe {
+            let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &none as *const u32 as *const _, 4);
+            let _ = DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &no_frame as *const i32 as *const _, 4);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     let _ = window;
+}
+
+#[cfg(windows)]
+fn win32_handle(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match HasWindowHandle::window_handle(window).ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(windows::Win32::Foundation::HWND(h.hwnd.get() as _)),
+        _ => None,
+    }
+}
+
+/// Windows: brings Iris's window to the front with the keyboard. In a Windows 11 VM the panel
+/// opened straight after the shortcut already was in front; this is for when it isn't (an app
+/// slow to read). Windows refuses a plain SetForegroundWindow from a program in the background,
+/// so Iris joins the front window's input queue for the call, the documented way to pass focus
+/// between programs. GPUI's own activation isn't used: it taps
+/// Alt to get the same right, and that Alt would reach the app you're writing in.
+#[cfg(windows)]
+pub fn take_keyboard(window: &Window) {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    };
+    let Some(hwnd) = win32_handle(window) else { return };
+    unsafe {
+        let front = GetForegroundWindow();
+        let theirs = GetWindowThreadProcessId(front, None);
+        let ours = GetCurrentThreadId();
+        let joined = theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, true).as_bool();
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetActiveWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
+        if joined {
+            let _ = AttachThreadInput(ours, theirs, false);
+        }
+    }
 }
 
 /// Whether Iris's windows take the keyboard: in the app itself yes, never under test (unless
@@ -686,8 +774,37 @@ pub fn visible_frame_at(x: f64, y: f64) -> [f64; 4] {
             }
         }
     }
+    // Windows: the work area (the screen less the taskbar) of the monitor at the point.
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+        unsafe {
+            let m = MonitorFromPoint(POINT { x: x as i32, y: y as i32 }, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if GetMonitorInfoW(m, &mut info).as_bool() {
+                let r = info.rcWork;
+                let s = screen_scale_at(r.left, r.top);
+                return [r.left as f64 / s, r.top as f64 / s, (r.right - r.left) as f64 / s, (r.bottom - r.top) as f64 / s];
+            }
+        }
+    }
     let _ = (x, y);
     [0.0, 0.0, 1920.0, 1080.0]
+}
+
+/// Windows: the scale (DPI / 96) of the monitor at a screen pixel.
+#[cfg(windows)]
+pub fn screen_scale_at(x: i32, y: i32) -> f64 {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    unsafe {
+        let m = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let (mut dx, mut dy) = (96u32, 96u32);
+        let _ = GetDpiForMonitor(m, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+        dx.max(96) as f64 / 96.0
+    }
 }
 
 /// Whether a point (screen points) is on the test display (`IRIS_TEST_DISPLAY`, 1920×1080).
@@ -727,6 +844,23 @@ fn main() {
             return driven::setup_preview(args.get(i + 1).cloned().unwrap_or("1-allow".into()));
         }
         return driven::run();
+    }
+    // Windows tooling: what the language check sees in each draft of a JSON list (the script's
+    // share, each word and whether Windows' dictionaries know it), to tune it against the Mac's.
+    #[cfg(windows)]
+    if let Some(i) = arg("--language-features") {
+        let drafts: Vec<String> = serde_json::from_str(&std::fs::read_to_string(&args[i + 1]).unwrap()).unwrap();
+        let dict = spelling_win::Dictionaries::open();
+        let out: Vec<serde_json::Value> = drafts.iter().map(|t| {
+            let letters: Vec<char> = t.chars().filter(|c| c.is_alphabetic()).collect();
+            let latin = letters.iter().filter(|c| (**c as u32) < 0x250).count();
+            let words: Vec<serde_json::Value> = t.split(|c: char| !c.is_alphabetic() && c != '\'')
+                .filter(|w| w.chars().count() > 1)
+                .map(|w| serde_json::json!([w, dict.knows(w)])).collect();
+            serde_json::json!({"letters": letters.len(), "latin": latin, "words": words, "windows": spelling_win::looks_foreign(t, &dict)})
+        }).collect();
+        std::fs::write(&args[i + 2], serde_json::to_string(&out).unwrap()).unwrap();
+        return;
     }
     if arg("--list-states").is_some() {
         for (i, st) in model::states().iter().enumerate() {
@@ -820,4 +954,25 @@ fn main() {
     }
     // No mode: Iris itself.
     app::run();
+}
+
+/// Windows: Settings and setup have no title bar (their paper runs to the top edge, as on the
+/// Mac), so a strip along the top drags the window and an ink brush X at the top right closes
+/// it. Both are Windows' own controls through GPUI's window control areas (snapping, a
+/// double-click, Alt+F4 all behave). Nothing on the Mac, where the traffic lights are.
+pub fn windows_chrome(scale: f32) -> Option<AnyElement> {
+    if keys::is_mac() {
+        return None;
+    }
+    let cross = crate::toast::brush_cross(31, 12.0, 12.0, scale);
+    Some(div().absolute().top_0().left_0().w_full().h(px(44.0))
+        .child(div().id("window-drag").absolute().top_0().left_0().right(px(52.0)).h(px(30.0))
+            .window_control_area(WindowControlArea::Drag))
+        .child(div().id("window-close").absolute().top(px(6.0)).right(px(8.0)).size(px(32.0))
+            .flex().items_center().justify_center().cursor_pointer()
+            // Over Settings' own title band, which starts a window move on any press: the X
+            // keeps its clicks.
+            .occlude()
+            .window_control_area(WindowControlArea::Close).child(cross))
+        .into_any_element())
 }

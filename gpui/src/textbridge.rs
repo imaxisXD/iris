@@ -37,10 +37,16 @@ pub fn under_test() -> bool {
 #[cfg(target_os = "macos")]
 pub use mac::*;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+#[path = "textbridge_win.rs"]
+mod win;
+#[cfg(windows)]
+pub use win::*;
+
+#[cfg(not(any(target_os = "macos", windows)))]
 pub use other::*;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 mod other {
     use super::*;
     /// What was read. (Windows reads through UI Automation: still to come.)
@@ -70,11 +76,13 @@ mod other {
         pub fn take() -> Clipboard { Clipboard }
         pub fn restore(&self) {}
     }
+    pub struct ReplaceBorrow;
+    pub fn begin_replace_borrow() -> ReplaceBorrow { ReplaceBorrow }
     pub fn put_on_clipboard(_text: &str, _transient: bool) -> isize { 0 }
     pub fn clipboard_count() -> isize { 0 }
     pub fn activate(_pid: i32) {}
     pub fn has_keyboard(_pid: i32) -> bool { false }
-    pub fn select_all_and_paste(_whole: bool) {}
+    pub fn select_all_and_paste(_pid: i32, _whole: bool) -> bool { false }
     pub fn copy_shortcut() {}
     pub fn clipboard_string() -> Option<String> { None }
 }
@@ -90,7 +98,7 @@ mod mac {
     use core_foundation::dictionary::CFDictionary;
     use core_foundation::string::CFString;
     use core_graphics::geometry::{CGPoint, CGRect, CGSize};
-    use objc2::rc::Retained;
+    use objc2::rc::{Retained, autoreleasepool};
     use objc2_app_kit::{NSApplicationActivationOptions, NSApplicationActivationPolicy, NSPasteboard, NSPasteboardItem, NSRunningApplication, NSWorkspace};
     use objc2_foundation::{NSArray, NSData, NSString};
 
@@ -217,10 +225,12 @@ mod mac {
 
     /// An app's name as people know it, and its bundle ID.
     pub fn app_info(pid: i32) -> (Option<String>, Option<String>) {
-        let Some(app) = running(pid) else { return (None, None) };
-        let name = (app.activationPolicy() == NSApplicationActivationPolicy::Regular)
-            .then(|| app.localizedName().map(|n| n.to_string())).flatten().filter(|n| !n.is_empty());
-        (name, app.bundleIdentifier().map(|b| b.to_string()))
+        autoreleasepool(|_| {
+            let Some(app) = running(pid) else { return (None, None) };
+            let name = (app.activationPolicy() == NSApplicationActivationPolicy::Regular)
+                .then(|| app.localizedName().map(|n| n.to_string())).flatten().filter(|n| !n.is_empty());
+            (name, app.bundleIdentifier().map(|b| b.to_string()))
+        })
     }
 
     fn can_own_text_box(pid: i32) -> bool {
@@ -237,15 +247,61 @@ mod mac {
     /// The app whose text box you're in: the one Accessibility says has the keyboard, else the
     /// menu bar's owner, else the frontmost app; never loginwindow or a background helper.
     pub fn focused_app() -> Option<i32> {
-        let ws = NSWorkspace::sharedWorkspace();
-        [focused_application_pid(),
-         ws.menuBarOwningApplication().map(|a| a.processIdentifier()),
-         ws.frontmostApplication().map(|a| a.processIdentifier())]
-            .into_iter().flatten().find(|p| can_own_text_box(*p))
+        autoreleasepool(|_| {
+            let ws = NSWorkspace::sharedWorkspace();
+            [focused_application_pid(),
+             ws.menuBarOwningApplication().map(|a| a.processIdentifier()),
+             ws.frontmostApplication().map(|a| a.processIdentifier())]
+                .into_iter().flatten().find(|p| can_own_text_box(*p))
+        })
     }
 
     /// Apps already asked to build their Electron tree.
     static ELECTRON: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+    /// Bumped by every new `copy_selection` or `Replace` so an earlier `lateCopy` watchdog stops.
+    static LATE_COPY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Tracks active Replace clipboard borrows so `copy_selection` waits instead of snapshotting
+    /// Iris's own transient pasteboard entry.
+    static REPLACE_BORROW: (std::sync::Mutex<usize>, std::sync::Condvar) =
+        (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+    /// Guards the clipboard while Replace owns it; dropping releases waiting `copy_selection`s.
+    pub struct ReplaceBorrow;
+
+    impl Drop for ReplaceBorrow {
+        fn drop(&mut self) {
+            let (lock, cvar) = &REPLACE_BORROW;
+            let mut count = lock.lock().unwrap();
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                cvar.notify_all();
+            }
+        }
+    }
+
+    /// Cancels any pending `lateCopy` watchdog and marks the clipboard as borrowed by Replace.
+    pub fn begin_replace_borrow() -> ReplaceBorrow {
+        LATE_COPY_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let (lock, _) = &REPLACE_BORROW;
+        *lock.lock().unwrap() += 1;
+        ReplaceBorrow
+    }
+
+    fn wait_for_replace_borrow() {
+        let (lock, cvar) = &REPLACE_BORROW;
+        // Cover `paste::start_replace`'s worst-case hold (20ms + 600ms focus poll + 60ms + 450ms).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1_500);
+        let mut count = lock.lock().unwrap();
+        while *count > 0 {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else { break };
+            let (next, timeout) = cvar.wait_timeout(count, remaining).unwrap();
+            count = next;
+            if timeout.timed_out() {
+                break;
+            }
+        }
+    }
 
     #[derive(Default)]
     struct Read {
@@ -262,18 +318,26 @@ mod mac {
     /// Reads the text box you're in, in the app `pid`. Accessibility calls are synchronous
     /// calls into the other app: call it off the main thread.
     pub fn capture(pid: i32) -> Result<Captured, CaptureError> {
+        autoreleasepool(|_| capture_inner(pid))
+    }
+
+    fn capture_inner(pid: i32) -> Result<Captured, CaptureError> {
         if !is_trusted() {
             return Err(CaptureError::NotTrusted);
         }
         let first = {
             let mut seen = ELECTRON.lock().unwrap();
-            let first = !seen.contains(&pid);
-            if first {
+            // Prune terminated processes so a recycled PID is treated as a new app.
+            seen.retain(|p| running(*p).is_some_and(|a| !a.isTerminated()));
+            !seen.contains(&pid)
+        };
+        let (read, mark_seen) = read_focused(pid, first);
+        if first && mark_seen {
+            let mut seen = ELECTRON.lock().unwrap();
+            if !seen.contains(&pid) {
                 seen.push(pid);
             }
-            first
-        };
-        let read = read_focused(pid, first, first && draws_pages_like_chrome(pid));
+        }
         if read.secure {
             return Err(CaptureError::SecureField);
         }
@@ -296,34 +360,47 @@ mod mac {
         if under_test() {
             return Err(CaptureError::NothingToCheck);
         }
-        if let Some(copied) = copy_selection().filter(|c| !c.trim().is_empty()) {
+        if let Some(copied) = copy_selection(pid).filter(|c| !c.trim().is_empty()) {
             return Ok(Captured { pid, app_name, bundle_id, element: None, text: copied, scope: Scope::Selection, field_frame: frame, can_replace: read.editable, own: false });
         }
         Err(CaptureError::NothingToCheck)
     }
 
-    fn read_focused(pid: i32, enable_electron: bool, ask_for_pages: bool) -> Read {
+    fn read_focused(pid: i32, first_time: bool) -> (Read, bool) {
         let app = Element::app(pid);
-        if !enable_electron {
-            return read_in(&app);
-        }
-        if app.set("AXManualAccessibility", &CFBoolean::true_value().as_CFType()) {
-            // Electron builds its tree only when asked; give it a moment.
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
+        // Always try reading immediately first: native macOS apps (and Electron/Chromium apps
+        // whose tree is already built) answer in ~1ms, avoiding a 200ms sleep and disk walk.
         let mut read = read_in(&app);
+        let saw = read.text.is_some() || read.secure;
+        if !first_time || saw {
+            return (read, saw);
+        }
+        let mut enabled = false;
+        if app.set("AXManualAccessibility", &CFBoolean::true_value().as_CFType()) {
+            enabled = true;
+            // Electron builds its tree only when asked; poll briefly instead of sleeping a flat 200ms.
+            for _ in 0..8 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                read = read_in(&app);
+                if read.text.is_some() || read.secure {
+                    return (read, true);
+                }
+            }
+        }
         // Chromium builds a page's tree only for a screen reader: ask as VoiceOver does, once,
-        // only when nothing was read, and give the page up to 3 seconds.
-        if ask_for_pages && read.text.is_none() && !read.secure && ask_for_screen_reader_tree(&app) {
-            for _ in 0..20 {
-                std::thread::sleep(std::time::Duration::from_millis(150));
+        // only when nothing was read, and give the page up to 3 seconds (polled at 50ms).
+        if read.text.is_none() && !read.secure && draws_pages_like_chrome(pid) && ask_for_screen_reader_tree(&app) {
+            enabled = true;
+            for _ in 0..60 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 read = read_in(&app);
                 if read.text.is_some() || read.secure {
                     break;
                 }
             }
         }
-        read
+        let mark_seen = enabled || read.text.is_some() || read.secure;
+        (read, mark_seen)
     }
 
     fn ask_for_screen_reader_tree(app: &Element) -> bool {
@@ -385,9 +462,13 @@ mod mac {
             return read;
         }
         read.frame = frame(&element);
-        read.selection = selection_bounds(&element)
-            .or_else(|| web_area_containing(&element).and_then(|w| selection_bounds(&w)))
-            .or_else(|| web_areas_under(&element).iter().find_map(selection_bounds));
+        // `capture` only uses `read.selection` when `read.frame` is None; skipping the
+        // selection/web-area walk when the element already gave its frame avoids up to 400+ AX IPCs.
+        if read.frame.is_none() {
+            read.selection = selection_bounds(&element)
+                .or_else(|| web_area_containing(&element).and_then(|w| selection_bounds(&w)))
+                .or_else(|| web_areas_under(&element).iter().find_map(selection_bounds));
+        }
         read.editable = is_editable(&element);
         let cleaned = |attr: &str| element.string(attr).map(clean);
         if let Some(sel) = cleaned("AXSelectedText").filter(|s| !s.trim().is_empty()) {
@@ -499,11 +580,24 @@ mod mac {
     }
 
     /// Whether the box Iris read still holds the same text (a Quick Fix that finished late
-    /// must never paste over something else).
+    /// must never paste over something else). Lightweight check: skips frame/selection/editable IPCs.
     pub fn still_holds(c: &Captured) -> bool {
         let Some(element) = &c.element else { return false };
-        let read = read_focused(c.pid, false, false);
-        read.element.is_some_and(|now| now.same(element)) && read.text.as_deref() == Some(c.text.as_str())
+        let app = Element::app(c.pid);
+        let Some(now) = focused_element(&app) else { return false };
+        if !now.same(element) {
+            return false;
+        }
+        unsafe { AXUIElementSetMessagingTimeout(now.0, AX_TIMEOUT) };
+        let cleaned = |attr: &str| now.string(attr).map(clean);
+        let text = cleaned("AXSelectedText")
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                cleaned("AXValue")
+                    .filter(|v| !v.trim().is_empty())
+                    .filter(|v| Some(v) != cleaned("AXPlaceholderValue").as_ref())
+            });
+        text.as_deref() == Some(c.text.as_str())
     }
 
     /// What the box holds now.
@@ -521,76 +615,89 @@ mod mac {
 
     // MARK: - The clipboard and the keyboard
 
-    /// Every item and type on the clipboard, to put back exactly.
-    pub struct Clipboard(Vec<Vec<(Retained<NSString>, Retained<NSData>)>>);
+    /// Every item and type on the clipboard, to put back exactly. Stored as plain Rust bytes so
+    /// the snapshot can safely move onto the late-copy watchdog thread.
+    pub struct Clipboard(Vec<Vec<(String, Vec<u8>)>>);
 
     impl Clipboard {
         pub fn take() -> Clipboard {
-            let pb = NSPasteboard::generalPasteboard();
-            let items = pb.pasteboardItems().map(|items| items.to_vec()).unwrap_or_default();
-            Clipboard(items.iter().map(|item| {
-                item.types().to_vec().into_iter().filter_map(|t| item.dataForType(&t).map(|d| (t, d))).collect()
-            }).collect())
+            autoreleasepool(|_| {
+                let pb = NSPasteboard::generalPasteboard();
+                let items = pb.pasteboardItems().map(|items| items.to_vec()).unwrap_or_default();
+                Clipboard(items.iter().map(|item| {
+                    item.types().to_vec().into_iter().filter_map(|t| {
+                        item.dataForType(&t).map(|d| (t.to_string(), d.to_vec()))
+                    }).collect()
+                }).collect())
+            })
         }
         pub fn restore(&self) {
-            let pb = NSPasteboard::generalPasteboard();
-            pb.clearContents();
-            let items: Vec<Retained<NSPasteboardItem>> = self.0.iter().map(|types| {
-                let item = NSPasteboardItem::new();
-                for (t, d) in types {
-                    item.setData_forType(d, t);
+            autoreleasepool(|_| {
+                let pb = NSPasteboard::generalPasteboard();
+                pb.clearContents();
+                let items: Vec<Retained<NSPasteboardItem>> = self.0.iter().map(|types| {
+                    let item = NSPasteboardItem::new();
+                    for (t, d) in types {
+                        item.setData_forType(&NSData::with_bytes(d), &NSString::from_str(t));
+                    }
+                    item
+                }).collect();
+                if !items.is_empty() {
+                    let refs: Vec<&objc2::runtime::ProtocolObject<dyn objc2_app_kit::NSPasteboardWriting>> =
+                        items.iter().map(|i| objc2::runtime::ProtocolObject::from_ref(&**i)).collect();
+                    pb.writeObjects(&NSArray::from_slice(&refs));
                 }
-                item
-            }).collect();
-            if !items.is_empty() {
-                let refs: Vec<&objc2::runtime::ProtocolObject<dyn objc2_app_kit::NSPasteboardWriting>> =
-                    items.iter().map(|i| objc2::runtime::ProtocolObject::from_ref(&**i)).collect();
-                pb.writeObjects(&NSArray::from_slice(&refs));
-            }
+            })
         }
     }
 
     /// Puts `text` on the clipboard (marked transient, so clipboard managers skip it, when
     /// `transient`); returns the clipboard's change count after.
     pub fn put_on_clipboard(text: &str, transient: bool) -> isize {
-        let pb = NSPasteboard::generalPasteboard();
-        pb.clearContents();
-        let item = NSPasteboardItem::new();
-        item.setString_forType(&NSString::from_str(text), &NSString::from_str("public.utf8-plain-text"));
-        if transient {
-            for t in ["org.nspasteboard.TransientType", "org.nspasteboard.AutoGeneratedType"] {
-                item.setData_forType(&NSData::new(), &NSString::from_str(t));
+        autoreleasepool(|_| {
+            let pb = NSPasteboard::generalPasteboard();
+            pb.clearContents();
+            let item = NSPasteboardItem::new();
+            item.setString_forType(&NSString::from_str(text), &NSString::from_str("public.utf8-plain-text"));
+            if transient {
+                for t in ["org.nspasteboard.TransientType", "org.nspasteboard.AutoGeneratedType"] {
+                    item.setData_forType(&NSData::new(), &NSString::from_str(t));
+                }
             }
-        }
-        let refs = [objc2::runtime::ProtocolObject::from_ref(&*item)];
-        pb.writeObjects(&NSArray::from_slice(&refs));
-        pb.changeCount()
+            let refs = [objc2::runtime::ProtocolObject::from_ref(&*item)];
+            pb.writeObjects(&NSArray::from_slice(&refs));
+            pb.changeCount()
+        })
     }
 
     pub fn clipboard_count() -> isize {
-        NSPasteboard::generalPasteboard().changeCount()
+        autoreleasepool(|_| NSPasteboard::generalPasteboard().changeCount())
     }
 
     pub fn clipboard_string() -> Option<String> {
-        NSPasteboard::generalPasteboard().stringForType(&NSString::from_str("public.utf8-plain-text")).map(|s| s.to_string())
+        autoreleasepool(|_| NSPasteboard::generalPasteboard().stringForType(&NSString::from_str("public.utf8-plain-text")).map(|s| s.to_string()))
     }
 
     pub fn activate(pid: i32) {
-        if let Some(app) = running(pid) {
-            #[allow(deprecated)]
-            app.activateWithOptions(NSApplicationActivationOptions::empty());
-        }
+        autoreleasepool(|_| {
+            if let Some(app) = running(pid) {
+                #[allow(deprecated)]
+                app.activateWithOptions(NSApplicationActivationOptions::empty());
+            }
+        })
     }
 
     /// Whether `pid` has the keyboard (any one sign: active, owns the menu bar, or has focus).
     pub fn has_keyboard(pid: i32) -> bool {
-        let Some(app) = running(pid) else { return false };
-        if app.isTerminated() {
-            return false;
-        }
-        app.isActive()
-            || NSWorkspace::sharedWorkspace().menuBarOwningApplication().map(|a| a.processIdentifier()) == Some(pid)
-            || focused_application_pid() == Some(pid)
+        autoreleasepool(|_| {
+            let Some(app) = running(pid) else { return false };
+            if app.isTerminated() {
+                return false;
+            }
+            app.isActive()
+                || NSWorkspace::sharedWorkspace().menuBarOwningApplication().map(|a| a.processIdentifier()) == Some(pid)
+                || focused_application_pid() == Some(pid)
+        })
     }
 
     fn post_shortcut(key: u16) {
@@ -605,13 +712,18 @@ mod mac {
         }
     }
 
-    /// ⌘A (for the whole box) then ⌘V, to the app in front.
-    pub fn select_all_and_paste(whole: bool) {
+    /// ⌘A (for the whole box) then ⌘V, to the app in front — re-checking keyboard ownership
+    /// before ⌘V so a focus switch during the 60 ms gap never pastes into another app.
+    pub fn select_all_and_paste(pid: i32, whole: bool) -> bool {
         if whole {
             post_shortcut(0x00); // A
             std::thread::sleep(std::time::Duration::from_millis(60));
         }
+        if !has_keyboard(pid) {
+            return false;
+        }
         post_shortcut(0x09); // V
+        true
     }
 
     /// ⌘C to the app in front.
@@ -619,8 +731,15 @@ mod mac {
         post_shortcut(0x08); // C
     }
 
-    /// Copies the selection with ⌘C, the clipboard put back as it was. Waits up to 0.3 s.
-    fn copy_selection() -> Option<String> {
+    /// Copies the selection with ⌘C, the clipboard put back as it was. Waits up to 0.3 s, and
+    /// keeps watching for a further second if the app answers late (Swift's `lateCopy`).
+    fn copy_selection(expected_pid: i32) -> Option<String> {
+        // Wait if a Replace is still borrowing the clipboard so we never snapshot Iris's own entry.
+        wait_for_replace_borrow();
+        let generation = LATE_COPY_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        if !has_keyboard(expected_pid) {
+            return None;
+        }
         let saved = Clipboard::take();
         let before = clipboard_count();
         copy_shortcut();
@@ -629,9 +748,24 @@ mod mac {
             if clipboard_count() != before {
                 let copied = clipboard_string().map(clean);
                 saved.restore();
-                return copied;
+                // Abort if another app took focus during ⌘C so we never misattribute its text.
+                return has_keyboard(expected_pid).then_some(copied).flatten();
             }
         }
+        // An app that answers ⌘C after Iris stopped waiting would leave the selection on the
+        // clipboard: keep looking for a second more, and put the clipboard back if it does.
+        std::thread::spawn(move || {
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                if LATE_COPY_GEN.load(std::sync::atomic::Ordering::Acquire) != generation {
+                    return;
+                }
+                if clipboard_count() != before {
+                    saved.restore();
+                    return;
+                }
+            }
+        });
         None
     }
 

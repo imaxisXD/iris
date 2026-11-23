@@ -106,6 +106,12 @@ pub struct TextField {
 }
 
 impl TextField {
+    /// Clears cached focus state when the field is unmounted (e.g. switching Settings pages)
+    /// so its caret blink loop stops waking the parent view.
+    pub fn clear_focus_state(&mut self) {
+        self.had_keys = false;
+    }
+
     pub fn new(cx: &mut App) -> Entity<TextField> {
         cx.new(|cx| {
             // The caret blinks at the Mac's pace while the field has the keyboard.

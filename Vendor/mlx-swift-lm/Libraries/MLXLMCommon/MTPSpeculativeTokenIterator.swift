@@ -85,6 +85,20 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// `draft_block_size` parameter.
     public let blockSize: Int
 
+    /// Iris: optional prompt-lookup drafting (PLD) source tokens (the user's draft).
+    /// When greedy with a stateless drafter, matching n-grams propose up to
+    /// `promptLookupMaxDraft` tokens in microseconds with zero drafter GPU calls,
+    /// falling back to the MTP drafter whenever the model diverges from the draft.
+    private let promptLookupTokens: [Int]
+    private let promptLookupMaxDraft: Int
+    private let maximumWindowBlockSize: Int
+    private var emittedHistory = [Int]()
+    private var emittedHistoryCount = 0
+    private var lookupCursor = 0
+    private var lookupMissStreak = 0
+    private var lookupCooldown = 0
+    private var lookupLastAccepted = 0
+
     private var pendingTokens = [Int]()
     private var pendingIndex = 0
     /// Number of pending tokens already represented by `mainCache`. The last
@@ -157,7 +171,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         mainCache: [KVCache]? = nil,
         parameters: GenerateParameters,
         blockSize: Int,
-        components: GenerationComponents = .init()
+        components: GenerationComponents = .init(),
+        promptLookupTokens: [Int]? = nil,
+        promptLookupMaxDraft: Int = 16
     ) throws {
         try drafter.validateCompatibility(with: mainModel)
 
@@ -170,7 +186,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 mainCache ?? (try mainModel.newCache(parameters: parameters)), plan: kvCachePlan),
             parameters: parameters,
             blockSize: blockSize,
-            components: components)
+            components: components,
+            promptLookupTokens: promptLookupTokens,
+            promptLookupMaxDraft: promptLookupMaxDraft)
     }
 
     package init(
@@ -182,7 +200,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         mtpContinuation: MTPDrafterContinuation? = nil,
         parameters: GenerateParameters,
         blockSize: Int,
-        components: GenerationComponents = .init()
+        components: GenerationComponents = .init(),
+        promptLookupTokens: [Int]? = nil,
+        promptLookupMaxDraft: Int = 16
     ) throws {
         try drafter.validateCompatibility(with: mainModel)
 
@@ -220,6 +240,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         self.maxTokens = parameters.maxTokens
+        let windowMaxBlock = Self.maximumBlockSize(for: mainCache)
+        self.maximumWindowBlockSize = windowMaxBlock
+        self.promptLookupTokens = promptLookupTokens ?? []
+        self.promptLookupMaxDraft = Swift.max(0, Swift.min(promptLookupMaxDraft, windowMaxBlock - 1))
         // A round presents `blockSize` positions at once, and a sliding layer can only show a
         // query the `maxSize` entries before it. Past that the extra drafts still decode
         // correctly -- masks are position-relative and the staged view is clamped -- but the
@@ -227,8 +251,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // stops meaning what the stats say it means. Clamp rather than trap: the block size is
         // a tuning knob, not a correctness input.
         let drafterBlockSize = Swift.min(blockSize, drafter.maximumBlockSize ?? blockSize)
-        let effectiveBlockSize = Swift.min(
-            drafterBlockSize, Self.maximumBlockSize(for: mainCache))
+        let effectiveBlockSize = Swift.min(drafterBlockSize, windowMaxBlock)
         self.blockSize = effectiveBlockSize
 
         // Probe by opening a round at the width rounds will actually use and discarding it,
@@ -302,17 +325,17 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         prefill.prefix?(mainCacheStorage.processedTokenCount)
         let inputLength = input.text.cacheSequenceLength
         let cachePositionBeforePrefill = mainCacheStorage.processedTokenCount
-        let needsFullPromptHidden = drafter.requiresPromptPrefill || continuationToResume != nil
 
         let persistentState = persistentTargetState(from: mainState)
         var prefillState = persistentState ?? LMOutput.State()
         prefillState[mtpEmitFlagKey] = true
-        // Stateful drafters and warm continuations need one hidden row per
-        // prompt token, so their `prepare` call receives the emit flag. Other
-        // drafters are primed by the explicit one-token follow-up below.
-
-        let incomingPrefillState: LMOutput.State? =
-            needsFullPromptHidden ? prefillState : persistentState
+        let isGreedyStateless =
+            (sampler is ArgMaxSampler)
+            && (processor == nil || processor is SuppressTokensProcessor)
+        prefillState[mtpSkipLogitSoftcapKey] = isGreedyStateless
+        // Iris: always pass `prefillState` so targets like Gemma 4 emit drafter state directly
+        // from prefill, eliminating a redundant 42-layer prime forward pass on every request.
+        let incomingPrefillState: LMOutput.State? = prefillState
         switch try mainModel.prepare(
             input, cache: mainCache, state: incomingPrefillState, prefill: prefill)
         {
@@ -348,7 +371,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             // the iterator silently starts 1 position ahead of an
             // equivalent autoregressive run, violating speculative
             // decoding's bit-exact-equivalence-to-greedy guarantee.
-            pendingTokens.append(token.item(Int.self))
+            let firstTok = token.item(Int.self)
+            pendingTokens.append(firstTok)
+            recordEmitted(firstTok)
 
             // the model reported per-chunk progress; the bonus forward above
             // consumed the remainder of the prompt
@@ -409,13 +434,19 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 // re-prime forward, now committed in cache); `newToken` is
                 // the prefill-position-N+1 sample that becomes the input
                 // to the first speculateRound.
-                pendingTokens.append(token.item(Int.self))
-                pendingTokens.append(newToken.item(Int.self))
+                let t0 = token.item(Int.self)
+                let t1 = newToken.item(Int.self)
+                pendingTokens.append(t0)
+                pendingTokens.append(t1)
+                recordEmitted(t0)
+                recordEmitted(t1)
                 committedPendingTokenCount = 1
             } else {
                 // Prefill state already carried drafter keys; the single
                 // bonus is the input to the first speculateRound.
-                pendingTokens.append(token.item(Int.self))
+                let t0 = token.item(Int.self)
+                pendingTokens.append(t0)
+                recordEmitted(t0)
             }
         }
 
@@ -501,22 +532,37 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // A speculative round can emit up to `numDraft + 1` tokens: the
         // accepted draft prefix plus the verifier's correction/bonus token.
         // Keep the whole pending buffer within the remaining output budget.
-        let numDraft: Int
+        let maxRemainingDraft: Int
         if let maxTokens {
             let remaining = maxTokens - tokenCount
             guard remaining > 0 else { return }
-
-            let draftBudget = Swift.min(remaining - 1, blockSize - 1)
-            guard draftBudget > 0 else {
+            maxRemainingDraft = remaining - 1
+            guard maxRemainingDraft > 0 else {
                 if let token = passthroughStep(maintainingDrafterState: true) {
                     pendingTokens.append(token)
+                    recordEmitted(token)
                 }
                 return
             }
-            numDraft = draftBudget
         } else {
-            numDraft = blockSize - 1
+            maxRemainingDraft = maximumWindowBlockSize - 1
         }
+
+        // Iris: Hybrid Prompt-Lookup Drafting (PLD). When greedy with a stateless drafter
+        // and not in cooldown after a typo cluster, match recent emitted tokens against the
+        // user's draft to propose up to `promptLookupMaxDraft` (31 -> L=32 NAX tile) on CPU.
+        let pldProposal: (drafts: [Int], matchEnd: Int)? =
+            (lookupCooldown == 0 && sampler is ArgMaxSampler
+                && !(drafter is any StatefulMTPDrafterModel)
+                && !promptLookupTokens.isEmpty && promptLookupMaxDraft > 0)
+            ? proposeFromPrompt(maxCount: Swift.min(promptLookupMaxDraft, maxRemainingDraft))
+            : nil
+        if lookupCooldown > 0 {
+            lookupCooldown -= 1
+        }
+
+        let numDraft =
+            pldProposal?.drafts.count ?? Swift.min(maxRemainingDraft, blockSize - 1)
 
         guard let state = mainState,
             let lastHidden = state[mtpLastHiddenStatesKey]
@@ -586,40 +632,52 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         let bonusToken = y.tokens
         let draftTokens: MLXArray
-        if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
-            var currentDrafterState = drafterState
-        {
-            draftTokens = statefulDrafter.draftBlock(
-                target: mainModel,
-                lastToken: bonusToken,
-                lastHidden: bonusSlotHidden,
-                sharedKV: sharedKV,
-                positionDeltas: state[mtpPositionDeltasKey],
-                queryOffset: queryOffset,
-                blockSize: numDraft + 1,  // total round size: bonus + numDraft
-                state: &currentDrafterState,
-                sampler: draftSampler
-            )
-            drafterState = currentDrafterState
+        let flatDraftTokens: MLXArray
+        let pldDraftList: [Int]?
+        if let pld = pldProposal {
+            let arr = MLXArray(pld.drafts.map(Int32.init))
+            flatDraftTokens = arr
+            draftTokens = arr.expandedDimensions(axis: 0)
+            pldDraftList = pld.drafts
         } else {
-            draftTokens = drafter.draftBlock(
-                target: mainModel,
-                lastToken: bonusToken,
-                lastHidden: bonusSlotHidden,
-                sharedKV: sharedKV,
-                positionDeltas: state[mtpPositionDeltasKey],
-                queryOffset: queryOffset,
-                blockSize: numDraft + 1,  // total round size: bonus + numDraft
-                sampler: draftSampler
-            )
+            pldDraftList = nil
+            if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
+                var currentDrafterState = drafterState
+            {
+                draftTokens = statefulDrafter.draftBlock(
+                    target: mainModel,
+                    lastToken: bonusToken,
+                    lastHidden: bonusSlotHidden,
+                    sharedKV: sharedKV,
+                    positionDeltas: state[mtpPositionDeltasKey],
+                    queryOffset: queryOffset,
+                    blockSize: numDraft + 1,  // total round size: bonus + numDraft
+                    state: &currentDrafterState,
+                    sampler: draftSampler
+                )
+                drafterState = currentDrafterState
+            } else {
+                draftTokens = drafter.draftBlock(
+                    target: mainModel,
+                    lastToken: bonusToken,
+                    lastHidden: bonusSlotHidden,
+                    sharedKV: sharedKV,
+                    positionDeltas: state[mtpPositionDeltasKey],
+                    queryOffset: queryOffset,
+                    blockSize: numDraft + 1,  // total round size: bonus + numDraft
+                    sampler: draftSampler
+                )
+            }
+            // draftTokens shape [B, numDraft] -> flatten to [numDraft].
+            flatDraftTokens = draftTokens.flattened()
         }
-        // draftTokens shape [B, numDraft] -> flatten to [numDraft].
-        let flatDraftTokens = draftTokens.flattened()
 
         // Verify pass: main model evaluates [bonus, draft_1, ..., draft_numDraft]
         // in one forward call, emitting state for next round.
         var verifyState = state
         verifyState[mtpEmitFlagKey] = true
+        let isStatelessProcessor = (processor == nil) || (processor is SuppressTokensProcessor)
+        verifyState[mtpSkipLogitSoftcapKey] = (sampler is ArgMaxSampler) && isStatelessProcessor
         let verifyTokens = concatenated([bonusToken, flatDraftTokens])
         let verifyInput = LMInput.Text(tokens: verifyTokens)
         let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
@@ -630,36 +688,101 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let mainLogits = mainResult.logits
         mainState = mainResult.state
 
-        eval(flatDraftTokens)
-        let draftTokensList = flatDraftTokens.asArray(Int.self)
-
         var accepted = 0
         var finalToken: MLXArray?
-        for i in 0 ..< numDraft {
-            var logits = mainLogits[0..., verifyStart + i, 0...]
-            logits = processor?.process(logits: logits) ?? logits
-            let targetToken = sampler.sample(logits: logits)
-            eval(targetToken)
-            let targetTokenValue = targetToken.item(Int.self)
-            processor?.didSample(token: targetToken)
-            pendingTokens.append(targetTokenValue)
-            guard targetTokenValue == draftTokensList[i] else {
-                finalToken = targetToken
-                break
+
+        // Iris: batched greedy verification — compute all `numDraft + 1` argmax tokens on GPU
+        // in one op and settle with a single `eval()` instead of `numDraft + 1` serial GPU syncs.
+        if sampler is ArgMaxSampler, isStatelessProcessor {
+            var verifyLogits = mainLogits[
+                0..., verifyStart ..< (verifyStart + numDraft + 1), 0...
+            ].reshaped([numDraft + 1, -1])
+            if let suppressor = processor as? SuppressTokensProcessor {
+                verifyLogits = suppressor.process(logits: verifyLogits)
             }
-            accepted += 1
+            let sampledAll = argMax(verifyLogits, axis: -1)  // [numDraft + 1]
+            let draftTokensList: [Int]
+            if let list = pldDraftList {
+                eval(sampledAll)
+                draftTokensList = list
+            } else {
+                eval(flatDraftTokens, sampledAll)
+                draftTokensList = flatDraftTokens.asArray(Int.self)
+            }
+            let sampledList = sampledAll.asArray(Int.self)
+            for i in 0 ..< numDraft {
+                let targetTokenValue = sampledList[i]
+                pendingTokens.append(targetTokenValue)
+                recordEmitted(targetTokenValue)
+                guard targetTokenValue == draftTokensList[i] else {
+                    finalToken = sampledAll[i ..< (i + 1)]
+                    break
+                }
+                accepted += 1
+            }
+            if finalToken == nil {
+                let bonusVal = sampledList[accepted]
+                pendingTokens.append(bonusVal)
+                recordEmitted(bonusVal)
+                finalToken = sampledAll[accepted ..< (accepted + 1)]
+            }
+        } else {
+            let draftTokensList: [Int]
+            if let list = pldDraftList {
+                draftTokensList = list
+            } else {
+                eval(flatDraftTokens)
+                draftTokensList = flatDraftTokens.asArray(Int.self)
+            }
+            for i in 0 ..< numDraft {
+                var logits = mainLogits[0..., verifyStart + i, 0...]
+                logits = processor?.process(logits: logits) ?? logits
+                let targetToken = sampler.sample(logits: logits)
+                eval(targetToken)
+                let targetTokenValue = targetToken.item(Int.self)
+                processor?.didSample(token: targetToken)
+                pendingTokens.append(targetTokenValue)
+                recordEmitted(targetTokenValue)
+                guard targetTokenValue == draftTokensList[i] else {
+                    finalToken = targetToken
+                    break
+                }
+                accepted += 1
+            }
+
+            // Only the all-accepted path samples the bonus row. On rejection the
+            // mismatching target sample above is already the emitted correction.
+            if finalToken == nil {
+                var logits = mainLogits[0..., verifyStart + accepted, 0...]
+                logits = processor?.process(logits: logits) ?? logits
+                let bonus = sampler.sample(logits: logits)
+                eval(bonus)
+                processor?.didSample(token: bonus)
+                let bonusVal = bonus.item(Int.self)
+                pendingTokens.append(bonusVal)
+                recordEmitted(bonusVal)
+                finalToken = bonus
+            }
         }
 
-        // Only the all-accepted path samples the bonus row. On rejection the
-        // mismatching target sample above is already the emitted correction.
-        if finalToken == nil {
-            var logits = mainLogits[0..., verifyStart + accepted, 0...]
-            logits = processor?.process(logits: logits) ?? logits
-            let bonus = sampler.sample(logits: logits)
-            eval(bonus)
-            processor?.didSample(token: bonus)
-            pendingTokens.append(bonus.item(Int.self))
-            finalToken = bonus
+        if let pld = pldProposal {
+            lookupLastAccepted = accepted
+            if accepted > 0 {
+                lookupCursor = pld.matchEnd + accepted + 1
+                lookupMissStreak = 0
+            } else {
+                lookupMissStreak += 1
+            }
+            // If PLD accepted fewer than 6 tokens on a non-final span, we hit a typo-dense region:
+            // let fast MTP breeze through the next 2 rounds before probing PLD again.
+            if accepted < 6 && accepted < numDraft {
+                lookupCooldown = 2
+            }
+        } else {
+            lookupCursor = Swift.min(promptLookupTokens.count, lookupCursor + accepted + 1)
+            if lookupMissStreak > 0 {
+                lookupMissStreak = Swift.max(0, lookupMissStreak - 1)
+            }
         }
         let emittedFinalToken = finalToken!
         committedPendingTokenCount = accepted
@@ -678,7 +801,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             drafted: numDraft,
             accepted: accepted,
             targetVerified: numDraft + 1,
-            draftModelCalls: 1
+            draftModelCalls: pldProposal == nil ? 1 : 0
         )
 
         if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
@@ -739,20 +862,121 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         y = .init(tokens: emittedFinalToken)
     }
 
+    /// Records an emitted token for PLD matching (no-op when PLD is off; keeps only the 4-token
+    /// sliding window that `proposeFromPrompt` inspects).
+    private mutating func recordEmitted(_ token: Int) {
+        guard !promptLookupTokens.isEmpty else { return }
+        emittedHistoryCount += 1
+        if emittedHistory.count == 4 {
+            emittedHistory.removeFirst()
+        }
+        emittedHistory.append(token)
+    }
+
+    /// Iris: Prompt-Lookup Drafting (PLD) matcher against the user's input tokens.
+    /// Searches locally near `lookupCursor` first so common phrases advance monotonically,
+    /// then falls back to scanning the full draft. Returns nil when no confident match exists
+    /// so the MTP drafter seamlessly takes over.
+    private func proposeFromPrompt(maxCount: Int) -> (drafts: [Int], matchEnd: Int)? {
+        let src = promptLookupTokens
+        let srcCount = src.count
+        let histCount = emittedHistory.count
+        guard srcCount >= 2, emittedHistoryCount >= 1, histCount >= 1, maxCount >= 1 else { return nil }
+
+        // First round right after prefill: if token 0 matches at the start of the draft,
+        // propose the following span directly without running the drafter.
+        if emittedHistoryCount == 1 {
+            let t0 = emittedHistory[0]
+            let searchEnd = srcCount < 25 ? 1 : Swift.min(6, srcCount - 1)
+            for i in 0 ..< searchEnd where src[i] == t0 {
+                let start = i + 1
+                let count = Swift.min(maxCount, srcCount - start)
+                if count >= 2 {
+                    return (Array(src[start ..< (start + count)]), start)
+                }
+            }
+            return nil
+        }
+
+        // Helper: find an n-gram match of the last `n` emitted tokens in `src[lo..<hi]`.
+        func findMatch(n: Int, from lo: Int, to hi: Int) -> Int? {
+            guard lo < hi else { return nil }
+            let lastTok = emittedHistory[histCount - 1]
+            let baseHist = histCount - n
+            var pos = lo
+            while pos < hi {
+                if src[pos - 1] == lastTok {
+                    var ok = true
+                    var k = 0
+                    while k < n - 1 {
+                        if src[pos - n + k] != emittedHistory[baseHist + k] {
+                            ok = false
+                            break
+                        }
+                        k += 1
+                    }
+                    if ok { return pos }
+                }
+                pos += 1
+            }
+            return nil
+        }
+
+        // Require a 3-gram match by default so typo clusters don't trigger costly PLD passes;
+        // allow 2-gram immediately after a high-acceptance (>= 8) PLD span to jump right over
+        // a single-word fix back into verbatim copy.
+        let minN = (lookupMissStreak == 0 && lookupLastAccepted >= 8) ? 2 : 3
+        let maxN = Swift.min(4, histCount)
+        let minAvail = srcCount < 25 ? 12 : 6
+        if maxN >= minN {
+            for n in stride(from: maxN, through: minN, by: -1) {
+                let localLo = Swift.max(n, lookupCursor - 8)
+                let localHi = Swift.min(srcCount, lookupCursor + 64)
+                let matchPos =
+                    findMatch(n: n, from: localLo, to: localHi)
+                    ?? findMatch(n: n, from: n, to: srcCount)
+                if let pos = matchPos {
+                    let avail = Swift.min(maxCount, srcCount - pos)
+                    if avail >= minAvail || (srcCount >= 25 && avail >= 2 && pos + avail == srcCount) {
+                        return (Array(src[pos ..< (pos + avail)]), pos)
+                    }
+                }
+            }
+        }
+
+        // 1-gram continuation ONLY at the exact expected cursor right after a high-acceptance
+        // PLD span (>= 8 tokens) so a 1-token typo fix immediately resumes full-speed PLD.
+        if lookupMissStreak == 0, lookupLastAccepted >= 8, lookupCursor >= 1, lookupCursor < srcCount {
+            let lastTok = emittedHistory[histCount - 1]
+            let searchLo = Swift.max(1, lookupCursor - 2)
+            let searchHi = Swift.min(srcCount, lookupCursor + 4)
+            for pos in searchLo ..< searchHi where src[pos - 1] == lastTok {
+                let avail = Swift.min(maxCount, srcCount - pos)
+                if avail >= 6 || (avail >= 2 && pos + avail == srcCount) {
+                    return (Array(src[pos ..< (pos + avail)]), pos)
+                }
+            }
+        }
+
+        return nil
+    }
+
     /// Switch to single-token generation for the remainder of the stream.
     /// Sticky — once flipped, `next()` never returns to speculation.
     private mutating func switchToPassthrough(reason: String) {
         if !passthroughLoggedOnce {
-            // Log one-time only so a quantization-onset round doesn't spam.
-            // The Swift stdlib `print` is intentional here: the iterator is
-            // a low-level component without access to a logger.
-            print("[MTPSpeculativeTokenIterator] passthrough mode: \(reason)")
+            // Iris: log to stderr rather than stdout so processes that use stdout for IPC
+            // (like Iris's brain) never receive diagnostic text in their protocol stream.
+            if let data = "[MTPSpeculativeTokenIterator] passthrough mode: \(reason)\n".data(using: .utf8) {
+                FileHandle.standardError.write(data)
+            }
             passthroughLoggedOnce = true
         }
         passthroughReason = reason
         passthrough = true
         discardSpeculativePromptCacheCheckpoints(mainCache)
         mainState?[mtpEmitFlagKey] = false
+        mainState?[mtpSkipLogitSoftcapKey] = nil
         mainState?[mtpCacheCheckpointIndexKey] = nil
         mainState?[mtpLastHiddenStatesKey] = nil
         mainState?[mtpSharedKVStatesKey] = nil
@@ -1001,6 +1225,7 @@ extension MTPSpeculativeTokenIterator {
 private func persistentTargetState(from state: LMOutput.State?) -> LMOutput.State? {
     guard var state else { return nil }
     state[mtpEmitFlagKey] = nil
+    state[mtpSkipLogitSoftcapKey] = nil
     state[mtpCacheCheckpointIndexKey] = nil
     state[mtpLastHiddenStatesKey] = nil
     state[mtpSharedKVStatesKey] = nil

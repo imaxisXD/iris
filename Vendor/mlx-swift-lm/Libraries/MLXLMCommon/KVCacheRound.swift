@@ -192,6 +192,12 @@ enum KVCacheRoundStrategyFactory {
 
         switch leaf.kind {
         case .rotating(let rotating):
+            // Iris: before the ring wraps, a rotating cache trims in O(1) bookkeeping just like
+            // an append-only cache; writing in-place avoids 2× full-history KV concats per layer
+            // on every speculative round.
+            if rotating.rewindCapacity == 0 && rotating.isTrimmable(after: maximumPositions) {
+                return AppendOnlyRoundStrategy(slot: slot, live: rotating)
+            }
             return RotatingRoundStrategy(slot: slot, live: rotating)
         case .recurrent:
             return nil

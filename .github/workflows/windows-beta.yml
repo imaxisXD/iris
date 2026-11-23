@@ -1,0 +1,262 @@
+# Iris for Windows (beta): what can only be measured on Windows, before there is a Windows app.
+#  - core-tests: the brain's rules (IrisCore) and their tests, built by Swift on Windows.
+#  - llama-cpu: llama.cpp's prebuilt Windows server replaying the brain's own requests on the
+#    runner's CPU: time against Iris's time limits, and memory.
+# Runs on pushes to the windows-beta branch that touch these parts (llama-cpu only when the
+# commit message says [llama-cpu]), or by hand.
+name: windows-beta
+
+on:
+  push:
+    branches: [windows-beta]
+    paths:
+      - "Sources/IrisCore/**"
+      - "Tests/IrisCoreTests/**"
+      - "gpui/windows/**"
+      - "gpui/src/**"
+      - "gpui/Cargo.toml"
+      - "gpui/brain/Sources/IrisBrain/**"
+      - "Sources/IrisLlama/**"
+      - ".github/workflows/windows-beta.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-beta-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLAMA_TAG: b12110
+  LLAMA_ZIP: llama-b12110-bin-win-cpu-x64.zip
+  LLAMA_SHA256: 98901e327c252875accaf2d1bf364e10e868843b0b63468baad1aa945cdc5da2
+
+jobs:
+  core-tests:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      # The files as committed: with CRLF, Swift reads "\r\n" as one Character, and the tests
+      # that read the repo's scripts line by line find nothing.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - uses: compnerd/gha-setup-swift@v0.5.1
+        with:
+          swift-version: swift-6.3.3-release
+          swift-build: 6.3.3-RELEASE
+      # IrisCore alone: this throwaway checkout's Package.swift (which brings in MLX, Mac-only) is
+      # replaced by one with only IrisCore and its tests, so tests that read the repo's own files
+      # (scripts, the changelog, the design rules) still find them. Tests that need the engine or
+      # the Mac's dictionaries are left out.
+      - name: Build and test IrisCore
+        shell: pwsh
+        run: |
+          Get-ChildItem Tests\IrisCoreTests\*.swift |
+            Where-Object { Select-String -Path $_ -Pattern '^(@testable )?import (IrisSpelling|IrisEngine)' -Quiet } |
+            ForEach-Object { "left out: $($_.Name)"; Remove-Item $_ }
+          # CoreGraphics is the Mac's; elsewhere Foundation has CGFloat, CGRect and CGPoint.
+          Get-ChildItem -Recurse Sources\IrisCore\*.swift, Tests\IrisCoreTests\*.swift | ForEach-Object {
+            $t = Get-Content -Raw $_
+            $u = $t -replace '(?m)^import CoreGraphics\r?$', "#if canImport(CoreGraphics)`nimport CoreGraphics`n#else`nimport Foundation`n#endif"
+            if ($u -ne $t) { Set-Content -NoNewline -Encoding utf8NoBOM $_ $u }
+          }
+          @(
+            '// swift-tools-version: 6.2',
+            'import PackageDescription',
+            'let package = Package(',
+            '    name: "IrisCoreWindows",',
+            '    targets: [',
+            '        .target(name: "IrisCore"),',
+            '        .testTarget(name: "IrisCoreTests", dependencies: ["IrisCore"]),',
+            '    ],',
+            '    swiftLanguageModes: [.v5]',
+            ')'
+          ) -join "`n" | Set-Content -NoNewline -Encoding utf8NoBOM Package.swift
+          Remove-Item Package.resolved -ErrorAction SilentlyContinue
+          swift build --build-tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          swift test --skip-build 2>&1 | Tee-Object "$env:RUNNER_TEMP\swift-test.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # What the Windows model helper needs from Foundation on Windows: streaming, a large
+      # download with progress, child processes, memory, free disk space.
+      - name: Swift on Windows, for the model helper
+        if: always()
+        shell: pwsh
+        working-directory: gpui/windows/ci/swift-probe
+        run: |
+          swift run -c release 2>&1 | Tee-Object "$env:RUNNER_TEMP\swift-probe.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # The brain for Windows: the rules and llama.cpp's engine, no MLX. It must start and
+      # answer hello with Windows' two models (no model file needed for that).
+      - name: Build the Windows brain
+        if: always()
+        shell: pwsh
+        run: |
+          git checkout -- Package.swift Sources/IrisCore
+          pwsh gpui/windows/build-brain.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bin = swift build -c release --show-bin-path
+          $hello = '{"op":"hello"}' | & "$bin\iris-brain.exe" 2>&1 | Out-String
+          $hello
+          if ($hello -notmatch '"event":"hello"' -or $hello -notmatch '"lighter"') { throw "the brain didn't answer hello" }
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\brain" | Out-Null
+          Copy-Item "$bin\iris-brain.exe" "$env:RUNNER_TEMP\brain\"
+          Get-ChildItem "$bin\*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination "$env:RUNNER_TEMP\brain\"
+          # Swift's runtime (Foundation, concurrency, ICU): a PC without Swift needs these beside the brain.
+          $rt = Split-Path (Get-Command swiftCore.dll).Source
+          "Swift runtime: $rt"
+          Get-ChildItem "$rt\*.dll" | Copy-Item -Destination "$env:RUNNER_TEMP\brain\"
+          "{0:N0} MB with the runtime" -f ((Get-ChildItem "$env:RUNNER_TEMP\brain" | Measure-Object Length -Sum).Sum / 1MB)
+          # llama.cpp's server beside it (hash-checked), with Microsoft's C++ runtime: a fresh PC
+          # has none, and llama-server won't start without it (measured in a Windows 11 VM; the
+          # DLLs beside it are enough, nothing installed). From Visual Studio's redistributable folder.
+          $zip = "$env:RUNNER_TEMP\$env:LLAMA_ZIP"
+          Invoke-WebRequest "https://github.com/ggml-org/llama.cpp/releases/download/$env:LLAMA_TAG/$env:LLAMA_ZIP" -OutFile $zip
+          if ((Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower() -ne $env:LLAMA_SHA256) { throw "llama.cpp zip hash" }
+          Expand-Archive $zip "$env:RUNNER_TEMP\brain\llama"
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory | Sort-Object FullName | Select-Object -Last 1
+          $omp = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.OpenMP" -Directory | Sort-Object FullName | Select-Object -Last 1
+          "C++ runtime: $($crt.FullName)"
+          Copy-Item "$($crt.FullName)\*.dll" "$env:RUNNER_TEMP\brain\llama\"
+          if ($omp) { Copy-Item "$($omp.FullName)\*.dll" "$env:RUNNER_TEMP\brain\llama\" }
+          "{0:N0} MB with llama.cpp and the C++ runtime" -f ((Get-ChildItem -Recurse "$env:RUNNER_TEMP\brain" | Measure-Object Length -Sum).Sum / 1MB)
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: iris-helper-windows-x64
+          path: ${{ runner.temp }}/brain
+          if-no-files-found: ignore
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: core-tests
+          path: |
+            ${{ runner.temp }}/swift-test.txt
+            ${{ runner.temp }}/swift-probe.txt
+          if-no-files-found: ignore
+
+  llama-cpu:
+    # Long and billed at Windows rates: only when a commit asks for it, or by hand.
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[llama-cpu]')
+    runs-on: windows-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { model: e2b, repack: "--no-repack", name: "Lighter, weights not repacked (8 GB PCs)" }
+          - { model: e2b, repack: "", name: "Lighter, weights repacked" }
+          - { model: e4b, repack: "", name: "Best, weights repacked" }
+    name: llama-cpu (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --disable-pip-version-check psutil==7.1.3
+      - name: llama.cpp ${{ env.LLAMA_TAG }} (prebuilt, CPU)
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\$env:LLAMA_ZIP"
+          Invoke-WebRequest "https://github.com/ggml-org/llama.cpp/releases/download/$env:LLAMA_TAG/$env:LLAMA_ZIP" -OutFile $zip
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($hash -ne $env:LLAMA_SHA256) { throw "llama.cpp zip hash $hash, expected $env:LLAMA_SHA256" }
+          Expand-Archive $zip "$env:RUNNER_TEMP\llama"
+          Get-ChildItem -Recurse "$env:RUNNER_TEMP\llama" -Filter llama-server.exe | Select-Object -First 1 -ExpandProperty FullName |
+            ForEach-Object { "LLAMA_SERVER=$_" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV }
+      - id: gguf
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/gguf
+          key: gguf-${{ matrix.model }}-q4km-v1
+      - name: Model file
+        if: steps.gguf.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $sha = @{ e4b = "467320c9e7dc9fd5a2935a90ac4cd433d90d6f3b6b057044de9b303afee0c54d"; e2b = "729a89ccf950f17cdf85daef79cd8d474ccad52ac049ef37da51e5b21ee93bdd" }
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\gguf" | Out-Null
+          $f = "$env:RUNNER_TEMP\gguf\${{ matrix.model }}.gguf"
+          Invoke-WebRequest "https://huggingface.co/ImAXISOG/iris-gemma-4-${{ matrix.model }}-it-gguf/resolve/main/iris-gemma-4-${{ matrix.model }}-it-Q4_K_M.gguf" -OutFile $f
+          $hash = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
+          if ($hash -ne $sha["${{ matrix.model }}"]) { throw "model hash $hash" }
+      - name: Replay the brain's requests
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List
+          python gpui/windows/ci/replay.py $env:LLAMA_SERVER "$env:RUNNER_TEMP\gguf\${{ matrix.model }}.gguf" `
+            gpui/windows/ci/requests-${{ matrix.model }}.jsonl "$env:RUNNER_TEMP\replay.json" `
+            --label "${{ matrix.name }}" ${{ matrix.repack }}
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: replay-${{ matrix.model }}${{ matrix.repack }}
+          path: |
+            ${{ runner.temp }}/replay.json
+            ${{ runner.temp }}/replay.json.server.log
+          if-no-files-found: ignore
+
+  # The Windows app and its installer: iris.exe built here (GPUI's shaders compiled by Windows'
+  # own fxc), the brain and its helper beside it, packed by Inno Setup. An artifact only: no
+  # secrets, nothing published. Long and billed at Windows rates, so only when a commit's
+  # message carries the windows-app tag in square brackets, or by hand.
+  windows-app:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[windows-app]')
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - uses: compnerd/gha-setup-swift@v0.5.1
+        with:
+          swift-version: swift-6.3.3-release
+          swift-build: 6.3.3-RELEASE
+      - name: Version
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Sources\Iris\Resources\Changelog.md -Pattern '^# v?(\d+\.\d+\.\d+)' | Select-Object -First 1).Matches[0].Groups[1].Value
+          "IRIS_VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "IRIS_COMMIT=$(git rev-parse --short HEAD)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "Iris $v"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            gpui\target
+          key: windows-app-${{ hashFiles('gpui/Cargo.lock') }}
+      - name: iris.exe
+        shell: pwsh
+        working-directory: gpui
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          # The update signature's public keys (update_win.rs): the release key, then its backup,
+          # so releases can move to the backup if the first is lost. Their private halves are
+          # the maintainer's, never in the repository or in CI (sign-release.py signs on a Mac).
+          IRIS_UPDATE_KEYS: ae33a43cf482523d05b7ea1a0098cf651c944a75f317aaf6b61a54501f9ce26e,89fe729fc6e8bf9edb745aae5bd5709eba2bc1495238c07c541562a61939df4a
+        run: |
+          cargo build --release --no-default-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: The brain
+        shell: pwsh
+        run: |
+          pwsh gpui/windows/build-brain.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "BRAIN_BIN=$(swift build -c release --show-bin-path)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: The bundle
+        shell: pwsh
+        run: pwsh gpui/windows/bundle.ps1 -Iris gpui\target\release\iris.exe -BrainBin $env:BRAIN_BIN -Out "$env:RUNNER_TEMP\bundle"
+      - name: The installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc /Q "/DBundle=$env:RUNNER_TEMP\bundle" "/DVersion=$env:IRIS_VERSION" "/DOut=$env:RUNNER_TEMP\out" gpui\windows\installer\iris.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem "$env:RUNNER_TEMP\out" | Select-Object Name, @{n="MB";e={[int]($_.Length/1MB)}}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Iris-Setup-x64
+          path: ${{ runner.temp }}/out/Iris-Setup-x64.exe
+          if-no-files-found: error

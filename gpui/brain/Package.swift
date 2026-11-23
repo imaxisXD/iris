@@ -33,7 +33,10 @@ let package = Package(
             ]
         ),
         .target(name: "IrisSpelling", dependencies: ["IrisCore"]),
-        .executableTarget(name: "IrisBrain", dependencies: ["IrisCore", "IrisEngine", "IrisSpelling"]),
+        // Windows' engine (llama.cpp's server). Built here too, so a debug brain can try it on a
+        // Mac (IRIS_ENGINE=llama); a release brain never runs it (`Engines.swift`).
+        .target(name: "IrisLlama", dependencies: ["IrisCore"]),
+        .executableTarget(name: "IrisBrain", dependencies: ["IrisCore", "IrisEngine", "IrisSpelling", "IrisLlama"]),
     ],
     swiftLanguageModes: [.v5]
 )

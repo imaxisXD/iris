@@ -24,23 +24,41 @@ public enum ModelFailure: Equatable, Sendable {
 
     /// The whole story in one plain sentence, standing alone: the slip and Settings.
     public var sentence: String {
+        #if os(Windows)
+        switch self {
+        case .noRoom(let needed, let free): return "The model needs \(needed) free, and this PC has \(free). Free up some space."
+        case .offline: return "No internet. The model downloads once, and picks up where it stopped."
+        case .notDownloaded: return "The model isn't on this PC yet. Click the Iris icon by the clock and finish setup to download it."
+        case .other: return "The model couldn't download. Try again in a moment."
+        }
+        #else
         switch self {
         case .noRoom(let needed, let free): "The model needs \(needed) free, and this Mac has \(free). Free up some space."
         case .offline: "No internet. The model downloads once, and picks up where it stopped."
         case .notDownloaded: "The model isn't on this Mac yet. Open the menu bar flower and finish setup to download it."
         case .other: "The model couldn't download. Try again in a moment."
         }
+        #endif
     }
 
     /// What to do, after a lead that already says what happened ("no internet"): the message
     /// by your text, the panel's VoiceOver line and setup.
     public var nextStep: String {
+        #if os(Windows)
+        switch self {
+        case .noRoom(let needed, let free): return "The model needs \(needed) free, and this PC has \(free). Free up some space."
+        case .offline: return "The model downloads once and needs the internet for that. It picks up where it stopped."
+        case .notDownloaded: return "Click the Iris icon by the clock and finish setup to download it."
+        case .other: return "Something got in the way. Try again in a moment; it picks up where it stopped."
+        }
+        #else
         switch self {
         case .noRoom(let needed, let free): "The model needs \(needed) free, and this Mac has \(free). Free up some space."
         case .offline: "The model downloads once and needs the internet for that. It picks up where it stopped."
         case .notDownloaded: "Open the menu bar flower and finish setup to download it."
         case .other: "Something got in the way. Try again in a moment; it picks up where it stopped."
         }
+        #endif
     }
 
     /// True for the network errors that mean "no connection right now".

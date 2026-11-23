@@ -36,7 +36,10 @@ pub const NOTES: [Note; 5] = [Note::Replaced, Note::UndoKeys, Note::Checking, No
 pub type Cap = (Option<&'static str>, &'static str);
 
 /// Quick Fix's keys out of the box (`KeyCombo.quickFixDefault.keycaps`).
-pub const QUICK_FIX: [Cap; 4] = [(Some("⌃"), "control"), (Some("⌥"), "option"), (Some("⇧"), "shift"), (None, "G")];
+/// Quick Fix's default keys, as the demo shows them (⌃⌥⇧G on the Mac, Ctrl+Win+Shift+G on Windows).
+pub fn quick_fix_caps() -> Vec<Cap> {
+    crate::tones::caps(crate::keys::quick_fix_default())
+}
 
 /// Shortcuts to check the keys with: the default, someone's own, a wide key, the longest.
 pub const SAMPLE_KEYS: [&[Cap]; 4] = [
@@ -172,9 +175,9 @@ fn generic_app_icon() -> Option<Img> {
 pub fn demos_sheet(scale: f32) -> El {
     let mut c = div().flex().flex_col().gap(z(18.0));
     for note in NOTES {
-        c = c.child(demo(&Demo { note, t: landed(note), keys: &QUICK_FIX, shows_note: true, shows_undo_keys: true }, SHEET_W, scale));
+        c = c.child(demo(&Demo { note, t: landed(note), keys: &quick_fix_caps(), shows_note: true, shows_undo_keys: true }, SHEET_W, scale));
     }
-    let d = Demo { note: Note::Replaced, t: landed(Note::Replaced), keys: &QUICK_FIX, shows_note: true, shows_undo_keys: false };
+    let d = Demo { note: Note::Replaced, t: landed(Note::Replaced), keys: &quick_fix_caps(), shows_note: true, shows_undo_keys: false };
     sheet(c.child(demo(&d, SHEET_W, scale)))
 }
 
@@ -211,7 +214,7 @@ fn card_size(keys: &[Cap]) -> (f32, f32) {
 
 /// The stage's height: the window and the keys, the room above, and the Dock's below.
 pub fn height() -> f32 {
-    TOP + window_h() + 22.0 + card_size(&QUICK_FIX).1 + 30.0 + DOCK_ROOM
+    TOP + window_h() + 22.0 + card_size(&quick_fix_caps()).1 + 30.0 + DOCK_ROOM
 }
 
 /// `NoteDemo` at `d.t`, `w` points wide.
@@ -531,18 +534,21 @@ fn key_card(d: &Demo, desk: (f32, f32), card_at: (f32, f32), scale: f32) -> El {
     let k = d.tape_on() as f32;
     let under = Under { desk, card_at, card: (w, h), tape_at: (-13.0, -11.0) };
     // The tape lands: printed whole at its lean (GPUI can't turn it), grown 15% as it comes.
-    let lean = -7.0 - 6.0 * (1.0 - k);
-    let grow = 1.15 - 0.15 * k;
+    // Skip rasterizing a `frame_image` when `k <= 0.0` (completely invisible for the first 0.55 s).
     let (tw, th) = tape_size();
-    let tape = with_zoom(grow, || tape_label(&under, lean, scale)).opacity(k);
+    let grow = 1.15 - 0.15 * k;
     let tape_at = (-13.0 - tw * (grow - 1.0) / 2.0, -11.0 - th * (grow - 1.0) / 2.0);
     // Swift leans the card 0.8°, which GPUI can't do to its keys.
-    paper_shadow(sized(w, h), w, h, 10.0, 7.0, 0.18)
+    let mut card = paper_shadow(sized(w, h), w, h, 10.0, 7.0, 0.18)
         .child(at(sized(w, h).bg(col(ink::PAPER)), 0.0, 0.0))
         .child(at(printed(w, h, &riso::grain(w, h, scale, 0.22)), 0.0, 0.0))
-        .child(at(keys.h(z(KEY_H)), CARD_PAD.0, CARD_PAD.1))
-        .child(at(tape, tape_at.0, tape_at.1))
-        .children(flicks)
+        .child(at(keys.h(z(KEY_H)), CARD_PAD.0, CARD_PAD.1));
+    if k > 0.0 {
+        let lean = -7.0 - 6.0 * (1.0 - k);
+        let tape = with_zoom(grow, || tape_label(&under, lean, scale)).opacity(k);
+        card = card.child(at(tape, tape_at.0, tape_at.1));
+    }
+    card.children(flicks)
 }
 
 const TAN: Rgb8 = (196, 157, 122);
@@ -567,62 +573,76 @@ fn turn(p: (f32, f32), c: (f32, f32), degrees: f32) -> (f32, f32) {
 /// whatever is under it, the card's paper or the sky's dots (`TapeLabel.Tape().fill(tape)
 /// .blendMode(.multiply)`). Rune has no blend modes, so the multiply is baked from what's under.
 fn tape_label(u: &Under, lean: f32, scale: f32) -> El {
+    thread_local! {
+        static SKY_DOTS: std::cell::RefCell<Option<(usize, usize, Vec<Rgb8>)>> = const { std::cell::RefCell::new(None) };
+    }
     let (tw, th) = tape_size();
     let plate = Plate { w: tw, h: th, scale };
-    let key = format!("demo-tape-{tw}-{:?}-{:?}-{:?}", u.desk, u.card_at, u.card);
-    let px = riso::cached(key, &plate, || {
+    let make_strip = || {
         let mask = plate.fill(&pen::tape(tw, th).skia().unwrap());
         let (dw, dh) = (u.desk.0 as usize, u.desk.1 as usize);
-        let dots = riso::screen(dw, dh, SKY, 19, 1.0, 1.0);
         let (pw, ph) = plate.px();
         let mut out = vec![0u8; (pw * ph * 4) as usize];
-        for y in 0..ph {
-            for x in 0..pw {
-                let i = (y * pw + x) as usize;
-                let a = mask.data()[i];
-                if a == 0 {
-                    continue;
-                }
-                // The tape turns -7° about its middle on the card, the card -0.8° about its own.
-                let p = ((x as f32 + 0.5) / scale, (y as f32 + 0.5) / scale);
-                let on_card = turn(p, (tw / 2.0, th / 2.0), -7.0);
-                let on_card = (on_card.0 + u.tape_at.0, on_card.1 + u.tape_at.1);
-                let paper = on_card.0 >= 0.0 && on_card.1 >= 0.0 && on_card.0 < u.card.0 && on_card.1 < u.card.1;
-                let under = if paper {
-                    ink::PAPER
-                } else {
-                    let q = turn(on_card, (u.card.0 / 2.0, u.card.1 / 2.0), -0.8);
-                    let (qx, qy) = (q.0 + u.card_at.0, q.1 + u.card_at.1);
-                    let (ix, iy) = ((qx.max(0.0) as usize).min(dw - 1), (qy.max(0.0) as usize).min(dh - 1));
-                    dots[iy * dw + ix]
-                };
-                let c = riso::multiply(hue::TAPE, under);
-                out[i * 4..i * 4 + 4].copy_from_slice(&[c.0, c.1, c.2, a]);
+        SKY_DOTS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.as_ref().is_none_or(|(cw, ch, _)| *cw != dw || *ch != dh) {
+                *cache = Some((dw, dh, riso::screen(dw, dh, SKY, 19, 1.0, 1.0)));
             }
-        }
+            let dots = &cache.as_ref().unwrap().2;
+            for y in 0..ph {
+                for x in 0..pw {
+                    let i = (y * pw + x) as usize;
+                    let a = mask.data()[i];
+                    if a == 0 {
+                        continue;
+                    }
+                    // The tape turns -7° about its middle on the card, the card -0.8° about its own.
+                    let p = ((x as f32 + 0.5) / scale, (y as f32 + 0.5) / scale);
+                    let on_card = turn(p, (tw / 2.0, th / 2.0), -7.0);
+                    let on_card = (on_card.0 + u.tape_at.0, on_card.1 + u.tape_at.1);
+                    let paper = on_card.0 >= 0.0 && on_card.1 >= 0.0 && on_card.0 < u.card.0 && on_card.1 < u.card.1;
+                    let under = if paper {
+                        ink::PAPER
+                    } else {
+                        let q = turn(on_card, (u.card.0 / 2.0, u.card.1 / 2.0), -0.8);
+                        let (qx, qy) = (q.0 + u.card_at.0, q.1 + u.card_at.1);
+                        let (ix, iy) = ((qx.max(0.0) as usize).min(dw - 1), (qy.max(0.0) as usize).min(dh - 1));
+                        dots[iy * dw + ix]
+                    };
+                    let c = riso::multiply(hue::TAPE, under);
+                    out[i * 4..i * 4 + 4].copy_from_slice(&[c.0, c.1, c.2, a]);
+                }
+            }
+        });
         out
-    });
+    };
     // The strip and its words, turned `lean` degrees about the middle and printed whole.
-    let (pw, ph) = plate.px();
-    let rgba = px_rgba(&px, pw, ph);
+    // Settled frames stay cached under a fixed key; animated arrival/exit frames use `frame_image`
+    // so intermediate positions and angles never accumulate in `riso::PRINTS` or the GPU atlas.
     let (lead, _) = brush_box("you press", 15.0);
-    turned(format!("demo-tape-turned-{tw}-{lean:.2}-{:?}", u.card), tw, th, 10.0, lean, scale, move |s| {
-        s.picture(&rgba, tw, th, 0.0, 0.0);
-        word_into(s, brush(15.0), "you press", 12.0 + lead, 2.0 + 15.0 * BRUSH_ASCENT + (15.0 * BRUSH_LINE - 15.0 * 1.26) / 2.0, hue::I12);
-    })
+    let settled = (lean - (-7.0)).abs() < 1e-4 && (u.card_at.1 - card_y(1.0)).abs() < 1e-4;
+    if settled {
+        turned(format!("demo-tape-turned-{tw}-{:?}-{:?}", u.desk, u.card), tw, th, 10.0, lean, scale, move |s| {
+            let rgba = make_strip();
+            s.picture(&rgba, tw, th, 0.0, 0.0);
+            word_into(s, brush(15.0), "you press", 12.0 + lead, 2.0 + 15.0 * BRUSH_ASCENT + (15.0 * BRUSH_LINE - 15.0 * 1.26) / 2.0, hue::I12);
+        })
+    } else {
+        let pad = 10.0;
+        let out_plate = Plate { w: tw + 2.0 * pad, h: th + 2.0 * pad, scale };
+        let mut sheet = crate::raster::Sheet::new(out_plate, lean, out_plate.w / 2.0, out_plate.h / 2.0);
+        sheet.turn = sheet.turn.pre_translate(pad, pad);
+        let rgba = make_strip();
+        sheet.picture(&rgba, tw, th, 0.0, 0.0);
+        word_into(&mut sheet, brush(15.0), "you press", 12.0 + lead, 2.0 + 15.0 * BRUSH_ASCENT + (15.0 * BRUSH_LINE - 15.0 * 1.26) / 2.0, hue::I12);
+        let (pw, ph) = out_plate.px();
+        let img = riso::frame_image(pw, ph, sheet.rgba());
+        sized(tw, th).child(at(printed(out_plate.w, out_plate.h, &img), -pad, -pad))
+    }
 }
 
 fn tape_size() -> (f32, f32) {
     (toast::shaped_brush_w("you press", 15.0) + 24.0, 15.0 * BRUSH_LINE + 5.0)
-}
-
-/// A printed picture's straight RGBA back (GPUI holds it as BGRA).
-fn px_rgba(img: &Img, pw: u32, ph: u32) -> Vec<u8> {
-    let mut out = img.as_bytes(0).map(|b| b.to_vec()).unwrap_or_else(|| vec![0; (pw * ph * 4) as usize]);
-    for p in out.chunks_exact_mut(4) {
-        p.swap(0, 2);
-    }
-    out
 }
 
 

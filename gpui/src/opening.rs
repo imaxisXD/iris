@@ -61,6 +61,7 @@ pub const QUICK: Script = Script { full: false, bloom: 0.5, readable: f64::INFIN
 pub fn panel_state() -> Panel {
     Panel {
         original: SAMPLE.into(),
+        tones: crate::model::default_tones(),
         selected: 0,
         phase: Phase::Done(Answer::fix(SAMPLE, FIXED, Some(Verdict::Minor), false)),
         app_name: Some("Slack".into()),
@@ -255,7 +256,18 @@ pub fn unroll(t: f64, script: &Script) -> (f64, f64) {
 /// thread).
 #[allow(clippy::too_many_arguments)]
 pub fn scene(t: f64, script: &Script, shown: &Panel, look: &panel::Look, paper_h: f32, measured: Rc<Cell<f32>>, rig: Option<&Img>) -> Div {
-    let (x, paper_top, _foot, hinge) = place(paper_h);
+    // When live, evaluate the critically damped body height spring before placing the paper so
+    // its bottom edge stays locked 10 pt above the text box on every frame with zero frame lag.
+    let live = crate::interact::get().filter(|l| l.view.is_some());
+    let (body_override, effective_paper_h) = match &live {
+        Some(l) => {
+            let (cur_body_h, height_moving) = l.spring("panel-body-h", panel::body_height(shown), 0.24, 0.0);
+            let chrome_h = l.anim.borrow().panel_chrome_h.unwrap_or(137.0);
+            (Some((cur_body_h, height_moving)), chrome_h + cur_body_h)
+        }
+        None => (None, paper_h),
+    };
+    let (x, paper_top, _foot, hinge) = place(effective_paper_h);
     let (u, fade) = unroll(t, script);
 
     let mut s = div().relative().w(px(SCENE.0)).h(px(SCENE.1)).overflow_hidden();
@@ -283,22 +295,37 @@ pub fn scene(t: f64, script: &Script, shown: &Panel, look: &panel::Look, paper_h
         let sy = FOLDED.1 + (1.0 - FOLDED.1) * u;
         let origin = (x - MARGIN.0, paper_top - MARGIN.1);
         let full_w = panel::WIDTH + 2.0 * MARGIN.0;
-        let full_h = paper_h + MARGIN.1 + MARGIN.2;
+        let full_h = effective_paper_h + MARGIN.1 + MARGIN.2;
         let anchor = ((hinge.0 - origin.0) / full_w, (hinge.1 - origin.1) / full_h);
         let shown_h = (full_h * sy / sx).min(full_h);
         let m = measured.clone();
+        let live_fit = live.as_ref().map(|l| l.anim.clone());
         let p = with_zoom(sx, || {
             let k = crate::parts::zoom();
             let fit = canvas(|_, _, _| (), move |b, _, window, _| {
-                // The paper's height at full size; when it changes (another tone's answer), place
-                // the panel again.
                 let h = f32::from(b.size.height) / k;
-                if (m.get() - h).abs() > 0.25 {
+                if let (Some(anim), Some((cur_body_h, _))) = (&live_fit, body_override) {
+                    let measured_chrome = h - cur_body_h;
+                    let mut a = anim.borrow_mut();
+                    let chrome_changed = k > 0.98 && a.panel_chrome_h.is_none_or(|old| (old - measured_chrome).abs() > 0.25);
+                    if chrome_changed {
+                        a.panel_chrome_h = Some(measured_chrome);
+                    }
+                    drop(a);
+                    if (m.get() - h).abs() > 0.25 {
+                        m.set(h);
+                    }
+                    if chrome_changed {
+                        window.refresh();
+                        window.request_animation_frame();
+                    }
+                } else if (m.get() - h).abs() > 0.25 {
                     m.set(h);
                     window.refresh();
+                    window.request_animation_frame();
                 }
             }).absolute().top_0().left_0().size_full();
-            div().pl(crate::parts::z(MARGIN.0)).pt(crate::parts::z(MARGIN.1)).child(panel::panel(shown, look).child(fit))
+            div().pl(crate::parts::z(MARGIN.0)).pt(crate::parts::z(MARGIN.1)).child(panel::panel_with_body_h(shown, look, body_override).child(fit))
         });
         // Scaled about the anchor: the panel's corner moves toward it.
         let corner = (anchor.0 * full_w * (1.0 - sx), anchor.1 * full_h * (1.0 - sx));
@@ -313,7 +340,7 @@ pub fn scene(t: f64, script: &Script, shown: &Panel, look: &panel::Look, paper_h
 
     if let Some(img) = rig {
         // One picture pixel a device pixel (the picture is whole pixels, a touch over the canvas).
-        let (left, top, w, h) = rig_box(paper_h);
+        let (left, top, w, h) = rig_box(effective_paper_h);
         let (w, h) = ((w * look.scale).ceil() / look.scale, (h * look.scale).ceil() / look.scale);
         s = s.child(at(printed(w, h, img), left, top));
     }

@@ -485,7 +485,7 @@ impl Check {
             return crate::updater::words(&st);
         }
         match self {
-            Check::Idle => (format!("Iris {}", installed()), "The version on this Mac.".to_string(), false),
+            Check::Idle => (format!("Iris {}", installed()), crate::words::w("The version on this Mac.").to_string(), false),
             Check::Looking => ("Looking…".into(), "Looking for a new Iris…".into(), false),
             Check::UpToDate => ("Up to date".into(), "You have the latest Iris.".into(), false),
             Check::New => ("2 new changes".into(), "Ready to install.".into(), false),

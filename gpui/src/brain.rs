@@ -11,8 +11,47 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{Receiver, channel};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
+use std::task::{Poll, Waker};
+
+/// Race-free one-bit wakeup signal so the blocking reader thread wakes the GPUI foreground
+/// task immediately with zero polling and zero idle wakeups.
+struct WakeSignal {
+    ready: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl WakeSignal {
+    fn new() -> Self {
+        Self { ready: AtomicBool::new(false), waker: Mutex::new(None) }
+    }
+
+    fn notify(&self) {
+        self.ready.store(true, Ordering::Release);
+        if let Some(w) = self.waker.lock().ok().and_then(|mut g| g.take()) {
+            w.wake();
+        }
+    }
+
+    async fn wait(&self) {
+        std::future::poll_fn(|cx| {
+            if self.ready.swap(false, Ordering::AcqRel) {
+                return Poll::Ready(());
+            }
+            if let Ok(mut g) = self.waker.lock() {
+                *g = Some(cx.waker().clone());
+            }
+            if self.ready.swap(false, Ordering::AcqRel) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+}
 
 use gpui::*;
 use serde_json::{Value, json};
@@ -110,10 +149,25 @@ impl Global for BrainHandle {}
 type OnEvent = Box<dyn FnMut(Event, &mut App)>;
 
 thread_local! {
+    static APP: RefCell<Option<AsyncApp>> = const { RefCell::new(None) };
     static STDIN: RefCell<Option<ChildStdin>> = const { RefCell::new(None) };
     static CHILD: RefCell<Option<Child>> = const { RefCell::new(None) };
     static CHECKS: RefCell<HashMap<i64, OnEvent>> = RefCell::new(HashMap::new());
     static NEXT: RefCell<i64> = const { RefCell::new(1) };
+    /// Tracks a check id currently inside `deliver()` so a re-entrant `cancel(id)` stops it
+    /// from being re-inserted after a `Partial` callback returns.
+    static DELIVERING: RefCell<Option<(i64, bool)>> = const { RefCell::new(None) };
+}
+
+fn brain_gone_problem() -> Problem {
+    Problem {
+        note: "iris couldn't keep running. try again?".into(),
+        lead: "Iris stopped.".into(),
+        detail: "Try again, or reopen Iris.".into(),
+        can_retry: true,
+        circled: false,
+        check_failed: true,
+    }
 }
 
 /// Where the brain is: beside the app's own program in a bundle (`Contents/MacOS/iris-brain`),
@@ -122,7 +176,7 @@ fn path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("IRIS_BRAIN") {
         return Some(PathBuf::from(p));
     }
-    let beside = std::env::current_exe().ok()?.with_file_name("iris-brain");
+    let beside = std::env::current_exe().ok()?.with_file_name(format!("iris-brain{}", std::env::consts::EXE_SUFFIX));
     if beside.exists() {
         return Some(beside);
     }
@@ -138,18 +192,22 @@ fn path() -> Option<PathBuf> {
     None
 }
 
-/// Sends a request.
-fn send(v: Value) {
+/// Sends a request; returns false if the brain isn't running or the pipe broke.
+fn send(v: Value) -> bool {
     STDIN.with(|s| {
-        if let Some(stdin) = s.borrow_mut().as_mut() {
-            let _ = writeln!(stdin, "{v}");
-            let _ = stdin.flush();
+        let mut slot = s.borrow_mut();
+        let Some(stdin) = slot.as_mut() else { return false };
+        if writeln!(stdin, "{v}").is_err() || stdin.flush().is_err() {
+            *slot = None;
+            return false;
         }
-    });
+        true
+    })
 }
 
 /// Starts the brain and listens to it. The `Brain` entity goes in a global.
 pub fn start(cx: &mut App) {
+    APP.with(|a| *a.borrow_mut() = Some(cx.to_async()));
     let brain = cx.new(|_| Brain { engine: Engine::Idle, models: vec![], recommended: None, chosen: None, tones: vec![Mode::fix()], starting: "fix".into(), alive: false });
     cx.set_global(BrainHandle(brain.clone()));
     // `--mock-answers`: no brain, canned answers (`mock.rs`).
@@ -166,6 +224,18 @@ pub fn start(cx: &mut App) {
     if let Some(dir) = path.parent() {
         cmd.current_dir(dir);
     }
+    // Windows: no console window for the brain (or the llama.cpp server it starts), and its log
+    // in a file (brain.log beside the settings), since a windowed app has no stderr to share.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let home = crate::store::home();
+        let _ = std::fs::create_dir_all(&home);
+        if let Ok(log) = std::fs::File::create(home.join("brain.log")) {
+            cmd.stderr(log);
+        }
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -173,11 +243,15 @@ pub fn start(cx: &mut App) {
             return;
         }
     };
+    #[cfg(windows)]
+    windows_job::hold(&child);
     let stdout = child.stdout.take().unwrap();
     STDIN.with(|s| *s.borrow_mut() = child.stdin.take());
     CHILD.with(|c| *c.borrow_mut() = Some(child));
     brain.update(cx, |b, _| b.alive = true);
     let (tx, rx) = channel::<Value>();
+    let signal = Arc::new(WakeSignal::new());
+    let signal_reader = signal.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             match serde_json::from_str::<Value>(&line) {
@@ -185,42 +259,39 @@ pub fn start(cx: &mut App) {
                     if tx.send(v).is_err() {
                         return;
                     }
+                    signal_reader.notify();
                 }
                 Err(_) => eprintln!("brain: not JSON: {line}"),
             }
         }
         let _ = tx.send(json!({"event": "gone"}));
+        signal_reader.notify();
     });
-    pump(rx, brain, cx);
-    send(json!({"op": "hello"}));
-    configure(cx);
-}
-
-/// Hands the brain's news to the main thread, as it comes.
-fn pump(rx: Receiver<Value>, brain: Entity<Brain>, cx: &mut App) {
+    // Event-driven wakeup on the main thread: 0ms polling delay and zero idle wakeups.
+    let brain_for_pump = brain.clone();
     cx.spawn(async move |cx| {
         loop {
-            cx.background_executor().timer(Duration::from_millis(16)).await;
+            signal.wait().await;
             let mut news = vec![];
             while let Ok(v) = rx.try_recv() {
                 news.push(v);
             }
-            if news.is_empty() {
-                continue;
-            }
-            let gone = cx.update(|cx| {
+            if !news.is_empty() {
                 let mut gone = false;
-                for v in news {
-                    gone |= handle(v, &brain, cx);
+                let _ = cx.update(|cx| {
+                    for v in news {
+                        gone |= handle(v, &brain_for_pump, cx);
+                    }
+                });
+                if gone {
+                    return;
                 }
-                gone
-            });
-            if gone {
-                return;
             }
         }
     })
     .detach();
+    send(json!({"op": "hello"}));
+    configure(cx);
 }
 
 /// One piece of news. True when the brain has gone.
@@ -248,9 +319,22 @@ fn handle(v: Value, brain: &Entity<Brain>, cx: &mut App) -> bool {
                 cx.notify();
             });
             if became_ready {
-                let starting = brain.read(cx).starting.clone();
-                let mode = brain.read(cx).tones.iter().find(|m| m.id == starting).cloned().unwrap_or_else(Mode::fix);
-                prewarm(&mode);
+                let b = brain.read(cx);
+                let starting = b.starting.clone();
+                let tones = b.tones.clone();
+                let first = tones.iter().find(|m| m.id == starting).cloned().unwrap_or_else(Mode::fix);
+                prewarm(&first);
+                // Prewarm the remaining shown tones in the background (real checks jump ahead in
+                // the engine's gate) so switching tones with Tab hits a warm prefix cache.
+                // Not on Windows: llama-server has no such gate (a warm-up shares the CPU with
+                // the first real check) and four slots, so more tones would push the one the
+                // panel opens on out; a tone used once is saved and comes back from disk in ms.
+                #[cfg(not(windows))]
+                for m in &tones {
+                    if m.id != first.id {
+                        prewarm(m);
+                    }
+                }
             }
         }
         "hello" => {
@@ -287,10 +371,23 @@ fn handle(v: Value, brain: &Entity<Brain>, cx: &mut App) -> bool {
         }
         "gone" => {
             eprintln!("brain: gone");
+            STDIN.with(|s| s.borrow_mut().take());
+            CHILD.with(|c| {
+                if let Some(mut child) = c.borrow_mut().take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            });
             brain.update(cx, |b, cx| {
                 b.alive = false;
                 cx.notify();
             });
+            // Fail any in-flight checks so panels don't spin forever and Quick Fix doesn't wedge.
+            let pending: Vec<OnEvent> = CHECKS.with(|c| c.borrow_mut().drain().map(|(_, cb)| cb).collect());
+            let problem = brain_gone_problem();
+            for mut cb in pending {
+                cb(Event::Failed(problem.clone()), cx);
+            }
             return true;
         }
         _ => {}
@@ -303,8 +400,13 @@ pub fn deliver(id: i64, event: Event, cx: &mut App) {
     let last = !matches!(event, Event::Partial(_));
     let cb = CHECKS.with(|c| c.borrow_mut().remove(&id));
     if let Some(mut cb) = cb {
+        let prev = DELIVERING.with(|d| d.replace(Some((id, false))));
         cb(event, cx);
-        if !last {
+        let cancelled = DELIVERING.with(|d| {
+            let cur = d.replace(prev);
+            cur.is_some_and(|(_, c)| c)
+        });
+        if !last && !cancelled {
             CHECKS.with(|c| c.borrow_mut().insert(id, cb));
         }
     }
@@ -386,14 +488,51 @@ pub fn check(text: &str, mode: &Mode, retry: bool, on: impl FnMut(Event, &mut Ap
         return id;
     }
     let s = crate::app::settings();
-    send(json!({"op": "check", "id": id, "text": text, "mode": mode.json(), "retry": retry,
-                "glossary": s.glossary, "styleRules": s.style_rules}));
+    #[allow(unused_mut)]
+    let mut req = json!({"op": "check", "id": id, "text": text, "mode": mode.json(), "retry": retry,
+                "glossary": s.glossary, "styleRules": s.style_rules});
+    // Windows: the language check and the words Windows' dictionaries don't know, worked out here
+    // (the Mac's brain asks the Mac's own; on Windows the brain has neither).
+    #[cfg(windows)]
+    windows_language(&mut req, text);
+    if !send(req) {
+        if let Some(acx) = APP.with(|a| a.borrow().clone()) {
+            let acx_inner = acx.clone();
+            acx.foreground_executor()
+                .spawn(async move {
+                    let _ = acx_inner.update(|cx| deliver(id, Event::Failed(brain_gone_problem()), cx));
+                })
+                .detach();
+        } else {
+            CHECKS.with(|c| c.borrow_mut().remove(&id));
+        }
+    }
     id
+}
+
+#[cfg(windows)]
+fn windows_language(req: &mut Value, text: &str) {
+    thread_local! {
+        static DICT: crate::spelling_win::Dictionaries = crate::spelling_win::Dictionaries::open();
+    }
+    DICT.with(|d| {
+        req["looksForeign"] = json!(crate::spelling_win::looks_foreign(text, d));
+        let words: Vec<Value> = d.misspelled(text).into_iter()
+            .map(|(word, start, guesses)| json!({"word": word, "start": start, "guesses": guesses})).collect();
+        req["misspelled"] = json!(words);
+    });
 }
 
 /// Stops a check; its callback hears nothing more.
 pub fn cancel(id: i64) {
     CHECKS.with(|c| c.borrow_mut().remove(&id));
+    DELIVERING.with(|d| {
+        if let Some((cur, cancelled)) = d.borrow_mut().as_mut()
+            && *cur == id
+        {
+            *cancelled = true;
+        }
+    });
     send(json!({"op": "cancel", "id": id}));
 }
 
@@ -414,6 +553,51 @@ pub fn stop() {
     CHILD.with(|c| {
         if let Some(mut child) = c.borrow_mut().take() {
             let _ = child.kill();
+            let _ = child.wait();
         }
     });
+}
+
+/// Windows: the brain in a Job Object that ends with Iris. If Iris quits, crashes or is ended
+/// in Task Manager, Windows ends the brain and the llama.cpp server it started (children join
+/// their parent's job), so no 3 GB server is left running.
+#[cfg(windows)]
+mod windows_job {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    thread_local! {
+        /// Kept open for Iris's whole life: closing it (Iris ending) ends everything in it.
+        static JOB: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub fn hold(child: &std::process::Child) {
+        unsafe {
+            let existing = JOB.with(|j| j.get());
+            let (job, created) = if existing != 0 {
+                (HANDLE(existing as _), false)
+            } else {
+                let Ok(job) = CreateJobObjectW(None, None) else { return };
+                let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let _ = SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32);
+                (job, true)
+            };
+            if AssignProcessToJobObject(job, HANDLE(child.as_raw_handle() as _)).is_ok() {
+                if created {
+                    JOB.with(|j| j.set(job.0 as isize));
+                }
+            } else {
+                if created {
+                    let _ = CloseHandle(job);
+                }
+                eprintln!("brain: couldn't put the brain in a job object");
+            }
+        }
+    }
 }

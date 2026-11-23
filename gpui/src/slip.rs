@@ -69,7 +69,7 @@ impl Engine {
 pub struct Command {
     pub id: &'static str,
     pub title: &'static str,
-    pub keys: Vec<&'static str>,
+    pub keys: Vec<String>,
     pub icon: Option<Icon>,
 }
 
@@ -89,50 +89,54 @@ pub struct Slip {
     pub page: Option<crate::page::Page>,
 }
 
-pub const OPEN_KEYS: [&str; 3] = ["⌃", "⌥", "G"];
-pub const QUICK_KEYS: [&str; 4] = ["⌃", "⌥", "⇧", "G"];
+/// The default shortcuts' caps (⌃⌥G and ⌃⌥⇧G on the Mac), for a slip no settings told.
+fn default_open_keys() -> Vec<String> {
+    crate::keys::caps(crate::keys::open_default())
+}
+
+fn default_quick_keys() -> Vec<String> {
+    crate::keys::caps(crate::keys::quick_fix_default())
+}
 
 thread_local! {
     /// The shortcuts as Settings has them, once the app has said (the snapshots keep ⌃⌥G).
-    static KEYS: std::cell::RefCell<Option<(Vec<&'static str>, Option<Vec<&'static str>>)>> = const { std::cell::RefCell::new(None) };
+    static KEYS: std::cell::RefCell<Option<(Vec<String>, Option<Vec<String>>)>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Tells the slip which keys the shortcuts are (each change of shortcut leaks a few bytes of
-/// key names, which is nothing).
+/// Tells the slip which keys the shortcuts are.
 pub fn set_keys(open: Vec<String>, quick: Option<Vec<String>>) {
-    let leak = |v: Vec<String>| v.into_iter().map(|s| &*Box::leak(s.into_boxed_str())).collect::<Vec<&'static str>>();
-    KEYS.with(|k| *k.borrow_mut() = Some((leak(open), quick.map(leak))));
+    KEYS.with(|k| *k.borrow_mut() = Some((open, quick)));
 }
 
 /// The keys the app has told (none: never told, as in a snapshot).
-pub fn told_keys() -> Option<(Vec<&'static str>, Option<Vec<&'static str>>)> {
+pub fn told_keys() -> Option<(Vec<String>, Option<Vec<String>>)> {
     KEYS.with(|k| k.borrow().clone())
 }
 
-fn open_keys() -> Vec<&'static str> {
-    KEYS.with(|k| k.borrow().as_ref().map(|k| k.0.clone())).unwrap_or_else(|| OPEN_KEYS.to_vec())
+fn open_keys() -> Vec<String> {
+    KEYS.with(|k| k.borrow().as_ref().map(|k| k.0.clone())).unwrap_or_else(default_open_keys)
 }
 
-fn quick_keys() -> Option<Vec<&'static str>> {
-    KEYS.with(|k| k.borrow().as_ref().map(|k| k.1.clone())).unwrap_or_else(|| Some(QUICK_KEYS.to_vec()))
+fn quick_keys() -> Option<Vec<String>> {
+    KEYS.with(|k| k.borrow().as_ref().map(|k| k.1.clone())).unwrap_or_else(|| Some(default_quick_keys()))
 }
 
 /// `SlipRows.build`: the rows for where Iris stands.
 pub fn rows(shortcut_taken: bool, setup_complete: bool, model_ready: bool) -> Vec<Vec<Command>> {
-    let c = |id, title, keys: &[&'static str], icon| Command { id, title, keys: keys.to_vec(), icon };
-    let settings = c("settings", "Settings…", &["⌘", ","], Some(Icon::General));
-    let update = c("update", "Check for Updates…", &[], Some(Icon::Updates));
-    let quit = vec![c("quit", "Quit Iris", &["⌘", "Q"], None)];
+    let c = |id, title, keys: Vec<String>, icon| Command { id, title, keys, icon };
+    let settings = c("settings", "Settings…", crate::keys::command(","), Some(Icon::General));
+    let update = c("update", "Check for Updates…", vec![], Some(Icon::Updates));
+    let quit = vec![c("quit", "Quit Iris", crate::keys::command("Q"), None)];
     if !setup_complete {
-        return vec![vec![c("setup", "Finish setup…", &[], Some(Icon::Tray))], vec![settings, update], quit];
+        return vec![vec![c("setup", "Finish setup…", vec![], Some(Icon::Tray))], vec![settings, update], quit];
     }
-    let mut check = vec![c("check", "Check text", &open_keys(), Some(Icon::Tones))];
+    let mut check = vec![c("check", "Check text", open_keys(), Some(Icon::Tones))];
     if shortcut_taken {
-        check.insert(0, c("shortcut", "Change shortcut…", &[], Some(Icon::Shortcuts)));
+        check.insert(0, c("shortcut", "Change shortcut…", vec![], Some(Icon::Shortcuts)));
     }
-    check.push(c("quick", "Quick Fix", &quick_keys().unwrap_or_default(), Some(Icon::Wand)));
-    let model = c("model", if model_ready { "Free model memory" } else { "Load model now" }, &[], Some(Icon::Model));
-    vec![check, vec![model], vec![c("setup", "Setup…", &[], Some(Icon::Tray)), settings, update], quit]
+    check.push(c("quick", "Quick Fix", quick_keys().unwrap_or_default(), Some(Icon::Wand)));
+    let model = c("model", if model_ready { "Free model memory" } else { "Load model now" }, vec![], Some(Icon::Model));
+    vec![check, vec![model], vec![c("setup", "Setup…", vec![], Some(Icon::Tray)), settings, update], quit]
 }
 
 pub fn shortcut_taken_line() -> String {
@@ -207,17 +211,46 @@ pub fn slip_live(s: &Slip, t: f64, acts: Option<&Acts>, scale: f32) -> Div {
 /// The paper, its cut edge and shadow behind; its tooth over everything, printed at paint time
 /// for the size the slip came out.
 fn paper(body: Div, scale: f32) -> Div {
+    // Reuse recent plates during opening spring zoom (`k != 1.0`) when height jitters by ±1–3 pt
+    // due to child pixel rounding so spring frames don't multiply cached ~4 MB plates. Updated on
+    // miss too so the very first opening spring (and state height changes) seed the reference.
+    // Only the size is kept, and the plate is asked for again at it: through the print cache,
+    // which records this window as using it, so its drops still reach this window's atlas.
+    thread_local! {
+        static LAST_PAPER: std::cell::Cell<Option<(f32, f32, f32, bool)>> = const { std::cell::Cell::new(None) };
+        static LAST_GRAIN: std::cell::Cell<Option<(f32, f32, f32)>> = const { std::cell::Cell::new(None) };
+    }
     let k = zoom();
+    let solid = SOLID.with(|s| s.get());
     let back = canvas(|_, _, _| (), move |b, _, window, _| {
         let (w, h) = ((f32::from(b.size.width) / k).round(), (f32::from(b.size.height) / k).round());
-        let (img, pad) = note_paper(w, h, scale);
+        let (img, pad) = LAST_PAPER.with(|l| {
+            if (k - 1.0).abs() > 1e-4
+                && let Some((lw, lh, ls, lsolid)) = l.get()
+                && (w - lw).abs() <= 3.0 && (h - lh).abs() <= 3.0 && ls == scale && lsolid == solid
+            {
+                return note_paper(lw, lh, scale);
+            }
+            l.set(Some((w, h, scale, solid)));
+            note_paper(w, h, scale)
+        });
         let p = gpui::px(pad * k);
         let at = gpui::Bounds { origin: gpui::point(b.origin.x - p, b.origin.y - p), size: gpui::size(b.size.width + p * 2.0, b.size.height + p * 2.0) };
         let _ = window.paint_image(at, at, Default::default(), img, 0, false);
     }).absolute().top_0().left_0().size_full();
     let tooth = canvas(|_, _, _| (), move |b, _, window, _| {
         let (w, h) = ((f32::from(b.size.width) / k).round(), (f32::from(b.size.height) / k).round());
-        let _ = window.paint_image(b, b, Default::default(), note_grain(w, h, scale), 0, false);
+        let img = LAST_GRAIN.with(|l| {
+            if (k - 1.0).abs() > 1e-4
+                && let Some((lw, lh, ls)) = l.get()
+                && (w - lw).abs() <= 3.0 && (h - lh).abs() <= 3.0 && ls == scale
+            {
+                return note_grain(lw, lh, scale);
+            }
+            l.set(Some((w, h, scale)));
+            note_grain(w, h, scale)
+        });
+        let _ = window.paint_image(b, b, Default::default(), img, 0, false);
     }).absolute().top_0().left_0().size_full();
     div().relative().w(z(WIDTH)).child(back).child(body).child(tooth)
 }
@@ -279,7 +312,7 @@ pub fn progress_track(f: f64, width: f32, scale: f32) -> Div {
     let mid = (17.0 * BRUSH_LINE * scale).ceil() / scale / 2.0;
     sized(width, 18.0)
         .child(at(pen_rule(91, width, over(hue::I12, 0.18, ink::PAPER), 1.0), 0.0, mid - 1.5))
-        .child(at(div().opacity(0.45).child(hand_printed(92, 0.7, w, 12.0, ink::PINK, 92, scale)), 0.0, mid - 6.0))
+        .child(at(div().opacity(0.45).child(hand_printed_frame(92, 0.7, w, 12.0, ink::PINK, 92, scale)), 0.0, mid - 6.0))
         .child(at(t(format!("{}%", (f * 100.0) as i32), brush(17.0), ink::PINK_TEXT), w + 6.0, mid - line_box(17.0, BRUSH_LINE) / 2.0))
 }
 

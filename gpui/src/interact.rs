@@ -51,8 +51,6 @@ impl Curve {
     pub const FAST: Curve = Curve::Ease(0.15);
     /// `DS.Motion.knob`.
     pub const KNOB: Curve = Curve::Spring(0.45, 0.2);
-    /// `DS.Motion.pill`.
-    pub const PILL: Curve = Curve::Spring(0.4, 0.12);
 
     /// Where it is `t` seconds in, 0 → 1 (a spring overshoots a touch).
     fn at(self, t: f32) -> f32 {
@@ -89,6 +87,67 @@ struct Track {
     curve: Curve,
 }
 
+/// An analytical damped spring (`DS.Motion.pill` / SwiftUI `.spring(duration:bounce:)`), carrying
+/// live position and velocity so mid-flight retargets redirect smoothly instead of restarting.
+#[derive(Clone, Copy)]
+struct SpringTrack {
+    x0: f32,
+    v0: f32,
+    target: f32,
+    since: Instant,
+    duration: f32,
+    bounce: f32,
+}
+
+impl SpringTrack {
+    /// Evaluates `(position, velocity)` at `t` scaled seconds into the spring.
+    fn eval(&self, t: f32) -> (f32, f32) {
+        let e0 = self.x0 - self.target;
+        if t <= 0.0 || (e0.abs() <= 1e-6 && self.v0.abs() <= 1e-6) {
+            return (self.x0, self.v0);
+        }
+        let omega = std::f32::consts::TAU / self.duration.max(1e-3);
+        let zeta = (1.0 - self.bounce).clamp(0.05, 1.0);
+        if zeta >= 0.9999 {
+            // Exact critically damped closed form: zero overshoot and C¹ velocity continuity.
+            let decay = (-omega * t).exp();
+            let c2 = self.v0 + omega * e0;
+            let e = decay * (e0 + c2 * t);
+            let v = decay * (self.v0 - omega * c2 * t);
+            return (self.target + e, v);
+        }
+        let wd = omega * (1.0 - zeta * zeta).sqrt();
+        let a = e0;
+        let b = (self.v0 + zeta * omega * e0) / wd;
+        let decay = (-zeta * omega * t).exp();
+        let (sin, cos) = (wd * t).sin_cos();
+        let e = decay * (a * cos + b * sin);
+        let v = decay * (self.v0 * cos - ((zeta * omega * self.v0 + omega * omega * e0) / wd) * sin);
+        (self.target + e, v)
+    }
+
+    fn settled(&self, t: f32, x: f32, v: f32) -> bool {
+        let e0 = self.x0 - self.target;
+        if e0.abs() <= 1e-6 && self.v0.abs() <= 1e-6 {
+            return true;
+        }
+        if t >= self.duration * 2.2 {
+            return true;
+        }
+        let omega = std::f32::consts::TAU / self.duration.max(1e-3);
+        let scale = e0.abs().max(self.v0.abs() / omega).max(1e-3);
+        t > 0.0 && (x - self.target).abs() <= 1e-3 * scale && v.abs() <= 1e-3 * scale * omega
+    }
+}
+
+/// State for a simultaneous in-place panel body cross-fade (`popLayout`).
+struct BodySwap {
+    key: String,
+    current: crate::model::Panel,
+    outgoing: Option<crate::model::Panel>,
+    since: Instant,
+}
+
 /// The window's moving parts: what's under the pointer, what's held down, each tracked value,
 /// and where the controls that pop a menu were last drawn.
 #[derive(Default)]
@@ -96,13 +155,24 @@ pub struct Anim {
     hovered: HashSet<String>,
     pressed: HashSet<String>,
     tracks: HashMap<String, Track>,
+    springs: HashMap<String, SpringTrack>,
     pub bounds: HashMap<String, Bounds<Pixels>>,
     /// A marker's flight: the choice it left, the one it's going to, since when.
     flights: HashMap<String, (usize, usize, Instant)>,
+    /// Simultaneous in-place panel body cross-fade (`panel.rs`).
+    body_swap: Option<BodySwap>,
+    /// Measured panel chrome height (`paper_h - body_h`) at full scale, so `opening::scene`
+    /// places the paper from `chrome_h + animated_body_h` with zero frame lag.
+    pub panel_chrome_h: Option<f32>,
     /// Controls whose menu is open.
     open: HashSet<String>,
     /// The note demo's clock (`NotesSection`).
     pub demo: DemoClock,
+    /// Frame counter and start instant for contiguous breathing pulses (`WaitingText`), so each
+    /// wait begins at full opacity (`1.0`) rather than a random global phase.
+    frame_id: u64,
+    pulse_frame: u64,
+    pulse_since: Option<Instant>,
     /// Something is still moving: draw another frame.
     pub moving: bool,
 }
@@ -111,10 +181,14 @@ impl Anim {
     /// Forgets every tracked value (a page turned), so the next page starts at rest.
     pub fn reset(&mut self) {
         self.tracks.clear();
+        self.springs.clear();
         self.hovered.clear();
         self.pressed.clear();
         self.bounds.clear();
         self.flights.clear();
+        self.body_swap = None;
+        self.panel_chrome_h = None;
+        self.pulse_since = None;
     }
 
     fn track(&mut self, id: &str, target: f32, curve: Curve, now: Instant) -> f32 {
@@ -133,6 +207,33 @@ impl Anim {
             shown(tr)
         } else {
             tr.to
+        }
+    }
+
+    fn spring(&mut self, id: &str, target: f32, duration: f32, bounce: f32, now: Instant) -> (f32, bool) {
+        let slow = crate::parts::slow().max(1e-3);
+        let tr = self.springs.entry(id.to_string()).or_insert(SpringTrack {
+            x0: target,
+            v0: 0.0,
+            target,
+            since: now,
+            duration,
+            bounce,
+        });
+        if (tr.target - target).abs() > 1e-6 {
+            let elapsed = now.duration_since(tr.since).as_secs_f32() / slow;
+            let (cur_x, cur_v) = tr.eval(elapsed);
+            *tr = SpringTrack { x0: cur_x, v0: cur_v, target, since: now, duration, bounce };
+        }
+        let elapsed = now.duration_since(tr.since).as_secs_f32() / slow;
+        let (x, v) = tr.eval(elapsed);
+        if tr.settled(elapsed, x, v) {
+            tr.x0 = tr.target;
+            tr.v0 = 0.0;
+            (tr.target, false)
+        } else {
+            self.moving = true;
+            (x, true)
         }
     }
 }
@@ -284,24 +385,81 @@ impl Live {
         self.anim.borrow_mut().track(id, target, curve, self.now)
     }
 
-    /// A flight between choices: (from, to, how far along, 0 → 1 with the spring's overshoot).
-    pub fn flight(&self, id: &str, target: usize, curve: Curve) -> (usize, usize, f32) {
-        let curve = match curve {
-            Curve::Spring(..) if self.reduce_motion => Curve::FAST,
-            c => c,
-        };
+    /// A value driven by an analytical damped spring (`DS.Motion.pill`), preserving live velocity
+    /// when retargeted mid-flight. Under Reduce Motion it lands immediately with no travel.
+    /// Returns `(current_value, still_moving)`.
+    pub fn spring(&self, id: &str, target: f32, duration: f32, bounce: f32) -> (f32, bool) {
+        if self.reduce_motion {
+            return (target, false);
+        }
+        self.anim.borrow_mut().spring(id, target, duration, bounce, self.now)
+    }
+
+    /// Scaled seconds elapsed since a contiguous breathing wait (`WaitingText`) began, resetting
+    /// cleanly to `0.0` (full opacity) whenever a wait starts anew.
+    pub fn pulse_elapsed(&self) -> f32 {
+        let mut a = self.anim.borrow_mut();
+        let frame = a.frame_id;
+        let fresh = a.pulse_since.is_none() || (a.pulse_frame != frame && a.pulse_frame + 1 != frame);
+        if fresh {
+            a.pulse_since = Some(self.now);
+        }
+        a.pulse_frame = frame;
+        let since = a.pulse_since.unwrap_or(self.now);
+        self.now.duration_since(since).as_secs_f32() / crate::parts::slow().max(1e-3)
+    }
+
+    /// A flight between choices: `(from, to, elapsed_scaled_s)`. While `from != to` and
+    /// `elapsed_scaled_s < duration`, marks the window as moving so it draws another frame.
+    /// Once settled (`elapsed_scaled_s >= duration`), returns `(to, to, duration)`.
+    pub fn flight_elapsed(&self, id: &str, target: usize, duration: f32) -> (usize, usize, f32) {
         let mut a = self.anim.borrow_mut();
         let f = a.flights.entry(id.to_string()).or_insert((target, target, self.now));
         if f.1 != target {
             *f = (f.1, target, self.now);
         }
         let (from, to, since) = *f;
-        let t = self.now.duration_since(since).as_secs_f32();
-        if from != to && t < curve.length() {
+        let slow = crate::parts::slow().max(1e-3);
+        let elapsed = self.now.duration_since(since).as_secs_f32() / slow;
+        if from != to && elapsed < duration {
             a.moving = true;
-            (from, to, curve.at(t))
+            (from, to, elapsed)
         } else {
-            (to, to, 1.0)
+            (to, to, duration)
+        }
+    }
+
+    /// Tracks the panel's displayed body keyed by `key`. When `key` changes, keeps the previous
+    /// panel as an outgoing layer for `duration` scaled seconds so incoming and outgoing content
+    /// cross-fade simultaneously (`popLayout`), marking the window as moving while active.
+    pub fn body_swap(&self, panel: &crate::model::Panel, key: String, duration: f32) -> Option<(crate::model::Panel, f32)> {
+        let mut a = self.anim.borrow_mut();
+        let slow = crate::parts::slow().max(1e-3);
+        match &mut a.body_swap {
+            None => {
+                a.body_swap = Some(BodySwap { key, current: panel.clone(), outgoing: None, since: self.now });
+                None
+            }
+            Some(s) => {
+                if s.key != key {
+                    let prev = std::mem::replace(&mut s.current, panel.clone());
+                    s.key = key;
+                    s.outgoing = Some(prev);
+                    s.since = self.now;
+                } else {
+                    s.current = panel.clone();
+                }
+                let elapsed = self.now.duration_since(s.since).as_secs_f32() / slow;
+                if elapsed < duration {
+                    if let Some(out) = s.outgoing.clone() {
+                        a.moving = true;
+                        return Some((out, elapsed));
+                    }
+                } else {
+                    s.outgoing = None;
+                }
+                None
+            }
         }
     }
 
@@ -468,7 +626,8 @@ pub fn alpha(c: Rgba, a: f32) -> Rgba {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's own `test` attribute would shadow the standard one.
-    use super::{ease_out, spring};
+    use std::time::{Duration, Instant};
+    use super::{Anim, ease_out, spring};
 
     #[test]
     fn curves_run_from_zero_to_one() {
@@ -479,6 +638,96 @@ mod tests {
         assert!((spring(0.45 * 1.75, 0.45, 0.2) - 1.0).abs() < 0.01);
         // A bounce overshoots.
         assert!((0..100).any(|i| spring(i as f32 * 0.01, 0.45, 0.2) > 1.01));
+    }
+
+    #[test]
+    fn spring_track_matches_swift_spring_and_retargets_smoothly() {
+        let t0 = Instant::now();
+        let mut anim = Anim::default();
+        // First sight starts at rest.
+        assert_eq!(anim.spring("x", 0.0, 0.4, 0.12, t0), (0.0, false));
+        // Retarget to 100.0; at t = 0.1 s it must match `swift_spring(0.1, 0.4, 0.12) * 100.0`.
+        let (x0, moving0) = anim.spring("x", 100.0, 0.4, 0.12, t0);
+        assert!(moving0 && x0.abs() < 1e-4);
+        let t1 = t0 + Duration::from_millis(100);
+        let (x1, moving1) = anim.spring("x", 100.0, 0.4, 0.12, t1);
+        assert!(moving1);
+        let expected = spring(0.1, 0.4, 0.12) * 100.0;
+        assert!((x1 - expected).abs() < 1e-3, "got {x1}, expected {expected}");
+        // Mid-flight retarget to 220.0 preserves position (no teleport) and continues forward smoothly.
+        let (x_retarget, moving_r) = anim.spring("x", 220.0, 0.4, 0.12, t1);
+        assert!(moving_r && (x_retarget - x1).abs() < 1e-3);
+        let t2 = t1 + Duration::from_millis(16);
+        let (x2, _) = anim.spring("x", 220.0, 0.4, 0.12, t2);
+        assert!(x2 > x_retarget, "velocity should carry marker forward: {x_retarget} -> {x2}");
+        // Eventually settles cleanly on target.
+        let t_end = t1 + Duration::from_millis(1000);
+        assert_eq!(anim.spring("x", 220.0, 0.4, 0.12, t_end), (220.0, false));
+    }
+
+    #[test]
+    fn critically_damped_spring_never_overshoots_and_retargets_smoothly() {
+        let t0 = Instant::now();
+        let mut anim = Anim::default();
+        assert_eq!(anim.spring("h", 61.0, 0.24, 0.0, t0), (61.0, false));
+        // Shrink from 61 → 17 pt: must be strictly monotonic decreasing with zero overshoot below 17.
+        let (h0, m0) = anim.spring("h", 17.0, 0.24, 0.0, t0);
+        assert!(m0 && (h0 - 61.0).abs() < 1e-4);
+        let mut prev = h0;
+        for ms in (8..=360).step_by(8) {
+            let (h, _) = anim.spring("h", 17.0, 0.24, 0.0, t0 + Duration::from_millis(ms));
+            assert!(h <= prev + 1e-4, "must decrease monotonically: {prev} -> {h} at {ms}ms");
+            assert!(h >= 17.0 - 1e-4, "critically damped spring overshot target at {ms}ms: {h}");
+            prev = h;
+        }
+        // Settles cleanly on target.
+        assert_eq!(anim.spring("h", 17.0, 0.24, 0.0, t0 + Duration::from_millis(600)), (17.0, false));
+
+        // Mid-flight reversal preserves position with zero teleport.
+        let t_rev = t0 + Duration::from_millis(700);
+        let _ = anim.spring("h", 61.0, 0.24, 0.0, t_rev);
+        let t_mid = t_rev + Duration::from_millis(60);
+        let (h_mid, m_mid) = anim.spring("h", 61.0, 0.24, 0.0, t_mid);
+        assert!(m_mid && h_mid > 25.0 && h_mid < 55.0);
+        let (h_after_rev, m_rev) = anim.spring("h", 17.0, 0.24, 0.0, t_mid);
+        assert!(m_rev && (h_after_rev - h_mid).abs() < 1e-3);
+    }
+
+    #[test]
+    fn flight_elapsed_and_body_swap_track_changes_cleanly() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let t0 = Instant::now();
+        let anim = Rc::new(RefCell::new(Anim::default()));
+        let make = |now| super::Live { anim: anim.clone(), view: None, now, reduce_motion: false, mouse: None };
+
+        // First sight starts at rest.
+        assert_eq!(make(t0).flight_elapsed("tabs", 1, 0.21), (1, 1, 0.21));
+        // Switching 1 → 3 reports direction and elapsed time, marking moving = true.
+        assert_eq!(make(t0).flight_elapsed("tabs", 3, 0.21), (1, 3, 0.0));
+        assert!(anim.borrow().moving);
+        let (f, to, el) = make(t0 + Duration::from_millis(100)).flight_elapsed("tabs", 3, 0.21);
+        assert_eq!((f, to), (1, 3));
+        assert!((el - 0.1).abs() < 1e-3);
+        assert_eq!(make(t0 + Duration::from_millis(250)).flight_elapsed("tabs", 3, 0.21), (3, 3, 0.21));
+
+        // BodySwap: first sight is at rest; same key (e.g. streamed tokens) never restarts swap;
+        // new key exposes previous panel for duration, then clears it.
+        let p0 = crate::opening::panel_state();
+        let mut p1 = p0.clone();
+        p1.selected = 1;
+        assert!(make(t0).body_swap(&p0, "0:done:a".into(), 0.16).is_none());
+        assert!(make(t0 + Duration::from_millis(20)).body_swap(&p0, "0:done:a".into(), 0.16).is_none());
+        let (out, el0) = make(t0 + Duration::from_millis(40)).body_swap(&p1, "1:gen".into(), 0.16).expect("swap starts");
+        assert_eq!(out.selected, 0);
+        assert!(el0 < 1e-4);
+        // Updating partial text under the same key continues the swap without resetting elapsed time.
+        let mut p1_stream = p1.clone();
+        p1_stream.phase = crate::model::Phase::Generating("Hi".into());
+        let (_, el1) = make(t0 + Duration::from_millis(100)).body_swap(&p1_stream, "1:gen".into(), 0.16).expect("still swapping");
+        assert!((el1 - 0.06).abs() < 1e-3);
+        // Settles after 160 ms.
+        assert!(make(t0 + Duration::from_millis(220)).body_swap(&p1_stream, "1:gen".into(), 0.16).is_none());
     }
 }
 
@@ -498,8 +747,12 @@ pub fn build<V: 'static, R>(anim: &Rc<RefCell<Anim>>, reduce_motion: bool, windo
             w.push((Rc::downgrade(anim), view.clone()));
         }
     });
+    {
+        let mut a = anim.borrow_mut();
+        a.frame_id = a.frame_id.wrapping_add(1);
+        a.moving = false;
+    }
     let live = Live { anim: anim.clone(), view: Some(view), now: Instant::now(), reduce_motion, mouse: Some(window.mouse_position()) };
-    anim.borrow_mut().moving = false;
     let out = with(live, f);
     if anim.borrow().moving {
         window.request_animation_frame();

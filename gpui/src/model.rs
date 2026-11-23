@@ -191,10 +191,15 @@ pub enum Phase {
 
 pub const TONES: [&str; 5] = ["Fix", "Professional", "Friendly", "Shorter", "Clearer"];
 
+pub fn default_tones() -> Vec<String> {
+    TONES.iter().map(|s| (*s).to_string()).collect()
+}
+
 /// What the panel is showing: `PanelModel` after `preview(...)`.
 #[derive(Clone, Debug)]
 pub struct Panel {
     pub original: String,
+    pub tones: Vec<String>,
     pub selected: usize,
     pub phase: Phase,
     pub app_name: Option<String>,
@@ -322,6 +327,7 @@ pub fn states() -> Vec<State> {
     let fix = |from: &str, to: &str, v: Option<Verdict>| Phase::Done(Answer::fix(from, to, v, false));
     let base = |original: &str, phase: Phase| Panel {
         original: original.into(),
+        tones: default_tones(),
         selected: 0,
         phase,
         app_name: Some(SLACK.0.into()),

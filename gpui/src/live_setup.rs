@@ -145,7 +145,7 @@ pub fn can_check(cx: &App) -> bool {
 pub fn slip_line(cx: &App) -> Option<String> {
     let p = progress(cx);
     let step = p.current()?;
-    let numbered = |what: &str| format!("Step {} of 3: {what}.", step as i32);
+    let numbered = |what: &str| format!("Step {} of {}: {what}.", step.number(), crate::setup::steps().len());
     Some(match step {
         Step::Allow if p.is_returning() => "Iris lost its permission to read text. Allow it again.".into(),
         Step::Allow => numbered("allow Iris to read the box you type in"),
@@ -154,7 +154,7 @@ pub fn slip_line(cx: &App) -> Option<String> {
                 .and_then(|b| if let brain::Engine::Failed(m) = &b.read(cx).engine { Some(m.sentence.clone()) } else { None })
                 .unwrap_or_else(|| f.next_step()),
             Activity::Downloading(_) => numbered("getting the model"),
-            _ if p.is_returning() => "The model isn't on this Mac any more. Download it again.".into(),
+            _ if p.is_returning() => crate::words::w("The model isn't on this Mac any more. Download it again.").into(),
             _ => numbered("get the model"),
         },
         Step::TryIt => numbered("try it once"),
@@ -163,19 +163,7 @@ pub fn slip_line(cx: &App) -> Option<String> {
 
 /// The shortcut's keys as setup shows them: (symbol, word).
 fn keys_of(k: crate::store::KeyCombo) -> Vec<(Option<String>, String)> {
-    crate::app::shortcut_caps(k).into_iter().map(|cap| {
-        let word = match cap.as_str() {
-            "⌃" => Some("control"),
-            "⌥" => Some("option"),
-            "⇧" => Some("shift"),
-            "⌘" => Some("command"),
-            _ => None,
-        };
-        match word {
-            Some(w) => (Some(cap), w.to_string()),
-            None => (None, cap),
-        }
-    }).collect()
+    crate::app::shortcut_caps(k).into_iter().map(crate::keys::labelled).collect()
 }
 
 /// Opens setup at its current step, or brings the open one forward.
@@ -259,8 +247,10 @@ pub fn own_capture(target: Option<i32>, cx: &mut App) -> Option<crate::textbridg
         pid: me,
         app_name: Some("Iris".into()),
         bundle_id: Some(crate::store::bundle_id().to_string()),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         element: None,
+        #[cfg(windows)]
+        window: 0,
         text,
         scope: crate::textbridge::Scope::WholeField,
         field_frame,
@@ -329,7 +319,11 @@ fn open_url(url: &str) {
     if under_test() {
         return news(&format!("would open {url}"));
     }
-    let _ = std::process::Command::new("open").arg(url).spawn();
+    if let Ok(mut child) = std::process::Command::new("open").arg(url).spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 pub struct SetupLive {
@@ -458,7 +452,7 @@ impl SetupLive {
             }
             // Asked first (`ModelDialogs.stop`): what's in stays, and picks up next time.
             Act::StopDownload => crate::confirm::ask(window, "Stop downloading the model?",
-                "What's downloaded so far stays on this Mac, and the download picks up where it stopped the next time.",
+                crate::words::w("What's downloaded so far stays on this Mac, and the download picks up where it stopped the next time."),
                 "Stop download", |_, _| {
                     news("setup: download stopped");
                     PRETEND_DOWNLOAD.set(None);
@@ -569,6 +563,6 @@ impl Render for SetupLive {
         let scale = window.scale_factor();
         let anim = self.anim.clone();
         let page = crate::interact::build(&anim, self.reduce_motion, window, cx, || setup::live_window(&state, scale, &self.scroll));
-        div().size_full().child(page).child(crate::confirm::layer(window, cx))
+        div().size_full().child(page).children(crate::windows_chrome(scale)).child(crate::confirm::layer(window, cx))
     }
 }

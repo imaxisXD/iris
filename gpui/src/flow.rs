@@ -24,7 +24,7 @@ thread_local! {
 pub fn open_panel(target: Option<i32>, cx: &mut App) {
     crate::live::pressed();
     if let Some(h) = live::open_panel()
-        && h.update(cx, |v, window, cx| v.key("escape", window, cx)).is_ok()
+        && h.update(cx, |v, window, cx| v.key("escape", window, cx)).unwrap_or(false)
     {
         live::set_open_panel(None);
         return;
@@ -48,7 +48,14 @@ pub fn quick_fix(target: Option<i32>, cx: &mut App) {
     if QUICK_FIXING.with(|q| q.replace(true)) {
         return;
     }
+    // A read for the panel is in flight: `capture` would refuse this one and Quick Fix would
+    // stay taken until Iris restarts.
+    if CAPTURING.with(|c| c.get()) {
+        QUICK_FIXING.with(|q| q.set(false));
+        return;
+    }
     let pressed = Instant::now();
+    let panel_before = live::open_panel().map(|h| h.window_id());
     capture(target, cx, move |captured, cx| {
         notes_live::show(Message::checking(), Some("checking"), captured.field_frame, cx);
         let c = captured.clone();
@@ -59,7 +66,6 @@ pub fn quick_fix(target: Option<i32>, cx: &mut App) {
                 let c = c.clone();
                 let unchanged = answer.verdict == Some(Verdict::Unchanged);
                 let heavy = answer.verdict == Some(Verdict::Heavy);
-                let still_there = if c.element_known() { textbridge::still_holds(&c) } else { pressed.elapsed().as_secs_f64() < 4.0 };
                 if unchanged {
                     news("quick fix landing clean");
                     notes_live::show(Message::looks_good(), Some("clean"), c.field_frame, cx);
@@ -68,9 +74,35 @@ pub fn quick_fix(target: Option<i32>, cx: &mut App) {
                     notes_live::dismiss(cx);
                     let frame = c.field_frame;
                     show_with(c, frame, move |captured, cx| OpeningView::with_answer(captured, answer, cx), cx);
-                } else if !still_there {
+                } else if c.element_known() {
+                    // Check `still_holds` off the main thread so Accessibility / UIA IPCs never
+                    // block the UI thread (or self-deadlock Windows AccessKit if Iris has focus).
+                    // Still Quick Fixing until it lands, so another press can't cut into the paste.
+                    QUICK_FIXING.with(|q| q.set(true));
+                    let text = answer.text.clone();
+                    let keep = answer.keep.clone();
+                    cx.spawn(async move |cx| {
+                        let c_check = c.clone();
+                        let still_there = cx.background_executor().spawn(async move { textbridge::still_holds(&c_check) }).await;
+                        let _ = cx.update(|cx| {
+                            QUICK_FIXING.with(|q| q.set(false));
+                            if panel_took_over(panel_before) {
+                                news("quick fix landing left alone (panel)");
+                            } else if !still_there {
+                                news("quick fix landing left alone");
+                                notes_live::show(Message::left_alone(), None, c.field_frame, cx);
+                            } else {
+                                news("quick fix landing paste");
+                                replace_and_say(c, text, keep, Said::Fixed(changed), cx);
+                            }
+                        });
+                    })
+                    .detach();
+                } else if pressed.elapsed().as_secs_f64() >= 4.0 {
                     news("quick fix landing left alone");
                     notes_live::show(Message::left_alone(), None, c.field_frame, cx);
+                } else if panel_took_over(panel_before) {
+                    news("quick fix landing left alone (panel)");
                 } else {
                     news("quick fix landing paste");
                     replace_and_say(c, answer.text.clone(), answer.keep.clone(), Said::Fixed(changed), cx);
@@ -133,9 +165,19 @@ fn prewarm(target: Option<i32>, quick: bool, cx: &mut App) {
     let mode = if quick {
         Mode::fix()
     } else {
-        brain::get(cx).and_then(|b| { let b = b.read(cx); b.tones.iter().find(|m| m.id == b.starting).cloned() }).unwrap_or_else(Mode::fix)
+        let list = crate::tones::ToneList::from_settings(&crate::app::settings());
+        let start_id = list.starting_for(bundle.as_deref());
+        live::current_modes(cx).into_iter().find(|m| m.id == start_id).unwrap_or_else(Mode::fix)
     };
     brain::prewarm(&mode);
+}
+
+/// The open shortcut was pressed while Quick Fix was checking: a panel opened since the press
+/// (`before`: the one open then, if any), or one is reading the box, has it now, and Quick Fix
+/// doesn't paste under it.
+fn panel_took_over(before: Option<gpui::WindowId>) -> bool {
+    let now = live::open_panel().map(|h| h.window_id());
+    (now.is_some() && now != before) || CAPTURING.with(|c| c.get())
 }
 
 /// Reads the text box off the main thread (Accessibility calls block on the other app), then
@@ -161,6 +203,22 @@ fn capture(target: Option<i32>, cx: &mut App, then: impl FnOnce(Captured, &mut A
         explain(CaptureError::NothingToCheck, cx);
         return;
     };
+    // Refuse excluded apps (password managers, etc.) before touching their AX tree or clipboard,
+    // matching Swift's `AppDelegate.captureOrExplain`. Keep the post-capture check below as a
+    // second guard in case `read.owner` switches the pid mid-capture. Windows: the program's
+    // file name, as its "off" list keeps them.
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        let (app_name, bundle_id) = textbridge::app_info(pid);
+        if crate::app::settings().is_excluded(bundle_id.as_deref()) {
+            CAPTURING.with(|c| c.set(false));
+            QUICK_FIXING.with(|q| q.set(false));
+            crate::host_level::set_host(pid);
+            let icon = excluded_icon(bundle_id.as_deref());
+            notes_live::show(Message::turned_off(app_name.as_deref(), icon), Some("excluded"), None, cx);
+            return;
+        }
+    }
     cx.spawn(async move |cx| {
         let read = cx.background_executor().spawn(async move { textbridge::capture(pid) }).await;
         let _ = cx.update(|cx| {
@@ -177,7 +235,7 @@ fn capture(target: Option<i32>, cx: &mut App, then: impl FnOnce(Captured, &mut A
                     let s = crate::app::settings();
                     if s.is_excluded(captured.bundle_id.as_deref()) {
                         QUICK_FIXING.with(|q| q.set(false));
-                        let icon = captured.bundle_id.as_deref().and_then(crate::app_icon).map(|(rgba, n)| crate::riso::image(n, n, rgba));
+                        let icon = excluded_icon(captured.bundle_id.as_deref());
                         notes_live::show(Message::turned_off(captured.app_name.as_deref(), icon), Some("excluded"), captured.field_frame, cx);
                         return;
                     }
@@ -191,6 +249,15 @@ fn capture(target: Option<i32>, cx: &mut App, then: impl FnOnce(Captured, &mut A
         });
     })
     .detach();
+}
+
+/// Cached excluded-app toast icon (reused through `riso::PRINTS` instead of allocating a fresh
+/// uncached `RenderImage` on every excluded-app trigger).
+fn excluded_icon(bundle: Option<&str>) -> Option<crate::riso::Img> {
+    let bundle = bundle?;
+    let (rgba, n) = crate::app_icon(bundle)?;
+    let plate = crate::riso::Plate { w: n as f32, h: n as f32, scale: 1.0 };
+    Some(crate::riso::cached(format!("excluded-icon-{bundle}"), &plate, move || rgba))
 }
 
 /// A read that found nothing to check, said by the text (`captureOrExplain`).
@@ -212,10 +279,13 @@ fn explain(e: CaptureError, cx: &mut App) {
 
 /// The panel for `captured`, on the tone it starts on (or with `answer` already in).
 fn show(captured: Captured, _answer: Option<()>, cx: &mut App) {
-    let starting = brain::get(cx).map(|b| {
-        let b = b.read(cx);
-        b.tones.iter().position(|m| m.id == b.starting).unwrap_or(0)
-    }).unwrap_or(0);
+    let modes = live::current_modes(cx);
+    let start_id = if crate::mock::on() {
+        brain::get(cx).map(|b| b.read(cx).starting.clone()).unwrap_or_else(|| "fix".into())
+    } else {
+        crate::tones::ToneList::from_settings(&crate::app::settings()).starting_for(captured.bundle_id.as_deref())
+    };
+    let starting = modes.iter().position(|m| m.id == start_id).unwrap_or(0);
     let frame = captured.field_frame;
     show_with(captured, frame, move |captured, cx| OpeningView::for_captured(captured, starting, cx), cx);
 }

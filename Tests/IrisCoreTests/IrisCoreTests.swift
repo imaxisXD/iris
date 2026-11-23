@@ -5,10 +5,26 @@ import Testing
 @Suite struct ProtectorTests {
     @Test func aPlaceholderTheWriterTypedSurvives() throws {
         let protector = Protector()
-        for draft in ["@bob see {{1}} please", "{{1}} and {{1}} then @a", "`x {{7}} y` and @a with {{2}}"] {
+        for draft in [
+            "@bob see {{1}} please",
+            "{{1}} and {{1}} then @a",
+            "`x {{7}} y` and @a with {{2}}",
+            "{{2}} {{1}}",
+            "{{0}} and {{1}}",
+            "`{{5}}` {{1}}",
+        ] {
             let masked = protector.mask(draft)
             #expect(try protector.restore(masked.text, from: masked) == draft)
         }
+    }
+
+    @Test func swallowedPlaceholderIndexCannotBeHallucinatedBackIn() throws {
+        let protector = Protector()
+        let masked = protector.mask("`{{5}}` hello")
+        // {{1}} was swallowed inside the code span {{2}}; restoring output where the model
+        // invents {{1}} must not substitute "{{5}}" for it.
+        #expect(masked.text == "{{2}} hello")
+        #expect(protector.restoringWhatsThere("{{2}} {{1}} hello", from: masked) == "`{{5}}` {{1}} hello")
     }
 
     let protector = Protector(glossary: ["Northwind", "OKR"])
@@ -66,6 +82,20 @@ import Testing
     @Test func identicalTextIsAllSame() {
         #expect(WordDiff.diff("same text", "same text") == [.same("same text")])
     }
+
+    @Test func hugeDivergentDiffFallsBackWithoutAllocatingGiantTable() {
+        let old = String(repeating: "a,", count: 2500)
+        let new = String(repeating: "b;", count: 2500)
+        let segments = WordDiff.diff(old, new)
+        let reconstructedOld = segments.compactMap { seg -> String? in
+            switch seg { case .same(let s), .removed(let s): s; case .added: nil }
+        }.joined()
+        let reconstructedNew = segments.compactMap { seg -> String? in
+            switch seg { case .same(let s), .added(let s): s; case .removed: nil }
+        }.joined()
+        #expect(reconstructedOld == old)
+        #expect(reconstructedNew == new)
+    }
 }
 
 @Suite struct FixGuardTests {
@@ -97,6 +127,12 @@ import Testing
     @Test func aLeadInTheWriterTypedStays() {
         #expect(FixGuard.clean("Output: looks wrong on page 2", keeping: "Output: looks wrong on page 2") == "Output: looks wrong on page 2")
         #expect(FixGuard.clean("Output: it looks fine", keeping: "its look fine") == "it looks fine")
+    }
+
+    @Test func hintLeadInTheWritersOwnDraftStays() {
+        let draft = "Look at this line:\nNot in the dictionary: foo\nKeep this tail."
+        #expect(FixGuard.clean(draft, keeping: draft) == draft)
+        #expect(FixGuard.clean("Fixed.\nNot in the dictionary: xyz", keeping: "Fixd.") == "Fixed.")
     }
 
     @Test func keepsOuterWhitespace() {
@@ -154,6 +190,16 @@ final class FakeGenerator: TextGenerator, @unchecked Sendable {
         let rewriter = Rewriter(generator: FakeGenerator(outputs: ["Corrected: \"it's fine\""]))
         let result = try await rewriter.check("its fine\n", mode: .fix)
         #expect(result.text == "it's fine\n")
+    }
+
+    @Test func rejectsCombiningMarkFloodWithinGraphemeCap() async {
+        // 500 graphemes each carrying 60 combining marks = 30,500 scalars (> 24,000 cap).
+        let zalgo = String(repeating: "a" + String(repeating: "\u{0301}", count: 60), count: 500)
+        #expect(zalgo.count == 500)
+        let rewriter = Rewriter(generator: FakeGenerator(outputs: ["ok"]))
+        await #expect(throws: RewriteError.tooLong(limit: Rewriter.maxInputCharacters)) {
+            _ = try await rewriter.check(zalgo, mode: .fix)
+        }
     }
 
     @Test func keepsQuotesTheWriterTyped() async throws {

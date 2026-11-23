@@ -84,23 +84,28 @@ public enum FixGuard {
         return kept.trimmingCharacters(in: .whitespaces)
     }
 
+    private static let emDashRegex = try! NSRegularExpression(pattern: #"[ \t]*—[ \t]*"#)
+    private static let enDashRegex = try! NSRegularExpression(pattern: #"[ \t]+–(?=\s|$)[ \t]*"#)
+    private static let capitalizingIRegex = try! NSRegularExpression(
+        pattern: #"(?<![\w.'’{}-])(?!(?<=(?m:^)[ \t]{0,12})i\.)i(?=(?:['’](?:m|ll|ve|d))?(?:[\s,!?;"]|\.(?!\w)|$))"#
+    )
+
     /// Replaces em and en dashes the model added, the most recognizable tic of model-written
     /// text; prompts alone don't stop it. A dash the writer typed stays, and so does a range
     /// like "9–5" or "Mon–Fri" (an en dash with no spaces around it).
     public static func replacingAddedDashes(in output: String, keeping input: String) -> String {
         if input.contains("—") { return output }
         // "word — word", "word—word", "word – word" become "word, word".
-        var t = replacingDashes(matching: #"[ \t]*—[ \t]*"#, in: output)
-        if !input.contains("–") {
-            t = replacingDashes(matching: #"[ \t]+–(?=\s|$)[ \t]*"#, in: t)
+        var t = output.contains("—") ? replacingDashes(matching: emDashRegex, in: output) : output
+        if !input.contains("–"), t.contains("–") {
+            t = replacingDashes(matching: enDashRegex, in: t)
         }
         return t
     }
 
     /// Puts a comma where each dash was, and tidies there only: the commas, spaces and line
     /// breaks in the rest of the text ("1,000", a link, a list) are never touched.
-    private static func replacingDashes(matching pattern: String, in text: String) -> String {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+    private static func replacingDashes(matching regex: NSRegularExpression, in text: String) -> String {
         let ns = text as NSString
         var out = ""
         var cursor = 0
@@ -124,18 +129,35 @@ public enum FixGuard {
     /// often leave lowercase. Not "i.e.", a list's "i)" or "i." at the start of a line, "option i:",
     /// or anything touching a placeholder.
     public static func capitalizingI(_ text: String) -> String {
-        text.replacingOccurrences(
-            of: #"(?<![\w.'’{}-])(?!(?<=(?m:^)[ \t]{0,12})i\.)i(?=(?:['’](?:m|ll|ve|d))?(?:[\s,!?;"]|\.(?!\w)|$))"#,
-            with: "I", options: .regularExpression)
+        guard text.contains("i") else { return text }
+        let ns = text as NSString
+        return capitalizingIRegex.stringByReplacingMatches(
+            in: text, range: NSRange(location: 0, length: ns.length), withTemplate: "I")
+    }
+
+    private static let labelRegexLock = NSLock()
+    private static var labelRegexCache: [String: NSRegularExpression] = [:]
+
+    private static func labelRegex(for label: String) -> NSRegularExpression? {
+        labelRegexLock.lock()
+        defer { labelRegexLock.unlock() }
+        if let cached = labelRegexCache[label] { return cached }
+        let name = NSRegularExpression.escapedPattern(for: label)
+        let pattern = #"^\s*(?:\*\*)?"# + name + #"(?:\s+(?:tone|version|rewrite|message))?(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        if labelRegexCache.count >= 64 {
+            labelRegexCache.removeAll(keepingCapacity: true)
+        }
+        labelRegexCache[label] = regex
+        return regex
     }
 
     /// Drops the tone's name the model sometimes puts before its answer ("Professional:",
     /// "Professional tone:", "**Friendly:**"), though the prompt asks for no labels. Kept when
     /// the draft itself starts that way: then it's the writer's word, not a label.
     public static func removingLabel(_ text: String, label: String, keeping original: String) -> String {
-        let name = NSRegularExpression.escapedPattern(for: label)
-        let pattern = #"^\s*(?:\*\*)?"# + name + #"(?:\s+(?:tone|version|rewrite|message))?(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return text }
+        guard text.contains(":") || text.contains("：") else { return text }
+        guard let regex = labelRegex(for: label) else { return text }
         func labelled(_ s: String) -> NSRange? {
             regex.firstMatch(in: s, range: NSRange(s.startIndex..., in: s))?.range
         }
@@ -157,7 +179,9 @@ public enum FixGuard {
         }
         let tags = Prompts.messageTags
         if t.hasPrefix(tags.open) { t = String(t.dropFirst(tags.open.count)).trimmingCharacters(in: .whitespacesAndNewlines) }
-        if let hint = t.range(of: "\n" + Prompts.hintLead) { t = String(t[..<hint.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines) }
+        if !draft.contains(Prompts.hintLead), let hint = t.range(of: "\n" + Prompts.hintLead) {
+            t = String(t[..<hint.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         if t.hasSuffix(tags.close) { t = String(t.dropLast(tags.close.count)).trimmingCharacters(in: .whitespacesAndNewlines) }
         if t.hasPrefix("```"), t.hasSuffix("```"), t.count >= 6 {
             t = String(t.dropFirst(3).dropLast(3)).trimmingCharacters(in: .whitespacesAndNewlines)

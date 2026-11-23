@@ -57,6 +57,12 @@ impl Message {
         Message { lead: lead.into(), detail: detail.map(Into::into), keys: vec![], label: None, crossed: None, extra: None, kind, hold: HOLD }
     }
 
+    /// News from Iris itself (Windows says the menu bar note's news this way, by the clock):
+    /// `lead`, the sentence and its keys, held `hold` seconds.
+    pub fn news(lead: &str, detail: &str, keys: Vec<String>, hold: f32) -> Message {
+        Message { keys, hold, ..Message::new(lead, Some(detail), Kind::Neutral) }
+    }
+
     /// How long it stays, in seconds.
     #[allow(dead_code)]
     pub fn stays(&self) -> f32 {
@@ -76,7 +82,7 @@ impl Message {
     fn undoable(lead: &str, undo_keys: bool) -> Message {
         let mut m = Self::new(lead, undo_keys.then_some("Undo with"), Kind::Success);
         if undo_keys {
-            m.keys = vec!["⌘".into(), "Z".into()];
+            m.keys = crate::keys::command("Z");
         }
         m
     }
@@ -87,7 +93,7 @@ impl Message {
 
     /// Copy on text that can't be edited where it is.
     pub fn copied() -> Message {
-        Message { keys: vec!["⌘".into(), "V".into()], ..Self::new("copied", Some("Paste it where you need it."), Kind::Success) }
+        Message { keys: crate::keys::command("V"), ..Self::new("copied", Some("Paste it where you need it."), Kind::Success) }
     }
 
     /// You put a word back after a replace, so Iris learned it.
@@ -148,11 +154,11 @@ pub fn states() -> Vec<(&'static str, Message)> {
         ("turned-off-unknown", Message::turned_off(None, None)),
         ("left-alone", Message::left_alone()),
         ("password", Message::password()),
-        ("nothing-to-read", Message::nothing_to_read(&["⌃", "⌥", "G"])),
+        ("nothing-to-read", Message::nothing_to_read(&crate::keys::caps(crate::keys::open_default()).iter().map(String::as_str).collect::<Vec<_>>())),
         ("empty", Message::problem("nothing to fix", "The box is empty. Type something, then try again.")),
         ("too-long", Message::problem("that's a lot", "Iris checks about 1000 words at once. Select a part, then press the keys again.")),
-        ("no-model", Message::problem("i need my model first", "Open the menu bar flower and finish setup to download it.")),
-        ("no-disk", Message::problem("no room for my model", "The model needs 6.2 GB free, and this Mac has 3.1 GB. Free up some space.")),
+        ("no-model", Message::problem("i need my model first", crate::words::w("Open the menu bar flower and finish setup to download it."))),
+        ("no-disk", Message::problem("no room for my model", crate::words::w("The model needs 6.2 GB free, and this Mac has 3.1 GB. Free up some space."))),
         ("offline", Message::problem("no internet", "The model downloads once and needs the internet for that. It picks up where it stopped.")),
         ("unknown", Message::problem("couldn't fix", "Something got in the way and Iris left your text alone. Try again in a moment.")),
     ]
@@ -168,13 +174,25 @@ fn turned_off_app() -> (&'static str, Option<Pixels>) {
 }
 
 /// An app's icon from its path, drawn once at 64 pixels (`NSImage.flattened`: 32 points at 2×).
+/// Kept in `riso`'s print cache, so an icon it lets go of also leaves GPUI's texture atlas; the
+/// icon is read from disk only on a miss (Settings' demo asks every frame).
 pub fn app_icon(path: &str) -> Option<Pixels> {
-    thread_local! { static ICONS: RefCell<HashMap<String, Option<Pixels>>> = RefCell::new(HashMap::new()); }
-    if let Some(hit) = ICONS.with(|m| m.borrow().get(path).cloned()) {
-        return hit;
+    // Paths with no icon, so they aren't asked about again every frame.
+    thread_local! { static MISSING: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new()); }
+    if MISSING.with(|m| m.borrow().contains(path)) {
+        return None;
     }
-    let found = crate::icon_of_app(path, 64).map(|rgba| riso::image(64, 64, rgba));
-    ICONS.with(|m| m.borrow_mut().insert(path.to_string(), found.clone()));
+    let plate = Plate { w: 64.0, h: 64.0, scale: 1.0 };
+    let found = riso::try_cached(format!("app-icon-{path}"), &plate, || crate::icon_of_app(path, 64));
+    if found.is_none() {
+        MISSING.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() >= 128 {
+                m.clear();
+            }
+            m.insert(path.to_string());
+        });
+    }
     found
 }
 
@@ -220,7 +238,13 @@ pub fn shaped_brush_w(s: &str, size: f32) -> f32 {
     let cm = font.charmap();
     let raw: f32 = s.chars().filter_map(|c| cm.map(c)).map(|g| gm.advance_width(g).unwrap_or(0.0)).sum();
     let w = brush_w(s, size) + shaped - raw;
-    K.with(|m| m.borrow_mut().insert(key, w));
+    K.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= 512 {
+            m.clear();
+        }
+        m.insert(key, w);
+    });
     w
 }
 
@@ -496,13 +520,23 @@ fn ribbon_loop(seed: i64, w: f32, h: f32, width: f32, start_taper: f32, end_tape
 
 /// `BrushRing`: a brush loop round a `w`×`h` frame, printed through the screen, drawn in to `drawn`.
 pub fn brush_ring(rgb: Rgb8, seed: i64, w: f32, h: f32, drawn: f32, scale: f32) -> Div {
+    let keep = ((61.0 * drawn.clamp(0.0, 1.0)).round() as usize).min(61);
+    if keep <= 2 {
+        return sized(w, h);
+    }
     let weight = (w.min(h) * 0.062).max(2.2);
     let (bw, bh) = ((w + 2.0 * weight) / 0.9, (h + 2.0 * weight) / 0.9);
     let plate = Plate { w: bw, h: bh, scale };
-    let px = riso::cached(format!("ring-{seed}-{rgb:?}-{drawn}"), &plate, || match ribbon_loop(seed, bw, bh, weight, 0.8, 0.5, true, drawn) {
+    let make = || match ribbon_loop(seed, bw, bh, weight, 0.8, 0.5, true, drawn) {
         Some(p) => riso::print(&plate, rgb, seed + 3, &plate.fill(&p.skia().unwrap()), 1.0),
         None => vec![0; (plate.px().0 * plate.px().1 * 4) as usize],
-    });
+    };
+    let px = if keep == 61 {
+        riso::cached(format!("ring-{seed}-{rgb:?}-full"), &plate, make)
+    } else {
+        let (pw, ph) = plate.px();
+        riso::frame_image(pw, ph, make())
+    };
     sized(w, h).child(at(printed(bw, bh, &px), (w - bw) / 2.0, (h - bh) / 2.0))
 }
 

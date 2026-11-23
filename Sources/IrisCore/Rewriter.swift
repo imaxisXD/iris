@@ -141,6 +141,9 @@ public struct Rewriter: Checker {
     /// Longest text checked in one go. Chat messages are far shorter; this keeps a pasted
     /// document from tying up the model for minutes.
     public static let maxInputCharacters = 6000
+    /// Upper bound on Unicode scalars so combining-mark/Zalgo text can't smuggle far more
+    /// scalars and tokens past the grapheme-cluster limit above.
+    static let maxInputScalars = maxInputCharacters * 4
 
     /// Starts loading the model and prefilling this mode's fixed prompt, so the request
     /// that follows only pays for the user's own words.
@@ -177,7 +180,9 @@ public struct Rewriter: Checker {
     public func perform(_ text: String, mode: Mode, retry: Bool = false,
                         onPartial: @escaping @Sendable (String) -> Void) async throws -> RewriteResult {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw RewriteError.emptyInput }
-        guard text.count <= Self.maxInputCharacters else { throw RewriteError.tooLong(limit: Self.maxInputCharacters) }
+        guard text.count <= Self.maxInputCharacters, text.unicodeScalars.count <= Self.maxInputScalars else {
+            throw RewriteError.tooLong(limit: Self.maxInputCharacters)
+        }
 
         let masked = protector.mask(text)
         let body = masked.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -258,10 +263,17 @@ public struct Rewriter: Checker {
         return try await withThrowingTaskGroup(of: String?.self) { group in
             group.addTask {
                 var output = ""
+                var lastEmit = ContinuousClock.Instant.now - .seconds(1)
                 for try await delta in generator.stream(turns, temperature: temperature, maxTokens: maxTokens, cacheKey: cacheKey) {
                     try Task.checkCancellation()
                     output += delta
-                    onPartial(output)
+                    // First delta fires immediately (TTFT); burst tokens within a single speculative
+                    // round coalesce to ~60Hz so regex cleaning and JSON IPC don't run 16× per ms.
+                    let now = ContinuousClock.Instant.now
+                    if now - lastEmit >= .milliseconds(16) {
+                        lastEmit = now
+                        onPartial(output)
+                    }
                 }
                 // A cancelled stream ends early without throwing: never hand back half an answer.
                 try Task.checkCancellation()
@@ -284,8 +296,13 @@ public struct Rewriter: Checker {
         FixGuard.removingLabel(FixGuard.clean(stripThinking(output), keeping: draft), label: mode.label, keeping: draft)
     }
 
+    private static let controlTokenRegex = try! NSRegularExpression(
+        pattern: #"<\|[a-z_]+\|?>|<[a-z_]+\|>|</?(start|end)_of_turn>"#
+    )
+
     /// Some chat templates can emit a reasoning block; never show it as the answer.
     static func stripThinking(_ text: String) -> String {
+        guard text.contains("<") else { return text }
         var t = text
         for (open, close) in [("<think>", "</think>"), ("<thought>", "</thought>"), ("<|channel>", "<channel|>")] {
             while let start = t.range(of: open), let end = t.range(of: close, range: start.upperBound..<t.endIndex) {
@@ -304,7 +321,11 @@ public struct Rewriter: Checker {
         // Any other control token the template leaks ("<|turn>", "<end_of_turn>").
         // Only the model's own tokens: they carry a pipe, or are Gemma's turn markers, so a
         // user's "<Product>" survives.
-        t = t.replacingOccurrences(of: #"<\|[a-z_]+\|?>|<[a-z_]+\|>|</?(start|end)_of_turn>"#, with: "", options: .regularExpression)
+        if t.contains("<") {
+            let ns = t as NSString
+            t = controlTokenRegex.stringByReplacingMatches(
+                in: t, range: NSRange(location: 0, length: ns.length), withTemplate: "")
+        }
         return t
     }
 

@@ -68,9 +68,77 @@ pub fn status() -> Status {
             _ => Status::NotFound,
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        win::status()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         Status::NotFound
+    }
+}
+
+/// Windows: Iris in the person's Run key (HKCU, no administrator needed), as "Iris" for the
+/// installed copy and "Iris (development)" for another, pointing at this iris.exe. Task Manager's
+/// Startup apps can turn it off without removing it (StartupApproved): then it's off here too.
+#[cfg(windows)]
+mod win {
+    use super::Status;
+    use windows::core::{PCWSTR, w};
+    use windows::Win32::System::Registry::{
+        RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_SZ,
+    };
+
+    const RUN: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+    const APPROVED: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run");
+
+    fn name() -> Vec<u16> {
+        let n = if crate::store::is_installed_iris() { "Iris" } else { "Iris (development)" };
+        n.encode_utf16().chain([0]).collect()
+    }
+
+    fn command() -> Option<String> {
+        Some(format!("\"{}\"", std::env::current_exe().ok()?.display()))
+    }
+
+    fn read_string(key: PCWSTR, name: &[u16]) -> Option<String> {
+        let mut buf = vec![0u16; 1024];
+        let mut size = (buf.len() * 2) as u32;
+        unsafe { RegGetValueW(HKEY_CURRENT_USER, key, PCWSTR(name.as_ptr()), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as _), Some(&mut size)) }.ok().ok()?;
+        let n = (size as usize / 2).saturating_sub(1);
+        Some(String::from_utf16_lossy(&buf[..n]))
+    }
+
+    /// Turned off in Task Manager: StartupApproved's first byte is odd (3, 7…) when it's off.
+    fn turned_off_in_task_manager(name: &[u16]) -> bool {
+        let mut buf = [0u8; 12];
+        let mut size = buf.len() as u32;
+        let ok = unsafe { RegGetValueW(HKEY_CURRENT_USER, APPROVED, PCWSTR(name.as_ptr()), RRF_RT_REG_BINARY, None, Some(buf.as_mut_ptr() as _), Some(&mut size)) }.is_ok();
+        ok && buf[0] & 1 == 1
+    }
+
+    pub fn status() -> Status {
+        let n = name();
+        match read_string(RUN, &n) {
+            Some(v) if Some(&v) == command().as_ref() && !turned_off_in_task_manager(&n) => Status::Enabled,
+            _ => Status::NotRegistered,
+        }
+    }
+
+    pub fn set(on: bool) -> Result<(), String> {
+        let n = name();
+        unsafe {
+            if on {
+                let cmd: Vec<u16> = command().ok_or("no path")?.encode_utf16().chain([0]).collect();
+                RegSetKeyValueW(HKEY_CURRENT_USER, RUN, PCWSTR(n.as_ptr()), REG_SZ.0, Some(cmd.as_ptr() as _), (cmd.len() * 2) as u32)
+                    .ok().map_err(|e| e.to_string())?;
+                // On again after Task Manager turned it off: Task Manager's switch goes with it.
+                let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, APPROVED, PCWSTR(n.as_ptr()));
+            } else {
+                let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN, PCWSTR(n.as_ptr()));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -99,14 +167,16 @@ thread_local! {
 pub fn set(on: bool) {
     #[cfg(target_os = "macos")]
     let result = mac::set(on);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    let result = win::set(on);
+    #[cfg(not(any(target_os = "macos", windows)))]
     let result: Result<(), String> = Err("not on this system".into());
     let problem = match result {
         Ok(()) if on && status() == Status::RequiresApproval => Some("Approve Iris in System Settings → General → Login Items.".to_string()),
         Ok(()) => None,
         Err(e) => {
             eprintln!("login item: {e}");
-            Some("macOS didn't let Iris open at login. Add it in System Settings → General → Login Items.".to_string())
+            Some(crate::words::w("macOS didn't let Iris open at login. Add it in System Settings → General → Login Items.").to_string())
         }
     };
     PROBLEM.with(|p| *p.borrow_mut() = problem);

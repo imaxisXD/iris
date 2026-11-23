@@ -61,6 +61,50 @@ iris_signing_identity() {
   echo "${name:--}"
 }
 
+# The branch updates follow: GitHub's default (origin/HEAD), or main if the clone doesn't say.
+# Never the branch the checkout has out. updater.rs counts new changes on it.
+iris_followed_branch() {
+  local b
+  b=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || b=origin/main
+  echo "${b#origin/}"
+}
+
+# After a fetch, prints the commit an update installs: main, brought up to GitHub's main.
+#   main behind or level with GitHub's: GitHub's, and main moves up to it where it can
+#   main ahead (commits not pushed yet): main's, as before
+#   both moved on: stops, saying so
+# What the checkout has out (another branch, uncommitted edits) never stops it: those only
+# mean its files stay as they are. The build has a worktree of its own. Chatter goes to stderr
+# (the log); stdout is only the commit.
+iris_update_target() {
+  local branch ours theirs
+  branch=$(iris_followed_branch)
+  ours=refs/heads/$branch theirs=refs/remotes/origin/$branch
+  if ! git rev-parse --verify --quiet "$theirs^{commit}" >/dev/null; then
+    echo "GitHub has no $branch branch to update from." >&2
+    return 1
+  fi
+  if ! git rev-parse --verify --quiet "$ours^{commit}" >/dev/null; then
+    git rev-parse "$theirs^{commit}"
+  elif git merge-base --is-ancestor "$ours" "$theirs"; then
+    if [[ "$(git symbolic-ref --quiet HEAD 2>/dev/null)" == "$ours" ]]; then
+      # Out here: move it up like a pull would. Edits in the way only keep it where it was.
+      git merge --ff-only "$theirs" >&2 \
+        || echo "Your $branch stays where it was (edits in this folder are in the way); Iris updates anyway." >&2
+    # grep reads to the end (no -q), so git never dies of a closed pipe, which pipefail counts.
+    elif ! git worktree list --porcelain | grep -x "branch $ours" >/dev/null; then
+      # Not out anywhere: move the branch alone. Out in another worktree: leave it to that one.
+      git update-ref "$ours" "$theirs" "$(git rev-parse "$ours")"
+    fi
+    git rev-parse "$theirs^{commit}"
+  elif git merge-base --is-ancestor "$theirs" "$ours"; then
+    git rev-parse "$ours^{commit}"
+  else
+    echo "This folder's $branch and GitHub's have both moved on. Merge or rebase $branch, then update again." >&2
+    return 1
+  fi
+}
+
 # Checks out commit $2 in a worktree at $1, kept between runs so its build cache stays warm.
 iris_worktree_at() {
   if [[ ! -e "$1/.git" ]]; then

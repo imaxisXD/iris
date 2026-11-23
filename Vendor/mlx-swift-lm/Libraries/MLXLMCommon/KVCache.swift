@@ -836,9 +836,12 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         // May not have hit the max size yet, so potentially keep growing the cache.
         // Fill is tracked by `idx`, not `offset`: after a post-wrap trim the logical
         // offset exceeds the rows actually held, and growth must resume from the rows.
+        // Iris: support multi-token in-place writes (S >= 1) while unwrapped and within capacity,
+        // avoiding full-history concatenations during prefill and speculative verify rounds.
         let filled = self.keys?.dim(2) ?? 0
-        if self.keys == nil || (!wrapped && idx >= filled && filled < storageCapacity) {
-            let newSize = min(step, storageCapacity - filled)
+        if self.keys == nil || (!wrapped && idx + S > filled && filled < storageCapacity) {
+            let needed = (idx + S) - filled
+            let newSize = min(max(step, needed), storageCapacity - filled)
 
             let kShape = [B, nKVHeads, newSize, kHeadDim]
             let vShape = [B, nKVHeads, newSize, vHeadDim]
@@ -892,8 +895,14 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             return logicalView(tail: maxCacheSize) ?? (keys, values)
         }
         let live = wrapped ? (self.keys?.dim(2) ?? 0) : idx
+        // Iris: write in-place for multi-token chunks too when unwrapped and within capacity,
+        // avoiding full-history concatenations on every speculative round.
+        let canUpdateInPlace =
+            count == 1
+            || (!wrapped && rewindCapacity == 0 && (self.keys?.dim(2) ?? 0) <= storageCapacity
+                && idx + count <= storageCapacity)
         let result =
-            if count == 1 {
+            if canUpdateInPlace {
                 updateInPlace(keys: keys, values: values)
             } else {
                 updateConcat(keys: keys, values: values)

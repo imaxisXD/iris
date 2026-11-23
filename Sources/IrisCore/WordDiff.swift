@@ -9,46 +9,100 @@ public enum WordDiff {
         case added(String)
     }
 
+    private static let maxDPTableCells = 4_000_000
+
+    private static let tokenRegex = try! NSRegularExpression(
+        pattern: "\\s+|[\\p{L}\\p{N}_]+(?:['’][\\p{L}\\p{N}_]+)*|" + Protector.placeholderPattern + "|[^\\p{L}\\p{N}_\\s]"
+    )
+
     /// Splits into words (keeping apostrophes: "it's", "don’t"), whitespace runs,
     /// and single punctuation marks, so "its" -> "it's" is one word change.
     public static func tokenize(_ text: String) -> [String] {
-        let pattern = "\\s+|[\\p{L}\\p{N}_]+(?:['’][\\p{L}\\p{N}_]+)*|" + Protector.placeholderPattern + "|[^\\p{L}\\p{N}_\\s]"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [text] }
         let ns = text as NSString
-        return regex.matches(in: text, range: NSRange(location: 0, length: ns.length))
+        return tokenRegex.matches(in: text, range: NSRange(location: 0, length: ns.length))
             .map { ns.substring(with: $0.range) }
     }
 
     public static func diff(_ old: String, _ new: String) -> [Segment] {
+        if old == new {
+            return old.isEmpty ? [] : [.same(old)]
+        }
         let a = tokenize(old)
         let b = tokenize(new)
-        let n = a.count
-        let m = b.count
 
-        // Classic LCS table. Chat messages are short, so O(n*m) is fine.
-        var lcs = Array(repeating: Array(repeating: 0, count: m + 1), count: n + 1)
-        if n > 0 && m > 0 {
-            for i in stride(from: n - 1, through: 0, by: -1) {
-                for j in stride(from: m - 1, through: 0, by: -1) {
-                    lcs[i][j] = a[i] == b[j] ? lcs[i + 1][j + 1] + 1 : max(lcs[i + 1][j], lcs[i][j + 1])
+        // Strip common prefix and suffix before running DP so minor edits on long drafts
+        // avoid allocating and scanning an O(N*M) table over unchanged text.
+        var prefixLen = 0
+        let minLen = min(a.count, b.count)
+        while prefixLen < minLen && a[prefixLen] == b[prefixLen] {
+            prefixLen += 1
+        }
+        var suffixLen = 0
+        while suffixLen < (minLen - prefixLen)
+            && a[a.count - 1 - suffixLen] == b[b.count - 1 - suffixLen]
+        {
+            suffixLen += 1
+        }
+
+        let aMidCount = a.count - prefixLen - suffixLen
+        let bMidCount = b.count - prefixLen - suffixLen
+        var raw: [Segment] = []
+        raw.reserveCapacity(a.count + b.count)
+
+        for k in 0 ..< prefixLen {
+            raw.append(.same(a[k]))
+        }
+
+        if aMidCount == 0 {
+            for k in prefixLen ..< (prefixLen + bMidCount) {
+                raw.append(.added(b[k]))
+            }
+        } else if bMidCount == 0 {
+            for k in prefixLen ..< (prefixLen + aMidCount) {
+                raw.append(.removed(a[k]))
+            }
+        } else if (aMidCount + 1) > Self.maxDPTableCells / (bMidCount + 1) {
+            // Very large full-text rewrite: skip allocating a huge O(N*M) table and show the
+            // differing span as one replacement block.
+            for k in prefixLen ..< (prefixLen + aMidCount) { raw.append(.removed(a[k])) }
+            for k in prefixLen ..< (prefixLen + bMidCount) { raw.append(.added(b[k])) }
+        } else {
+            // Flat contiguous Int32 LCS table (instead of array-of-arrays) for cache locality.
+            let strideM = bMidCount + 1
+            var lcs = [Int32](repeating: 0, count: (aMidCount + 1) * strideM)
+            for i in stride(from: aMidCount - 1, through: 0, by: -1) {
+                let rowOff = i * strideM
+                let nextRowOff = rowOff + strideM
+                let ai = a[prefixLen + i]
+                for j in stride(from: bMidCount - 1, through: 0, by: -1) {
+                    if ai == b[prefixLen + j] {
+                        lcs[rowOff + j] = lcs[nextRowOff + j + 1] + 1
+                    } else {
+                        let down = lcs[nextRowOff + j]
+                        let right = lcs[rowOff + j + 1]
+                        lcs[rowOff + j] = down >= right ? down : right
+                    }
                 }
             }
+
+            var i = 0
+            var j = 0
+            while i < aMidCount && j < bMidCount {
+                if a[prefixLen + i] == b[prefixLen + j] {
+                    raw.append(.same(a[prefixLen + i])); i += 1; j += 1
+                } else if lcs[(i + 1) * strideM + j] >= lcs[i * strideM + j + 1] {
+                    raw.append(.removed(a[prefixLen + i])); i += 1
+                } else {
+                    raw.append(.added(b[prefixLen + j])); j += 1
+                }
+            }
+            while i < aMidCount { raw.append(.removed(a[prefixLen + i])); i += 1 }
+            while j < bMidCount { raw.append(.added(b[prefixLen + j])); j += 1 }
         }
 
-        var raw: [Segment] = []
-        var i = 0
-        var j = 0
-        while i < n && j < m {
-            if a[i] == b[j] {
-                raw.append(.same(a[i])); i += 1; j += 1
-            } else if lcs[i + 1][j] >= lcs[i][j + 1] {
-                raw.append(.removed(a[i])); i += 1
-            } else {
-                raw.append(.added(b[j])); j += 1
-            }
+        for k in (a.count - suffixLen) ..< a.count {
+            raw.append(.same(a[k]))
         }
-        while i < n { raw.append(.removed(a[i])); i += 1 }
-        while j < m { raw.append(.added(b[j])); j += 1 }
 
         return merge(absorbingSpaces(raw))
     }

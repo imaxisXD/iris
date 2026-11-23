@@ -64,6 +64,15 @@ impl SettingsView {
     }
 }
 
+impl Drop for SettingsView {
+    fn drop(&mut self) {
+        // Ensure global shortcuts are restored if Settings closes while a recorder is active,
+        // and stop the About meadow painter thread / release its buffers.
+        crate::pages::shortcuts::stop(None);
+        crate::pages::about::shutdown();
+    }
+}
+
 /// The values the page draws, from the settings saved on this Mac and the brain.
 fn values(anim: &Anim, reduce_motion: bool, page: Page, cx: &App) -> Values {
     let brain = crate::brain::get(cx).map(|b| b.read(cx));
@@ -80,6 +89,11 @@ fn values(anim: &Anim, reduce_motion: bool, page: Page, cx: &App) -> Values {
     v.starts_in = v.modes.iter().position(|m| m.0 == tones.default_id).unwrap_or(0);
     v.show_changes = s.show_changes;
     v.panel_when_clean = s.show_panel_when_clean;
+    v.answer_cache = match s.answer_cache {
+        crate::store::AnswerCache::Off => 0,
+        crate::store::AnswerCache::WhileOpen => 1,
+        crate::store::AnswerCache::Recent => 2,
+    };
     v.notes = std::array::from_fn(|i| s.shows(settings::NOTE_NAMES[i]));
     // Asking macOS whether Iris opens at login takes about 20 ms: only General shows it, and
     // About and Updates draw every frame while they move.
@@ -105,7 +119,7 @@ fn values(anim: &Anim, reduce_motion: bool, page: Page, cx: &App) -> Values {
         v.update_check = m.update_check.or_else(|| Some(crate::pages::updates::from_phase(&crate::updater::phase(cx))));
         v.model = brain.map(|b| crate::pages::model::Live {
             engine: b.engine.clone(),
-            chosen: b.chosen.clone().or(s.model.clone()).unwrap_or_else(|| b.recommended.clone().unwrap_or_else(|| "best".into())),
+            chosen: s.model.clone().or_else(|| b.chosen.clone()).unwrap_or_else(|| b.recommended.clone().unwrap_or_else(|| "best".into())),
             models: b.models.iter().map(|m| (m.id.clone(), m.download_size.clone(), m.downloaded)).collect(),
             recommended: b.recommended.clone().unwrap_or_else(|| "best".into()),
             crossing: m.crossing.clone(),
@@ -125,6 +139,10 @@ impl Render for SettingsView {
             crate::pages::shortcuts::stop(None);
             self.anim.borrow_mut().reset();
             crate::pages::about::reset();
+            // Unmounted fields stop blinking instead of waking Settings every 530 ms.
+            for f in &self.fields {
+                f.update(cx, |f, _| f.clear_focus_state());
+            }
             self.shown = self.page;
         }
         self.values = values(&self.anim.borrow(), self.reduce_motion, self.page, cx);
@@ -151,7 +169,7 @@ impl Render for SettingsView {
             eprintln!("settings frame cpu_ms={:.3} values={t_values:.2} built={t_build:.2}", began.elapsed().as_secs_f64() * 1000.0);
         }).absolute().size_0());
         div().size_full()
-            .child(page).child(crate::confirm::layer(window, cx)).children(trace)
+            .child(page).children(crate::windows_chrome(scale)).child(crate::confirm::layer(window, cx)).children(trace)
     }
 }
 

@@ -417,6 +417,11 @@ public let mtpPositionDeltasKey =
 /// reads as `false` (no emit), so non-MTP callers are unaffected.
 public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
 
+/// Iris: when `true` (greedy argmax verification with no temperature/top-p sampling), targets
+/// with strictly monotonic final logit softcapping (such as Gemma 4's `tanh(x/30)*30`) may skip
+/// the FP32 softcap pass and return raw logits, preserving argmax identically at lower latency.
+public let mtpSkipLogitSoftcapKey = LMOutput.Key<Bool>("mtp.skipLogitSoftcap")
+
 /// Requests a recurrent-cache checkpoint after this many verification input
 /// tokens. Hybrid Qwen models use `1` for MTP-1 so a rejected draft restores
 /// state after the always-committed bonus token without replaying the model.

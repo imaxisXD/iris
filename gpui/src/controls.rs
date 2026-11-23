@@ -56,37 +56,28 @@ pub fn toggle_if(on: bool, title: &str, scale: f32, enabled: bool, act: Act) -> 
 // MARK: - Ink choice
 
 /// `InkChoice`: the snapshot's `kit::ink_choice`, or live: each tab a button (squeezed to 0.97),
-/// the pink marker flying to the chosen one on `DS.Motion.pill`, its width stretching between the
-/// two tabs' as SwiftUI's matched geometry does; a tab under the pointer darkens to i12.
+/// the pink brushstroke lifting from the old tab and painting itself across the chosen one in
+/// lockstep with the brush/mono label cross-fade; a tab under the pointer darkens to i12.
 pub fn choice(labels: &[&str], selected: usize, title: &str, scale: f32, pick: impl Fn(usize) -> Act) -> AnyElement {
     let l = live::get().unwrap_or_else(Live::still);
     let tab_h = line_box(23.0, BRUSH_LINE).max(line_box(12.5, MONO_LINE) + 4.0);
-    let (tx, ty, tw, th, marker) = tone_marker(labels, selected, scale);
-    // The marker's flight: how far from the tab it left to the one chosen.
     let id = format!("choice-{title}");
-    let (from, to, k) = l.flight(&id, selected, Curve::PILL);
-    let (fx, _, fw, _, _) = tone_marker(labels, from, scale);
-    let (x, mw) = if from == to { (tx, tw) } else { (fx + (tx - fx) * k, fw + (tw - fw) * k) };
-    let _ = to;
+    let marker = tone_marker_live(&l, &id, labels, selected, scale);
     let mut tabs = row().gap(z(18.0));
     for (i, label) in labels.iter().enumerate() {
         let tw_ = brush_w(label, 23.0).max(mono_w(label, 12.5, -0.12));
         let chosen = i == selected;
         let tab_id = format!("{title}-{i}");
+        let curve = if l.reduce_motion { Curve::FAST } else { Curve::Ease(0.21) };
+        let chosen_k = l.track(&format!("choice-sel-{title}-{i}"), chosen as u8 as f32, curve);
         let label_s = label.to_string();
         let el = pressable(&l, &tab_id, tw_, tab_h, 0.97, Some(pick(i)), move |hover| {
-            let mut tab = sized(tw_, tab_h);
-            if chosen {
-                tab = tab.child(at(t(label_s.clone(), brush(23.0), hue::I12), 0.0, tab_h - line_box(23.0, BRUSH_LINE)));
-            } else {
-                tab = tab.child(at(t(label_s.clone(), body().tracked(-0.12), mix(hue::I10, hue::I12, hover)), 0.0, tab_h - 4.0 - line_box(12.5, MONO_LINE)));
-            }
-            tab.into_any_element()
+            tone_tab_blend(&label_s, chosen_k, hover).into_any_element()
         });
         tabs = tabs.child(el.role(Role::Tab).aria_label(label.to_string()).aria_selected(chosen));
     }
     let c = sized(kit::ink_choice_w(labels), tab_h)
-        .child(div().absolute().top(z(ty)).left(z(x)).w(z(mw)).h(z(th)).child(printed_fill(&marker)))
+        .child(marker)
         .child(at(tabs, 0.0, 0.0));
     kit::named(c, title, Role::TabList, title).into_any_element()
 }
@@ -375,7 +366,11 @@ pub fn open_url(url: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("/usr/bin/open").arg(url).spawn();
+        if let Ok(mut child) = std::process::Command::new("/usr/bin/open").arg(url).spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -667,7 +662,9 @@ pub fn recorder(r: &Recorder, scale: f32, acts: Option<RecorderActs>) -> (AnyEle
         let mut waiting: Vec<_> = r.keys.map(crate::tones::caps).unwrap_or_default();
         waiting.pop();
         if r.keys.is_none() {
-            waiting = vec![(Some("⌃"), "control"), (Some("⌥"), "option")];
+            // The default's modifiers (⌃ ⌥ on the Mac, Ctrl Win on Windows).
+            waiting = crate::tones::caps(crate::keys::open_default());
+            waiting.pop();
         }
         for (i, (sym, word)) in waiting.into_iter().enumerate() {
             caps.push((sym, word, 70 + i as i64 * 7, false));
@@ -706,14 +703,19 @@ pub fn recorder(r: &Recorder, scale: f32, acts: Option<RecorderActs>) -> (AnyEle
     let mut col_ = kit::column().items_end().gap(z(6.0)).child(el);
     let mut w = face_w;
     if r.listening {
-        let line1 = row().gap(z(4.0)).items_center()
-            .child(t("Now press your new keys, like", caption(), ink::PINK_TEXT))
-            .child(keycap("⌃", scale)).child(keycap("⌥", scale)).child(keycap("K", scale));
-        let w1 = mono_w("Now press your new keys, like", 11.0, 0.0) + 3.0 * 4.0 + 3.0 * 20.0;
-        let mut line2 = row().gap(z(4.0)).items_center().child(keycap("esc", scale)).child(t("keeps the old ones", caption(), hue::I10));
+        // The example: the default's modifiers with K (⌃⌥K on the Mac, Ctrl+Win+K on Windows).
+        let example = crate::keys::caps(crate::store::KeyCombo { key_code: 40, modifiers: crate::keys::open_default().modifiers });
+        let mut line1 = row().gap(z(4.0)).items_center()
+            .child(t("Now press your new keys, like", caption(), ink::PINK_TEXT));
+        let mut w1 = mono_w("Now press your new keys, like", 11.0, 0.0);
+        for cap in &example {
+            line1 = line1.child(keycap(cap, scale));
+            w1 += 4.0 + (10.0 + cap.chars().count() as f32 * 7.0).max(20.0);
+        }
+        let mut line2 = row().gap(z(4.0)).items_center().child(keycap(&crate::keys::key("esc"), scale)).child(t("keeps the old ones", caption(), hue::I10));
         let mut w2 = 31.0 + 4.0 + mono_w("keeps the old ones", 11.0, 0.0);
         if r.allows_clear {
-            line2 = line2.child(t("·", caption(), hue::I9)).child(keycap("⌫", scale)).child(t("turns it off", caption(), hue::I10));
+            line2 = line2.child(t("·", caption(), hue::I9)).child(keycap(&crate::keys::key("⌫"), scale)).child(t("turns it off", caption(), hue::I10));
             w2 += 3.0 * 4.0 + mono_w("·", 11.0, 0.0) + 20.0 + mono_w("turns it off", 11.0, 0.0);
         }
         w = w.max(w1).max(w2);

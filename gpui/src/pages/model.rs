@@ -78,7 +78,7 @@ pub struct Live {
     pub crossing: Option<String>,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Engine {
     Resting,
     Downloading(f64),
@@ -99,7 +99,8 @@ struct Look {
 
 impl Look {
     /// As the Swift snapshot finds this Mac: both of Iris's models on disk, Best quality
-    /// chosen. `IRIS_MODEL_STATE=downloading`, `delete-hover` or `earlier` draws the others.
+    /// chosen. `IRIS_MODEL_STATE=downloading`, `delete-hover`, `earlier` or `not-downloaded`
+    /// draws the others.
     fn snapshot() -> Look {
         let both = |a: bool, b: bool| vec![(&CHOICES[0], a), (&CHOICES[1], b)];
         let (engine, chosen, offered, crossing) = match std::env::var("IRIS_MODEL_STATE").as_deref() {
@@ -107,6 +108,7 @@ impl Look {
             Ok("delete-hover") => (Engine::Ready, "best", both(true, true), Some("lighter".to_string())),
             // Someone who used Iris before the trained models: on Google's model still.
             Ok("earlier") => (Engine::Ready, "e4b", vec![(&CHOICES[0], false), (&CHOICES[1], false), (&CHOICES[2], true), (&CHOICES[3], true)], None),
+            Ok("not-downloaded") => (Engine::Resting, "lighter", both(true, false), None),
             _ => (Engine::Resting, "best", both(true, true), None),
         };
         Look { engine, chosen: chosen.into(), offered, crossing, recommended: "best".into() }
@@ -114,26 +116,40 @@ impl Look {
 
     fn live(l: &Live) -> Look {
         use crate::brain::Engine as E;
-        let engine = match &l.engine {
-            E::Idle => Engine::Resting,
-            E::Downloading(f) => Engine::Downloading(*f),
-            E::Loading => Engine::Loading,
-            E::Ready(_) => Engine::Ready,
-            E::Failed(f) => Engine::Failed(f.sentence.clone()),
-        };
         // Iris's own two always; an earlier one only while it's on disk (`ModelChoice.offered`).
         let offered = CHOICES.iter().filter_map(|c| {
             let on_disk = l.models.iter().any(|(id, _, d)| id == c.id && *d);
             (c.trained || on_disk).then_some((c, on_disk))
         }).collect();
+        let engine = match &l.engine {
+            E::Idle => Engine::Resting,
+            E::Downloading(f) => Engine::Downloading(*f),
+            E::Loading => Engine::Loading,
+            // Only show Ready when the loaded model is the one chosen in Settings; otherwise
+            // reflect the chosen model's own state so switching to an undownloaded model offers
+            // Download right away instead of claiming Ready / Free model memory.
+            E::Ready(loaded) if loaded == &l.chosen => Engine::Ready,
+            E::Ready(_) => Engine::Resting,
+            E::Failed(f) => Engine::Failed(f.sentence.clone()),
+        };
         Look { engine, chosen: l.chosen.clone(), offered, crossing: l.crossing.clone(), recommended: l.recommended.clone() }
     }
 
     fn on_disk(&self, id: &str) -> bool {
         self.offered.iter().any(|(c, d)| c.id == id && *d)
     }
+    fn needs_download(&self) -> bool {
+        matches!(self.engine, Engine::Resting) && !self.on_disk(&self.chosen)
+    }
+    fn not_downloaded_note(&self) -> String {
+        crate::words::ws(format!(
+            "{} isn't on this Mac yet. Download it here before using your shortcut.",
+            Choice::of(&self.chosen).name
+        ))
+    }
     fn title(&self) -> &'static str {
         match self.engine {
+            Engine::Resting if !self.on_disk(&self.chosen) => "Not downloaded",
             Engine::Resting => "Resting",
             Engine::Downloading(_) => "Downloading",
             Engine::Loading => "Waking up",
@@ -143,10 +159,11 @@ impl Look {
     }
     fn detail(&self) -> String {
         match &self.engine {
+            Engine::Resting if !self.on_disk(&self.chosen) => self.not_downloaded_note(),
             Engine::Resting => "The model loads on your first check.".into(),
             Engine::Downloading(_) => "Getting the model. One time only.".into(),
             Engine::Loading => "Getting ready. A few seconds.".into(),
-            Engine::Ready => "Runs on this Mac. Nothing leaves it.".into(),
+            Engine::Ready => crate::words::w("Runs on this Mac. Nothing leaves it.").into(),
             Engine::Failed(s) => s.clone(),
         }
     }
@@ -183,6 +200,8 @@ pub fn content(v: &Values, w: f32, cx: &Ctx) -> Vec<Div> {
             .child(t(Choice::of(&look.chosen).downloaded(f), caption(), hue::I10)));
     } else if let Engine::Failed(_) = look.engine {
         out.push(column().w(z(w)).mt(z(-14.0)).child(para_out(&look.detail(), caption(), hue::RED_TEXT, w)));
+    } else if look.needs_download() {
+        out.push(column().w(z(w)).mt(z(-14.0)).child(para_out(&look.not_downloaded_note(), caption(), hue::WARN_TEXT, w)));
     }
     let trained: Vec<_> = look.offered.iter().filter(|(c, _)| c.trained).collect();
     let earlier: Vec<_> = look.offered.iter().filter(|(c, _)| !c.trained).collect();
@@ -196,7 +215,7 @@ pub fn content(v: &Values, w: f32, cx: &Ctx) -> Vec<Div> {
         for (i, (c, d)) in earlier.iter().enumerate() {
             row_ = row_.child(model(&look, c, *d, i + 2, false, w / earlier.len() as f32, s));
         }
-        which = which.child(column().w(z(w)).gap(z(10.0)).pt(z(8.0)).child(t("Earlier models on this Mac", brush(20.0), hue::I12)).child(row_));
+        which = which.child(column().w(z(w)).gap(z(10.0)).pt(z(8.0)).child(t(crate::words::w("Earlier models on this Mac"), brush(20.0), hue::I12)).child(row_));
     }
     let idle = [5u32, 15, 30, 60, 240];
     let idle_label = |m: u32| if m < 60 { format!("{m} min") } else if m == 60 { "1 hour".into() } else { format!("{} hours", m / 60) };
@@ -211,7 +230,7 @@ pub fn content(v: &Values, w: f32, cx: &Ctx) -> Vec<Div> {
         // `PenRule()` takes the line it's called on as its seed.
         .child(hairline(861, w))
         .child(setting_row("Free memory after", None, free_after, 132.0, w));
-    out.push(section_wrapped(1, "Which model", Some("Each runs on this Mac. Iris downloads a model the first time you use it."), None, which, w, s));
+    out.push(section_wrapped(1, "Which model", Some(crate::words::w("Each runs on this Mac. Download a model here once before using it.")), None, which, w, s));
     out.push(section_wrapped(2, "Memory", None, None, memory, w, s));
     out
 }
@@ -225,7 +244,7 @@ fn progress_track(f: f64, width: f32, scale: f32) -> Div {
     let mid = (17.0 * BRUSH_LINE * 2.0).round() / 4.0;
     sized(width, 18.0)
         .child(at(pen_rule(91, width, over(hue::I12, 0.18, ink::PAPER), 1.0), 0.0, mid - 1.5))
-        .child(at(faded(hand_printed(92, 0.7, w, 12.0, ink::PINK, 92, scale), 0.45), 0.0, mid - 6.0))
+        .child(at(faded(hand_printed_frame(92, 0.7, w, 12.0, ink::PINK, 92, scale), 0.45), 0.0, mid - 6.0))
         .child(at(t(format!("{}%", (f * 100.0) as i32), brush(17.0), ink::PINK_TEXT), w + 6.0, mid - line_box(17.0, BRUSH_LINE) / 2.0))
 }
 
@@ -261,7 +280,7 @@ fn band_action(look: &Look) -> crate::interact::Act {
     match look.engine {
         Engine::Ready => act(|_, _| crate::brain::unload()),
         Engine::Downloading(_) => act(|window, _| crate::confirm::ask(window, "Stop downloading the model?",
-            "What's downloaded so far stays on this Mac, and the download picks up where it stopped the next time.",
+            crate::words::w("What's downloaded so far stays on this Mac, and the download picks up where it stopped the next time."),
             "Stop download", |_, _| crate::brain::unload())),
         _ => act(|_, _| crate::brain::load(true)),
     }
@@ -407,23 +426,25 @@ fn model(look: &Look, c: &'static Choice, on_disk: bool, i: usize, big: bool, w:
         .child(name)
         .child(stacked_figure(&c.figure(), "GB", if on_disk { "on disk" } else { "to download" }, scale));
     if big {
-        option = option.child(mono_paragraph(c.line, caption(), hue::I10, 210.0, 11.0 * MONO_LINE));
+        option = option.child(mono_paragraph(crate::words::w(c.line), caption(), hue::I10, 210.0, 11.0 * MONO_LINE));
     }
     let choose = {
         let id = c.id.to_string();
-        live::act(move |_, cx| {
+        live::act(move |window, cx| {
             crate::app::change(|s| s.model = Some(id.clone()));
             crate::brain::configure(cx);
+            window.refresh();
         })
     };
     let mut option = option.id(gpui::SharedString::from(format!("settings-model-{}", c.id))).role(Role::RadioButton)
-        .aria_label(format!("{}, {}. {}", c.name, c.size(), c.line)).aria_selected(chosen);
+        .aria_label(format!("{}, {}. {}", c.name, c.size(), crate::words::w(c.line))).aria_selected(chosen);
     if l.view.is_some() {
         let ch = choose.clone();
         option = option.cursor_pointer().on_click(move |_, window, cx| ch(window, cx));
     }
 
     let downloading = matches!(look.engine, Engine::Downloading(_));
+    let loading = matches!(look.engine, Engine::Loading);
     let mut stack = column().w(z(w)).gap(z(10.0)).child(option);
     if let Some(st) = crate::model_compare::Strengths::of(c.id) {
         stack = stack.child(div().flex_none().py(z(2.0)).child(crate::model_compare::pips(&st, i as i64, scale)));
@@ -432,6 +453,10 @@ fn model(look: &Look, c: &'static Choice, on_disk: bool, i: usize, big: bool, w:
     if !chosen {
         let b = Button::secondary("Use this one").compact().id(format!("use-{}", c.id)).label(format!("Use {}", c.name.to_lowercase()));
         buttons = buttons.child(ctl::button(&b, scale, choose).0);
+    } else if !on_disk && !downloading && !loading {
+        let b = Button::primary(format!("Download ({})", c.size())).compact().id(format!("download-{}", c.id))
+            .label(format!("Download {} ({})", c.name.to_lowercase(), c.size()));
+        buttons = buttons.child(ctl::button(&b, scale, live::act(|_, _| crate::brain::load(true))).0);
     }
     if on_disk && !(chosen && downloading) {
         let id = c.id.to_string();
@@ -598,12 +623,12 @@ pub fn recommended_mark(scale: f32) -> Div {
     });
     let lh = line_box(19.0, BRUSH_LINE);
     let cap_h = 11.0 * MONO_LINE;
-    let ww = brush_w("recommended", 19.0).max(mono_w("for this Mac", 11.0, 0.0));
+    let ww = brush_w("recommended", 19.0).max(mono_w(crate::words::w("for this Mac"), 11.0, 0.0));
     let wh = lh - 3.0 + cap_h;
     let (lead, _) = brush_box("recommended", 19.0);
     let words = turned("settings-model-recommended".into(), ww, wh, 6.0, -3.0, scale, move |sh| {
         word_into(sh, brush(19.0), "recommended", lead, (lh - 19.0 * BRUSH_LINE) / 2.0 + 19.0 * BRUSH_ASCENT, ink::PINK_TEXT);
-        word_into(sh, caption(), "for this Mac", 0.0, lh - 3.0 + mono_base(11.0, cap_h), hue::I10);
+        word_into(sh, caption(), crate::words::w("for this Mac"), 0.0, lh - 3.0 + mono_base(11.0, cap_h), hue::I10);
     });
     row().gap(z(6.0)).items_center().child(sticker).child(words)
 }
@@ -650,4 +675,71 @@ pub fn clock(points: f32, scale: f32) -> Img {
         ];
         icons::print(44, str_seed("clock", 11), &[(ink::CREMA, 2, 2, art[0]), (ink::PINK, -1, -1, art[1]), (ink::ESPRESSO, 0, 0, art[2])])
     }, points, scale)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::brain::Engine as BrainEngine;
+
+    fn live_state(engine: BrainEngine, chosen: &str, on_disk: &[&str]) -> Look {
+        let models = CHOICES
+            .iter()
+            .filter(|c| c.trained || on_disk.contains(&c.id))
+            .map(|c| (c.id.to_string(), c.size(), on_disk.contains(&c.id)))
+            .collect();
+        Look::live(&Live {
+            engine,
+            chosen: chosen.into(),
+            models,
+            recommended: "best".into(),
+            crossing: None,
+        })
+    }
+
+    #[test]
+    fn switching_from_loaded_model_to_undownloaded_shows_not_downloaded() {
+        let look = live_state(BrainEngine::Ready("best".into()), "lighter", &["best"]);
+        assert_eq!(look.engine, Engine::Resting);
+        assert!(look.needs_download());
+        assert_eq!(look.title(), "Not downloaded");
+        assert_eq!(look.action().as_deref(), Some("Download (4.0 GB)"));
+        assert!(look.detail().contains("Lighter"));
+        assert!(look.detail().contains("Download it here"));
+    }
+
+    #[test]
+    fn idle_undownloaded_model_shows_not_downloaded_instead_of_resting() {
+        let look = live_state(BrainEngine::Idle, "lighter", &[]);
+        assert!(look.needs_download());
+        assert_eq!(look.title(), "Not downloaded");
+        assert_eq!(look.action().as_deref(), Some("Download (4.0 GB)"));
+        assert!(!look.detail().contains("loads on your first check"));
+    }
+
+    #[test]
+    fn ready_matching_chosen_model_stays_ready() {
+        let look = live_state(BrainEngine::Ready("best".into()), "best", &["best"]);
+        assert_eq!(look.engine, Engine::Ready);
+        assert!(!look.needs_download());
+        assert_eq!(look.title(), "Ready");
+        assert_eq!(look.action().as_deref(), Some("Free model memory"));
+    }
+
+    #[test]
+    fn switching_from_loaded_model_to_another_on_disk_shows_resting_and_load() {
+        let look = live_state(BrainEngine::Ready("best".into()), "lighter", &["best", "lighter"]);
+        assert_eq!(look.engine, Engine::Resting);
+        assert!(!look.needs_download());
+        assert_eq!(look.title(), "Resting");
+        assert_eq!(look.action().as_deref(), Some("Load model now"));
+    }
+
+    #[test]
+    fn downloading_model_keeps_downloading_state_and_stop_action() {
+        let look = live_state(BrainEngine::Downloading(0.42), "lighter", &["best"]);
+        assert!(!look.needs_download());
+        assert_eq!(look.title(), "Downloading");
+        assert_eq!(look.action().as_deref(), Some("Stop download"));
+    }
 }

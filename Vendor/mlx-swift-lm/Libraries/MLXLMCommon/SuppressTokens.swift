@@ -37,6 +37,7 @@ public struct SuppressTokensProcessor: LogitProcessor {
     /// model's vocabulary (e.g. tiny test configs) degrades to a no-op
     /// instead of indexing out of range.
     private let sortedIds: [Int]
+    package var suppressedIds: [Int] { sortedIds }
 
     /// Suppressed vocabulary indices, shaped `[1, N]` for broadcasting
     /// against `[B, vocab]` logits. Fast path used when every ID fits the
@@ -51,7 +52,8 @@ public struct SuppressTokensProcessor: LogitProcessor {
     /// Negative IDs are ignored. Returns `nil` when no valid IDs remain
     /// (nothing to suppress).
     public init?(tokenIds: Set<Int>) {
-        let sorted = tokenIds.filter { $0 >= 0 }.sorted()
+        // Iris: clamp to Int32.max so out-of-range config IDs degrade to a no-op instead of trapping on UInt32/Int32 conversion.
+        let sorted = tokenIds.filter { $0 >= 0 && $0 <= Int(Int32.max) }.sorted()
         guard !sorted.isEmpty else { return nil }
         self.sortedIds = sorted
         self.broadcastIndices = MLXArray(sorted.map { UInt32($0) })[.newAxis, 0...]
@@ -157,6 +159,18 @@ func makeSuppressTokensProcessor(model: any LanguageModel) -> SuppressTokensProc
 /// Draft proposals of suppressed tokens would always be rejected by the
 /// verifier — masking them at the source keeps speculative acceptance high.
 /// ``SuppressTokensProcessor`` is stateless, so wrapping is safe.
+/// Iris: lets sparse-head drafters (like Gemma 4 Assistant's MaskedEmbedder) run greedy
+/// argmax directly over their ~4K selected candidates instead of scattering to 262K vocab.
+package protocol GreedyTokenSampler {
+    var isGreedyArgMax: Bool { get }
+    var greedySuppressedTokenIds: [Int] { get }
+}
+
+extension ArgMaxSampler: GreedyTokenSampler {
+    package var isGreedyArgMax: Bool { true }
+    package var greedySuppressedTokenIds: [Int] { [] }
+}
+
 struct SuppressTokensSampler: LogitSampler {
 
     let base: LogitSampler
@@ -165,4 +179,9 @@ struct SuppressTokensSampler: LogitSampler {
     func sample(logits: MLXArray) -> MLXArray {
         base.sample(logits: suppressor.process(logits: logits))
     }
+}
+
+extension SuppressTokensSampler: GreedyTokenSampler {
+    package var isGreedyArgMax: Bool { base is ArgMaxSampler }
+    package var greedySuppressedTokenIds: [Int] { suppressor.suppressedIds }
 }

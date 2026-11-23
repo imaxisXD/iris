@@ -27,6 +27,7 @@ struct NoteView {
 
 impl Render for NoteView {
     fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        crate::riso::let_go_of_last_frame(window);
         // `FloatingNote.fadeIn` / `fadeOut`: in over `DS.Motion.fast.enter`, out one step quicker.
         let alpha = match self.leaving {
             Some(l) => 1.0 - crate::parts::ds_curve(l.elapsed().as_secs_f32() / crate::parts::slow() / 0.12),

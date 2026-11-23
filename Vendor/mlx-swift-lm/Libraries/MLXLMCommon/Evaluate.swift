@@ -2608,8 +2608,39 @@ public func generateTokens(
     mtpDrafter: any MTPDrafterModel,
     blockSize: Int = 4,
     components: GenerationComponents = .init(),
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    promptLookupTokens: [Int]? = nil,
+    promptLookupMaxDraft: Int = 16
 ) throws -> AsyncStream<TokenGeneration> {
+    let (stream, _) = try generateTokensTask(
+        input: input,
+        cache: cache,
+        parameters: parameters,
+        context: context,
+        mtpDrafter: mtpDrafter,
+        blockSize: blockSize,
+        components: components,
+        wiredMemoryTicket: wiredMemoryTicket,
+        promptLookupTokens: promptLookupTokens,
+        promptLookupMaxDraft: promptLookupMaxDraft
+    )
+    return stream
+}
+
+/// Iris: MTP counterpart to `generateTokensTask` returning both the stream and the worker `Task`,
+/// so callers that cancel early can await the worker's unwind before releasing GPU serialization.
+public func generateTokensTask(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    mtpDrafter: any MTPDrafterModel,
+    blockSize: Int = 4,
+    components: GenerationComponents = .init(),
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    promptLookupTokens: [Int]? = nil,
+    promptLookupMaxDraft: Int = 16
+) throws -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
     let iterator = try MTPSpeculativeTokenIterator(
         input: input,
         mainModel: context.model,
@@ -2617,9 +2648,11 @@ public func generateTokens(
         mainCache: cache,
         parameters: parameters,
         blockSize: blockSize,
-        components: components
+        components: components,
+        promptLookupTokens: promptLookupTokens,
+        promptLookupMaxDraft: promptLookupMaxDraft
     )
-    let (stream, _) = generateLoopTask(
+    return generateLoopTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
@@ -2627,7 +2660,6 @@ public func generateTokens(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: RawTokenLoopHandler()
     )
-    return stream
 }
 
 /// Generates raw token IDs asynchronously and returns the stream plus a `Task`.

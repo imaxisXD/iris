@@ -46,13 +46,36 @@ const SUNFLOWER: Rgb8 = (255, 190, 40);
 /// Raw pictures kept by name: (pixels square, straight RGBA).
 pub type Raw = Rc<(u32, Vec<u8>)>;
 
+const RAW_MAX_ENTRIES: usize = 64;
+
 pub fn raw(key: &str, pixels: u32, make: impl FnOnce() -> Vec<u8>) -> Raw {
-    thread_local! { static RAW: RefCell<HashMap<String, Raw>> = RefCell::new(HashMap::new()); }
-    if let Some(r) = RAW.with(|m| m.borrow().get(key).cloned()) {
+    thread_local! {
+        static RAW: RefCell<(HashMap<String, (Raw, u64)>, u64)> = RefCell::new((HashMap::new(), 0));
+    }
+    if let Some(r) = RAW.with(|m| {
+        let mut guard = m.borrow_mut();
+        guard.1 = guard.1.wrapping_add(1);
+        let tick = guard.1;
+        let entry = guard.0.get_mut(key)?;
+        entry.1 = tick;
+        Some(entry.0.clone())
+    }) {
         return r;
     }
     let r = Rc::new((pixels, make()));
-    RAW.with(|m| m.borrow_mut().insert(key.to_string(), r.clone()));
+    RAW.with(|m| {
+        let mut guard = m.borrow_mut();
+        guard.1 = guard.1.wrapping_add(1);
+        let tick = guard.1;
+        guard.0.insert(key.to_string(), (r.clone(), tick));
+        while guard.0.len() > RAW_MAX_ENTRIES {
+            if let Some(oldest) = guard.0.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| k.clone()) {
+                guard.0.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    });
     r
 }
 
@@ -380,12 +403,14 @@ pub fn garden_rgba(stage: Stage, progress: f64, growth: Option<f64>, t: f64, zoo
     (pw, ph, sh.rgba())
 }
 
-/// The garden as a picture (`side` points square, `PAD` round it at `zoom`). A garden held at
-/// one moment (snapshots, or reduced motion) is printed once and kept.
+/// The garden as a picture (`side` points square, `PAD` round it at `zoom`). A static garden
+/// held at one moment (snapshots, or reduced motion when idle) is printed once and kept; dynamic
+/// download/update progress frames use `frame_image` so progress ticks never fill the cache.
 pub fn garden(stage: Stage, progress: f64, growth: Option<f64>, t: f64, zoom: f32, scale: f32) -> (Pixels, f32) {
     let side = (SIZE + 2.0 * PAD) * zoom;
-    let (pw, ph, rgba) = if t == 1000.0 {
-        let key = format!("garden-{stage:?}-{progress}-{growth:?}-{zoom}");
+    let dynamic = progress > 0.0 || growth.is_some();
+    let (pw, ph, rgba) = if t == 1000.0 && !dynamic {
+        let key = format!("garden-{stage:?}-{zoom}");
         let plate = Plate { w: side, h: side, scale };
         return (riso::cached(key, &plate, || garden_rgba(stage, progress, growth, t, zoom, scale).2), side);
     } else {

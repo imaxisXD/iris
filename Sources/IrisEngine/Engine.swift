@@ -27,18 +27,20 @@ public enum ModelChoice: String, CaseIterable, Codable, Sendable, Identifiable {
     /// How the model is asked (`Prompts`): trained models already know the jobs.
     public var promptStyle: PromptStyle { isTrained ? .trained : .taught }
 
-    /// The weights, and how to read their chat template. Iris's own are pinned to the
-    /// commit that was tested, so a later upload can't change them under anyone.
+    /// The weights, and how to read their chat template. Every shipped model and drafter is
+    /// pinned to the commit that was tested, so a later upload can't change them under anyone.
     public var configuration: ModelConfiguration {
         switch self {
         case .best: ModelConfiguration(id: "ImAXISOG/iris-gemma-4-e4b-it-mlx",
                                        revision: "d7b746bea65153a385e18cd9a0f5549a2cf7e0bf", extraEOSTokens: ["<turn|>"])
         case .lighter: ModelConfiguration(id: "ImAXISOG/iris-gemma-4-e2b-it-mlx",
                                           revision: "b0a6390530ea4580ef7607967d1134e1b2ada58e", extraEOSTokens: ["<turn|>"])
-        case .e4b: LLMRegistry.gemma4_e4b_it_4bit
+        case .e4b: ModelConfiguration(id: "mlx-community/gemma-4-e4b-it-4bit",
+                                      revision: "475b9088d29754a3379866cf5aeb6b41acd313c2", extraEOSTokens: ["<turn|>"])
         // Google's quantization-aware build: in our side-by-side tests it beat the plain
         // 4-bit E2B on Fix (76% vs 72% acceptable) and tones (76% vs 68% sendable).
-        case .e2b: ModelConfiguration(id: "mlx-community/gemma-4-E2B-it-qat-4bit", extraEOSTokens: ["<turn|>"])
+        case .e2b: ModelConfiguration(id: "mlx-community/gemma-4-E2B-it-qat-4bit",
+                                      revision: "42f62737af7a9fd8c1d55d79666c1a217be4e2e2", extraEOSTokens: ["<turn|>"])
         }
     }
 
@@ -46,8 +48,10 @@ public enum ModelChoice: String, CaseIterable, Codable, Sendable, Identifiable {
     /// models share the drafter of the Gemma they were trained from.
     var drafter: ModelConfiguration {
         switch self {
-        case .best, .e4b: ModelConfiguration(id: "mlx-community/gemma-4-E4B-it-assistant-bf16")
-        case .lighter, .e2b: ModelConfiguration(id: "mlx-community/gemma-4-E2B-it-qat-assistant-bf16")
+        case .best, .e4b: ModelConfiguration(id: "mlx-community/gemma-4-E4B-it-assistant-bf16",
+                                             revision: "844e008e06ef5562bdb89428d851d0634d119dcd")
+        case .lighter, .e2b: ModelConfiguration(id: "mlx-community/gemma-4-E2B-it-qat-assistant-bf16",
+                                                revision: "52e23b80eba4a664562ccd71ddc47984aee294fe")
         }
     }
 
@@ -233,7 +237,7 @@ public actor Engine: TextGenerator {
     private enum Residency {
         case empty
         case loading(ModelChoice, Task<ModelContainer, Error>, id: UUID)
-        case loaded(ModelChoice, ModelContainer)
+        case loaded(ModelChoice, ModelContainer, id: UUID)
     }
     private var residency = Residency.empty
 
@@ -248,15 +252,28 @@ public actor Engine: TextGenerator {
         return false
     }
 
+    /// Whether `container` is the model loaded now. When it isn't (unloaded, or switched for
+    /// another while an operation held it), letting go of it frees its weights, and MLX's buffer
+    /// cache should be emptied after.
+    private func isResident(_ container: ModelContainer?) -> Bool {
+        guard let container, case .loaded(_, let live, _) = residency else { return false }
+        return live === container
+    }
+
     // Activity and idle unload
     private var activeRequests = 0
+    private var activeGenerations = 0
     private var lastActivity = Date()
     private var idleTask: Task<Void, Never>?
     public var idleUnloadAfter: Duration = .seconds(30 * 60)
 
     // Generation
     private let gate = AsyncGate()
-    let prefixes = PrefixStore(capacity: 4)
+    /// Counts unloads, read from inside a generation (off the actor): one running when the model
+    /// it uses is unloaded or switched stops at its next token instead of finishing on a model
+    /// that's gone, which kept both models in memory until it ended.
+    private let unloads = UnloadCount()
+    let prefixes = PrefixStore(capacity: 12)
     /// How the last request went, for local tools that measure the pipeline.
     private(set) var lastStats: GenerationStats?
 
@@ -318,7 +335,18 @@ public actor Engine: TextGenerator {
         scheduleIdleUnload()
     }
 
-    public func setPreferred(_ choice: ModelChoice) { preferredChoice = choice }
+    public func setPreferred(_ choice: ModelChoice) {
+        guard choice != preferredChoice else { return }
+        preferredChoice = choice
+        // Another model chosen (Settings, setup): let go of the one in memory or on its way, as
+        // llama.cpp's engine does, so it isn't kept, and shown ready, until the next check.
+        switch residency {
+        case .empty: break
+        case .loaded(let loaded, _, _) where loaded == choice: break
+        case .loading(let loading, _, _) where loading == choice: break
+        default: unload()
+        }
+    }
 
     // MARK: Load and unload
 
@@ -329,8 +357,8 @@ public actor Engine: TextGenerator {
     @discardableResult
     public func load(_ choice: ModelChoice, allowDownload: Bool = false) async throws -> ModelContainer {
         switch residency {
-        case .loaded(let loaded, let container) where loaded == choice: return container
-        case .loading(let loading, let task, _) where loading == choice: return try await task.value
+        case .loaded(let loaded, let container, _) where loaded == choice: return container
+        case .loading(let loading, _, let id) where loading == choice: return try await join(load: id)
         default: break
         }
 
@@ -353,36 +381,42 @@ public actor Engine: TextGenerator {
         // drafter its hidden state and K/V; other models load as plain language models.
         let drafterConfiguration = speculativeDecoding ? Self.drafterConfiguration(for: configuration.name) : nil
         let wordTableFile = configurationOverride == nil ? choice.wordTableFile : nil
-        let task = Task<ModelContainer, Error> {
+        // Optional so it can be let go of: a finished task keeps its container alive.
+        var task: Task<ModelContainer, Error>? = Task<ModelContainer, Error> {
             let progressHandler: @Sendable (Progress) -> Void = { progress in
                 let fraction = progress.fractionCompleted
                 Task { await self.reportDownload(fraction, load: id) }
             }
             if drafterConfiguration != nil {
-                // Read when the model is built, after the download: Iris's own load text-only.
-                Gemma4TextOnly.wordTableFile = wordTableFile
-                defer { Gemma4TextOnly.wordTableFile = nil }
-                return try await VLMModelFactory.shared.loadContainer(
-                    from: #hubDownloader(), using: #huggingFaceTokenizerLoader(),
-                    configuration: configuration, progressHandler: progressHandler)
+                // Scoped to this load task so overlapping loads can't clobber each other.
+                return try await Gemma4TextOnly.withWordTableFile(wordTableFile) {
+                    try await VLMModelFactory.shared.loadContainer(
+                        from: #hubDownloader(), using: #huggingFaceTokenizerLoader(),
+                        configuration: configuration, progressHandler: progressHandler)
+                }
             }
             // Labelled on purpose: the macro only reads a `progressHandler:` argument and
             // silently drops a trailing closure, which left the download stuck at 0%.
             return try await #huggingFaceLoadModelContainer(
                 configuration: configuration, progressHandler: progressHandler)
         }
-        residency = .loading(choice, task, id: id)
+        residency = .loading(choice, task!, id: id)
         do {
-            let loaded = try await task.value
-            guard isCurrentLoad(id) else { throw CancellationError() }  // replaced meanwhile
-            residency = .loaded(choice, loaded)
+            var loaded: ModelContainer? = try await task!.value
+            task = nil
+            guard isCurrentLoad(id), let container = loaded else {
+                loaded = nil
+                throw CancellationError()
+            }
+            residency = .loaded(choice, container, id: id)
             state = .ready(choice)
             lastActivity = Date()
             scheduleIdleUnload()
             if let drafterConfiguration { loadDrafter(drafterConfiguration, load: id) }
             Self.log.info("loaded \(choice.rawValue, privacy: .public)")
-            return loaded
+            return container
         } catch {
+            task = nil
             if isCurrentLoad(id) {
                 residency = .empty
                 if error is CancellationError {
@@ -392,8 +426,34 @@ public actor Engine: TextGenerator {
                     state = .failed(ModelFailure(error))
                 }
             }
+            // This load failed, or was unloaded or switched for another while in flight: its
+            // tensors have unwound now, so give their buffers back (whatever is loading next).
+            MLX.Memory.clearCache()
             throw error
         }
+    }
+
+    /// Waits for the load already under way (`id`) for a second caller. The task is held only
+    /// while waiting (a finished task keeps its container), and a load unloaded meanwhile isn't
+    /// handed out: the caller hears it was cancelled, as the load's own caller does.
+    private func join(load id: UUID) async throws -> ModelContainer {
+        var task: Task<ModelContainer, Error>?
+        if case .loading(_, let running, let current) = residency, current == id { task = running }
+        guard task != nil else { throw CancellationError() }
+        var container: ModelContainer?
+        do {
+            container = try await task!.value
+            task = nil
+        } catch {
+            task = nil
+            throw error
+        }
+        guard isResident(container) || isCurrentLoad(id), let container else {
+            container = nil
+            MLX.Memory.clearCache()
+            throw CancellationError()
+        }
+        return container
     }
 
     /// Fetches (first time) and loads the drafter after Gemma is ready, so it never delays
@@ -403,16 +463,85 @@ public actor Engine: TextGenerator {
         drafterTask = Task {
             await Gemma4AssistantRegistration.register()
             do {
-                let context = try await MTPDrafterModelFactory.shared.load(
+                var context: MTPDrafterContext? = try await MTPDrafterModelFactory.shared.load(
                     from: #hubDownloader(), using: #huggingFaceTokenizerLoader(), configuration: configuration)
-                guard drafterLoad == id else { return }  // the model was unloaded or replaced
-                drafter = context.model
+                guard drafterLoad == id, let loaded = context else {
+                    context = nil
+                    MLX.Memory.clearCache()
+                    return
+                }
+                drafter = loaded.model
                 Self.log.info("drafter ready: \(configuration.name, privacy: .public)")
+                await self.warmUpShaders(load: id)
             } catch {
+                MLX.Memory.clearCache()
                 Self.log.error("drafter unavailable, decoding normally: \(error.localizedDescription, privacy: .public)")
             }
         }
     }
+
+    /// Compiles Metal shaders, prepares fused projections, and primes the drafter path in the
+    /// background right after loading so the user's very first check doesn't pay the cold-compile stall.
+    private func warmUpShaders(load id: UUID) async {
+        // Bindings from `residency` are scoped in `do` blocks, as in `run` and `prewarm`, so the
+        // only reference this holds is `container`, let go of before the cache is cleared.
+        let choice: ModelChoice
+        var container: ModelContainer?
+        do {
+            guard drafterLoad == id, activeGenerations == 0,
+                case .loaded(let loadedChoice, let initialContainer, let loadedID) = residency, loadedID == id
+            else { return }
+            choice = loadedChoice
+            container = initialContainer
+        }
+        nonisolated(unsafe) var drafter = self.drafter
+        let blockSize = Self.mtpBlockSize
+        await gate.acquire()
+        defer {
+            gate.release()
+            drafter = nil
+            let stale = !isResident(container)
+            container = nil
+            if stale { MLX.Memory.clearCache() }
+        }
+        do {
+            guard drafterLoad == id, activeGenerations == 0,
+                case .loaded(_, let liveContainer, let liveID) = residency,
+                liveID == id, liveContainer === container
+            else { return }
+        }
+        let turns = Prompts.fixTurns(for: "ok", style: choice.promptStyle)
+        let store = prefixes
+        let key = "warmup:\(choice.rawValue)"
+        do {
+            nonisolated(unsafe) let activeDrafter = drafter
+            _ = try? await container!.perform { context in
+                (context.model as? Gemma4)?.prepareFusedProjections()
+                let prepared = try await context.processor.prepare(
+                    input: Self.input(Self.messages(turns)))
+                let params = GenerateParameters(maxTokens: 2, temperature: 0)
+                let (tokens, workerTask) = try activeDrafter.map {
+                    try generateTokensTask(
+                        input: prepared, parameters: params, context: context,
+                        mtpDrafter: $0, blockSize: blockSize)
+                } ?? generateTokensTask(input: prepared, parameters: params, context: context)
+                for await _ in tokens {
+                    if Task.isCancelled { break }
+                }
+                workerTask.cancel()
+                await workerTask.value
+                // Don't leave warmup key in prefix cache.
+                store[key] = nil
+            }
+        }
+        Self.log.info("shaders warmed for \(choice.rawValue, privacy: .public)")
+    }
+
+    /// Block size for MTP speculative decoding (5 = 4 draft + 1 bonus, benchmarked optimal on E4B and E2B).
+    private static let mtpBlockSize = 5
+
+    /// Maximum tokens proposed per Fix-mode Prompt-Lookup Drafting round (31 + 1 bonus = 32 NAX tile).
+    private static let promptLookupMaxDraft = 31
 
     private func reportDownload(_ fraction: Double, load id: UUID) {
         guard isCurrentLoad(id) else { return }
@@ -434,6 +563,7 @@ public actor Engine: TextGenerator {
 
     /// Frees the model. Waits for nothing: callers that need it simply load again.
     public func unload() {
+        unloads.bump()
         idleTask?.cancel()
         idleTask = nil
         // A load still in flight is cancelled, and no longer current when it returns.
@@ -462,15 +592,30 @@ public actor Engine: TextGenerator {
     /// Loads the model and prefills the fixed part of a prompt, so the next request with
     /// the same `cacheKey` only has to read the user's text. Cheap to call repeatedly.
     public func prewarm(_ turns: [PromptTurn], cacheKey: String) async {
+        guard activeGenerations == 0 else { return }
         beginActivity()
         defer { endActivity() }
         do {
-            let container = try await load(preferredChoice)
+            var container: ModelContainer? = try await load(preferredChoice)
+            defer {
+                let stale = !isResident(container)
+                container = nil
+                if stale { MLX.Memory.clearCache() }
+            }
+            guard activeGenerations == 0 else { return }
             await gate.acquire()
             defer { gate.release() }
+            let scopedKey: String
+            do {
+                guard activeGenerations == 0,
+                    case .loaded(let loadedChoice, let liveContainer, let loadedID) = residency,
+                    liveContainer === container
+                else { return }
+                scopedKey = "\(loadedChoice.rawValue):\(loadedID.uuidString):\(cacheKey)"
+            }
             let store = prefixes
-            try await container.perform { context in
-                _ = try await Self.prefixEntry(for: Self.messages(turns), key: cacheKey, store: store, context: context)
+            try await container!.perform { context in
+                _ = try await Self.prefixEntry(for: Self.messages(turns), key: scopedKey, store: store, context: context)
             }
         } catch {
             Self.log.debug("prewarm skipped: \(error.localizedDescription, privacy: .public)")
@@ -502,22 +647,53 @@ public actor Engine: TextGenerator {
         onChunk: @escaping @Sendable (String) -> Void
     ) async throws {
         beginActivity()
-        defer { endActivity() }
+        activeGenerations += 1
+        defer {
+            activeGenerations = max(0, activeGenerations - 1)
+            endActivity()
+        }
 
-        let container = try await load(preferredChoice)
-        // One generation on the GPU at a time; a superseded request is cancelled by its
-        // caller and gives up its turn here.
-        await gate.acquire()
-        defer { gate.release() }
+        var container: ModelContainer? = try await load(preferredChoice)
+        nonisolated(unsafe) var activeDrafter: (any MTPDrafterModel)? = nil
+        let blockSize = Self.mtpBlockSize
+        // One generation on the GPU at a time; real checks jump ahead of queued background prewarms.
+        await gate.acquire(urgent: true)
+        defer {
+            gate.release()
+            activeDrafter = nil
+            // If `unload()` or a model switch ran while this generation held strong references to
+            // the container/drafter, release the Metal buffer cache now that they have dropped.
+            let stale = !isResident(container)
+            container = nil
+            if stale { MLX.Memory.clearCache() }
+        }
         try Task.checkCancellation()
 
+        // Re-check residency after the gate wait so a model switch never cross-wires caches or drafters.
+        let loadedChoice: ModelChoice
+        let loadedID: UUID
+        do {
+            guard case .loaded(let choice, let liveContainer, let id) = residency,
+                liveContainer === container
+            else { throw CancellationError() }
+            loadedChoice = choice
+            loadedID = id
+        }
+
         let store = prefixes
-        let cacheKey = prefixCacheEnabled ? cacheKey : nil
+        let isFixMode = cacheKey?.hasPrefix("fix:") == true
+        let scopedCacheKey = prefixCacheEnabled
+            ? cacheKey.map { "\(loadedChoice.rawValue):\(loadedID.uuidString):\($0)" }
+            : nil
         let parameters = GenerateParameters(
             maxTokens: maxTokens, temperature: temperature, topP: temperature == 0 ? 1.0 : 0.95)
 
-        nonisolated(unsafe) let drafter = self.drafter  // used only inside the serialized perform below
-        let stats = try await container.perform { context in
+        activeDrafter = drafterLoad == loadedID ? self.drafter : nil  // used only inside the serialized perform below
+        let unloads = self.unloads
+        let unloadsAtStart = unloads.count
+        let stats: GenerationStats = try await {
+            nonisolated(unsafe) let drafter = activeDrafter
+            return try await container!.perform { context in
             let messages = Self.messages(turns)
             let started = Date()
             var stats = GenerationStats()
@@ -528,24 +704,33 @@ public actor Engine: TextGenerator {
 
             var input = full
             var cache: [KVCache]? = nil
-            if let cacheKey,
+            var draftTokens: [Int]? = nil
+            if let cacheKey = scopedCacheKey,
                 let entry = try await Self.prefixEntry(for: messages, key: cacheKey, store: store, context: context),
                 fullTokens.count > entry.tokens.count, fullTokens.starts(with: entry.tokens)
             {
                 cache = entry.cache.map { $0.copy() }
                 input = LMInput(tokens: MLXArray(fullTokens[entry.tokens.count...].map(Int32.init)))
                 stats.reusedTokens = entry.tokens.count
+                let draftEnd = fullTokens.count - entry.suffixCount
+                if draftEnd > entry.tokens.count {
+                    draftTokens = Array(fullTokens[entry.tokens.count ..< draftEnd])
+                }
             }
 
             let prefillStart = Date()
             var first = true
             var decoder = ScalarStreamDecoder(tokenizer: context.tokenizer)
-            let tokens = try drafter.map {
-                try generateTokens(input: input, cache: cache, parameters: parameters, context: context,
-                                   mtpDrafter: $0, blockSize: 4)
-            } ?? generateTokens(input: input, cache: cache, parameters: parameters, context: context)
+            let pldMax = isFixMode ? Self.promptLookupMaxDraft : 0
+            let (tokens, workerTask) = try drafter.map {
+                try generateTokensTask(
+                    input: input, cache: cache, parameters: parameters, context: context,
+                    mtpDrafter: $0, blockSize: blockSize,
+                    promptLookupTokens: pldMax > 0 ? draftTokens : nil,
+                    promptLookupMaxDraft: pldMax)
+            } ?? generateTokensTask(input: input, cache: cache, parameters: parameters, context: context)
             for await generation in tokens {
-                if Task.isCancelled { break }
+                if Task.isCancelled || unloads.count != unloadsAtStart { break }
                 switch generation {
                 case .token(let token):
                     if first {
@@ -556,13 +741,17 @@ public actor Engine: TextGenerator {
                     if let text = decoder.append(token) { onChunk(text) }
                 case .info(let info):
                     stats.generatedTokens = info.generationTokenCount
-                default:
-                    break
                 }
             }
+            // Wait for the worker to unwind before releasing the GPU gate.
+            workerTask.cancel()
+            await workerTask.value
+            // Stopped by an unload: not an answer (whoever asked hears the check didn't finish).
+            if unloads.count != unloadsAtStart { throw CancellationError() }
             stats.totalMs = Int(Date().timeIntervalSince(started) * 1000)
             return stats
-        }
+            }
+        }()
         try Task.checkCancellation()
         lastStats = stats
         Self.log.info(
@@ -578,11 +767,16 @@ public actor Engine: TextGenerator {
         for messages: [Chat.Message], key: String, store: PrefixStore, context: ModelContext
     ) async throws -> PrefixStore.Entry? {
         if let entry = store[key] { return entry }
+        let generation = store.currentGeneration()
         guard messages.count >= 2 else { return nil }
 
+        let lastContent = messages[messages.count - 1].content
+        let wrappedInMessageTags =
+            lastContent.hasPrefix("<message>\n") && lastContent.contains("\n</message>")
         func tokens(lastUser text: String) async throws -> [Int] {
             var probe = messages
-            probe[probe.count - 1] = .user(text)
+            let wrapped = wrappedInMessageTags ? "<message>\n\(text)\n</message>" : text
+            probe[probe.count - 1] = .user(wrapped)
             let prepared = try await context.processor.prepare(
                 input: Self.input(probe))
             return prepared.text.tokens.asArray(Int32.self).map(Int.init)
@@ -592,15 +786,21 @@ public actor Engine: TextGenerator {
         let shared = zip(a, b).prefix { $0 == $1 }.count
         guard shared >= 16 else { return nil }
         let prefix = Array(a.prefix(shared))
+        let commonSuffix = zip(a.reversed(), b.reversed()).prefix { $0 == $1 }.count
+        let suffixCount = max(0, min(commonSuffix, min(a.count, b.count) - shared - 1))
 
         let cache = try context.model.newCache(parameters: nil)
-        _ = try TokenIterator(
-            input: LMInput(tokens: MLXArray(prefix.map(Int32.init))), model: context.model, cache: cache,
-            parameters: GenerateParameters(maxTokens: 1, temperature: 0))
+        if let gemma4 = context.model as? Gemma4 {
+            gemma4.prefillOnly(MLXArray(prefix.map(Int32.init)), cache: cache)
+        } else {
+            _ = try TokenIterator(
+                input: LMInput(tokens: MLXArray(prefix.map(Int32.init))), model: context.model, cache: cache,
+                parameters: GenerateParameters(maxTokens: 1, temperature: 0))
+        }
         eval(cache)
-        let entry = PrefixStore.Entry(tokens: prefix, cache: cache)
-        store[key] = entry
-        log.info("prefilled prefix \(key, privacy: .public): \(prefix.count) tokens")
+        let entry = PrefixStore.Entry(tokens: prefix, suffixCount: suffixCount, cache: cache)
+        store.store(entry, forKey: key, ifGeneration: generation)
+        log.info("prefilled prefix \(key, privacy: .public): \(prefix.count) tokens (suffix \(suffixCount))")
         return entry
     }
 
@@ -675,7 +875,7 @@ public actor Engine: TextGenerator {
 struct ScalarStreamDecoder {
     let tokenizer: any MLXLMCommon.Tokenizer
     private var tokens: [Int] = []
-    private var emitted = 0  // Unicode scalars already handed out
+    private var emitted = 0  // Unicode scalars already handed out from `tokens`
 
     init(tokenizer: any MLXLMCommon.Tokenizer) { self.tokenizer = tokenizer }
 
@@ -683,10 +883,17 @@ struct ScalarStreamDecoder {
         tokens.append(token)
         let scalars = Array(tokenizer.decode(tokenIds: tokens).unicodeScalars)
         // A token that ends partway through a multi-byte character decodes to U+FFFD; wait for the rest.
-        guard scalars.last != "\u{FFFD}", scalars.count > emitted else { return nil }
+        guard let last = scalars.last, last != "\u{FFFD}", scalars.count > emitted else { return nil }
         var text = String.UnicodeScalarView()
         text.append(contentsOf: scalars[emitted...])
         emitted = scalars.count
+        // Keep decoding O(1) amortized instead of O(N^2): slide the window down to the last 2
+        // tokens once we end on a clean ASCII printable boundary (never mid-UTF-8 or combining mark).
+        if tokens.count >= 24, last.value >= 0x20, last.value <= 0x7E {
+            let anchor = Array(tokens.suffix(2))
+            tokens = anchor
+            emitted = tokenizer.decode(tokenIds: anchor).unicodeScalars.count
+        }
         return String(text)
     }
 }
@@ -697,15 +904,31 @@ struct ScalarStreamDecoder {
 final class PrefixStore: @unchecked Sendable {
     struct Entry {
         let tokens: [Int]
+        let suffixCount: Int
         let cache: [KVCache]
     }
 
     private let capacity: Int
     private var entries: [String: Entry] = [:]
     private var order: [String] = []
+    private var generation: UInt64 = 0
     private let lock = NSLock()
 
     init(capacity: Int) { self.capacity = capacity }
+
+    func currentGeneration() -> UInt64 {
+        lock.withLock { generation }
+    }
+
+    func store(_ entry: Entry, forKey key: String, ifGeneration expected: UInt64) {
+        lock.withLock {
+            guard generation == expected else { return }
+            entries[key] = entry
+            order.removeAll { $0 == key }
+            order.append(key)
+            while order.count > capacity { entries[order.removeFirst()] = nil }
+        }
+    }
 
     subscript(key: String) -> Entry? {
         get {
@@ -728,6 +951,7 @@ final class PrefixStore: @unchecked Sendable {
 
     func clear() {
         lock.withLock {
+            generation &+= 1
             entries.removeAll()
             order.removeAll()
         }
@@ -738,13 +962,18 @@ final class PrefixStore: @unchecked Sendable {
 final class AsyncGate: @unchecked Sendable {
     private let lock = NSLock()
     private var busy = false
+    private var urgentWaiters: [CheckedContinuation<Void, Never>] = []
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    func acquire() async {
+    func acquire(urgent: Bool = false) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             lock.lock()
             if busy {
-                waiters.append(continuation)
+                if urgent {
+                    urgentWaiters.append(continuation)
+                } else {
+                    waiters.append(continuation)
+                }
                 lock.unlock()
             } else {
                 busy = true
@@ -756,13 +985,24 @@ final class AsyncGate: @unchecked Sendable {
 
     func release() {
         lock.lock()
-        if waiters.isEmpty {
-            busy = false
-            lock.unlock()
+        let next: CheckedContinuation<Void, Never>?
+        if !urgentWaiters.isEmpty {
+            next = urgentWaiters.removeFirst()
+        } else if !waiters.isEmpty {
+            next = waiters.removeFirst()
         } else {
-            let next = waiters.removeFirst()
-            lock.unlock()
-            next.resume()
+            next = nil
+            busy = false
         }
+        lock.unlock()
+        next?.resume()
     }
+}
+
+/// A count bumped on the engine's actor and read from inside a generation.
+final class UnloadCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func bump() { lock.lock(); value += 1; lock.unlock() }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return value }
 }

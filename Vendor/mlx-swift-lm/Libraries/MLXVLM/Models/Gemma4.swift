@@ -145,9 +145,31 @@ private func gemma4TextOnlyPromptTokens(_ input: LMInput) -> MLXArray {
     return tokens.flattened()
 }
 
+// Iris: compiled fusion fragments matching MLXLLM's Gemma4Text.swift (~+24% decode throughput
+// on Apple Silicon by cutting per-op Swift->MLX dispatch overhead across all 42 layers + drafter).
+private let gemma4FusedRMSEps: Float = 1e-6
+
+private let gemma4AddRMSNorm: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { residual, x, weight in
+    residual + MLXFast.rmsNorm(x, weight: weight, eps: gemma4FusedRMSEps)
+}
+
+private let gemma4AddRMSNormScale: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { residual, x, weight, scale in
+        (residual + MLXFast.rmsNorm(x, weight: weight, eps: gemma4FusedRMSEps)) * scale
+    }
+
+private let gemma4GeluMul: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { gate, other in
+    geluApproximate(gate) * other
+}
+
 private func gemma4PrepareTextOnly(
     _ input: LMInput,
     cache: [any KVCache],
+    state: LMOutput.State?,
     prefill: PrefillParameters,
     languageModel: Gemma4TextLanguageModel
 ) throws -> PrepareResult {
@@ -156,11 +178,21 @@ private func gemma4PrepareTextOnly(
     let totalPositions = y.dim(1)
 
     let processed = try prefill.forEachChunk(total: totalPositions) { range in
-        _ = languageModel(y[0..., range], cache: convertedCache)
+        _ = languageModel.model(y[0..., range], cache: convertedCache.map { $0 as KVCache? })
         asyncEval(cache)
     }
     if processed > 0 { eval(cache) }
-    let result = languageModel(y[0..., processed...], cache: convertedCache)
+    // Iris: emit drafter state directly from prefill when requested (eliminates a redundant
+    // 42-layer prime forward pass on every request) and project lm_head only for the final token.
+    let emit = state?[mtpEmitFlagKey] ?? false
+    let skipSoftcap = state?[mtpSkipLogitSoftcapKey] ?? false
+    let result = languageModel(
+        y[0..., processed...],
+        cache: convertedCache,
+        emitDrafterState: emit,
+        lastTokenLogitsOnly: true,
+        skipLogitSoftcap: skipSoftcap
+    )
     prefill.progress?(totalPositions, totalPositions)
     return .logits(result)
 }
@@ -474,11 +506,24 @@ final class Gemma4TextMLP: Module, UnaryLayer {
     @ModuleInfo(key: "down_proj") var downProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
 
+    // Iris: coalesce gate_proj + up_proj into one matmul (quantized or dense BF16, zero extra RAM).
+    private let fusedGateUp = FusedQuantizedLinearProjectionCache()
+    private var fusedDenseGateUp: Linear?
+    private var fusionChecked = false
+    private let gateDim: Int
+
+    var fusedProjectionTraceState: [Module] {
+        if let q = fusedGateUp.fused { return [q] }
+        if let d = fusedDenseGateUp { return [d] }
+        return []
+    }
+
     init(config: Gemma4TextConfiguration, layerIdx: Int) {
         let firstKVSharedLayer = config.hiddenLayers - config.numKVSharedLayers
         let isKVSharedLayer = layerIdx >= firstKVSharedLayer && firstKVSharedLayer > 0
         let useDoubleWide = config.useDoubleWideMLP && isKVSharedLayer
         let hiddenDimensions = config.intermediateSize * (useDoubleWide ? 2 : 1)
+        self.gateDim = hiddenDimensions
 
         self._gateProj.wrappedValue = Linear(config.hiddenSize, hiddenDimensions, bias: false)
         self._downProj.wrappedValue = Linear(hiddenDimensions, config.hiddenSize, bias: false)
@@ -486,8 +531,77 @@ final class Gemma4TextMLP: Module, UnaryLayer {
         super.init()
     }
 
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        fusedGateUp.invalidate()
+        fusedDenseGateUp = nil
+        fusionChecked = false
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        if key == "gate_proj" || key == "up_proj" {
+            fusedGateUp.invalidate()
+            fusedDenseGateUp = nil
+            fusionChecked = false
+        }
+        try super.updateModule(key: key, value)
+    }
+
+    @discardableResult
+    func prepareFusedGateUp() -> Linear? {
+        if let fused = fusedGateUp.fused { return fused }
+        if let dense = fusedDenseGateUp { return dense }
+        guard !fusionChecked, !training else { return nil }
+        fusionChecked = true
+        if (try? fusedGateUp.prepare(enabled: true, linears: [gateProj, upProj]) { views in
+            try self.update(
+                modules: ModuleChildren(values: [
+                    "gate_proj": .value(views[0]),
+                    "up_proj": .value(views[1]),
+                ]), verify: [])
+        }) == true, let fused = fusedGateUp.fused {
+            return fused
+        }
+        // Dense Linear fallback (used by the 4-layer BF16 MTP drafter): coalesce into one matmul
+        // and share backing storage via views so weight RAM doesn't double.
+        if ObjectIdentifier(type(of: gateProj)) == ObjectIdentifier(Linear.self),
+            ObjectIdentifier(type(of: upProj)) == ObjectIdentifier(Linear.self),
+            gateProj.bias == nil, upProj.bias == nil,
+            gateProj.weight.ndim == 2, upProj.weight.ndim == 2,
+            gateProj.weight.dim(1) == upProj.weight.dim(1),
+            gateProj.weight.dtype == upProj.weight.dtype
+        {
+            let w = concatenated([gateProj.weight, upProj.weight], axis: 0)
+            eval(w)
+            let fused = Linear(weight: w, bias: nil)
+            fused.freeze()
+            let gView = Linear(weight: w[..<gateDim], bias: nil)
+            let uView = Linear(weight: w[gateDim...], bias: nil)
+            gView.freeze()
+            uView.freeze()
+            _ = try? self.update(
+                modules: ModuleChildren(values: [
+                    "gate_proj": .value(gView),
+                    "up_proj": .value(uView),
+                ]), verify: [])
+            self.fusedDenseGateUp = fused
+            self.fusionChecked = true
+            return fused
+        }
+        return nil
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(geluApproximate(gateProj(x)) * upProj(x))
+        if let fused = prepareFusedGateUp() {
+            let parts = split(fused(x), parts: 2, axis: -1)
+            return downProj(gemma4GeluMul(parts[0], parts[1]))
+        }
+        return downProj(gemma4GeluMul(gateProj(x), upProj(x)))
     }
 }
 
@@ -607,6 +721,12 @@ final class Gemma4TextAttention: Module {
     @ModuleInfo(key: "v_norm") var vNorm: Gemma4RMSNormNoScale?
     @ModuleInfo var rope: OffsetLayer
 
+    // Iris: coalesce q_proj + k_proj (+ v_proj) into one quantized matmul on KV-owning layers.
+    private let fusedQKV = FusedQuantizedLinearProjectionCache()
+    private var qkvFusionChecked = false
+    private let qDim: Int
+    private let kvDim: Int
+
     init(config: Gemma4TextConfiguration, layerIdx: Int, kvSharedOnly: Bool = false) {
         self.config = config
         self.layerIdx = layerIdx
@@ -619,6 +739,8 @@ final class Gemma4TextAttention: Module {
         self.useKEqV = config.attentionKEqV && !isSliding
         self.numKVHeads =
             useKEqV ? (config.globalKVHeads ?? config.kvHeads) : config.kvHeads
+        self.qDim = numHeads * headDim
+        self.kvDim = numKVHeads * headDim
         self.scale = 1.0
 
         let firstKVSharedLayer = config.hiddenLayers - config.numKVSharedLayers
@@ -660,21 +782,69 @@ final class Gemma4TextAttention: Module {
         super.init()
     }
 
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        fusedQKV.invalidate()
+        qkvFusionChecked = false
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        if key == "q_proj" || key == "k_proj" || key == "v_proj" {
+            fusedQKV.invalidate()
+            qkvFusionChecked = false
+        }
+        try super.updateModule(key: key, value)
+    }
+
+    @discardableResult
+    func prepareFusedQKV() -> QuantizedLinear? {
+        if let fused = fusedQKV.fused { return fused }
+        guard !qkvFusionChecked, !training, let kProj else { return nil }
+        qkvFusionChecked = true
+        if useKEqV {
+            _ = try? fusedQKV.prepare(enabled: true, linears: [qProj, kProj]) { views in
+                try self.update(
+                    modules: ModuleChildren(values: [
+                        "q_proj": .value(views[0]),
+                        "k_proj": .value(views[1]),
+                    ]), verify: [])
+            }
+        } else if let vProj {
+            _ = try? fusedQKV.prepare(enabled: true, linears: [qProj, kProj, vProj]) { views in
+                try self.update(
+                    modules: ModuleChildren(values: [
+                        "q_proj": .value(views[0]),
+                        "k_proj": .value(views[1]),
+                        "v_proj": .value(views[2]),
+                    ]), verify: [])
+            }
+        }
+        return fusedQKV.fused
+    }
+
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
         cache: KVCache? = nil,
         sharedKV: Gemma4SharedKVState? = nil,
-        offset: Int? = nil
+        offset: Int? = nil,
+        offsetArray: MLXArray? = nil
     ) -> (MLXArray, Gemma4SharedKVState?, Int) {
-        let (batch, length, _) = (x.dim(0), x.dim(1), x.dim(2))
+        let batch = x.dim(0)
+        // Iris: keep sequence length symbolic (`-1`) when `offsetArray != nil` (inside `compile(shapeless: true)`).
+        let seqDim = offsetArray != nil ? -1 : x.dim(1)
 
-        var queries = qProj(x).reshaped(batch, length, numHeads, headDim)
-        queries = qNorm(queries)
-
+        var queries: MLXArray
         let currentOffset: Int
         let kvState: Gemma4SharedKVState?
 
         if let sharedKV {
+            queries = qProj(x).reshaped(batch, seqDim, numHeads, headDim)
+            queries = qNorm(queries)
             currentOffset = offset ?? 0
             kvState = sharedKV
         } else {
@@ -687,16 +857,38 @@ final class Gemma4TextAttention: Module {
                     "Gemma4 attention called without sharedKV on a KV-shared layer")
             }
             currentOffset = cache?.offset ?? 0
-            var keys = kProj(x).reshaped(batch, length, numKVHeads, headDim)
-            var values =
-                if useKEqV {
-                    keys
-                } else {
-                    vProj!(x).reshaped(batch, length, numKVHeads, headDim)
-                }
+            var keys: MLXArray
+            var values: MLXArray
+            if let fused = prepareFusedQKV() {
+                let qkv = fused(x)
+                queries = qkv[.ellipsis, ..<qDim].reshaped(batch, seqDim, numHeads, headDim)
+                keys = qkv[.ellipsis, qDim ..< (qDim + kvDim)].reshaped(
+                    batch, seqDim, numKVHeads, headDim)
+                values =
+                    if useKEqV {
+                        keys
+                    } else {
+                        qkv[.ellipsis, (qDim + kvDim)...].reshaped(
+                            batch, seqDim, numKVHeads, headDim)
+                    }
+            } else {
+                queries = qProj(x).reshaped(batch, seqDim, numHeads, headDim)
+                keys = kProj(x).reshaped(batch, seqDim, numKVHeads, headDim)
+                values =
+                    if useKEqV {
+                        keys
+                    } else {
+                        vProj!(x).reshaped(batch, seqDim, numKVHeads, headDim)
+                    }
+            }
+            queries = qNorm(queries)
             keys = kNorm(keys).transposed(0, 2, 1, 3)
             values = vNorm(values).transposed(0, 2, 1, 3)
-            keys = rope(keys, offset: currentOffset)
+            if let offsetArray, let dynRope = rope as? any ArrayOffsetLayer {
+                keys = dynRope(keys, offset: offsetArray)
+            } else {
+                keys = rope(keys, offset: currentOffset)
+            }
             if let quantizedCache = cache as? QuantizedKVCacheProtocol {
                 let (quantizedKeys, quantizedValues) = quantizedCache.updateQuantized(
                     keys: keys, values: values)
@@ -716,7 +908,11 @@ final class Gemma4TextAttention: Module {
         }
 
         queries = queries.transposed(0, 2, 1, 3)
-        queries = rope(queries, offset: currentOffset)
+        if let offsetArray, let dynRope = rope as? any ArrayOffsetLayer {
+            queries = dynRope(queries, offset: offsetArray)
+        } else {
+            queries = rope(queries, offset: currentOffset)
+        }
 
         guard let kvState else {
             fatalError("Gemma4 attention expected a KV state")
@@ -747,7 +943,7 @@ final class Gemma4TextAttention: Module {
             }
 
         return (
-            oProj(output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)),
+            oProj(output.transposed(0, 2, 1, 3).reshaped(batch, seqDim, qDim)),
             kvState,
             currentOffset
         )
@@ -758,6 +954,7 @@ final class Gemma4TextAttention: Module {
 final class Gemma4TextDecoderLayer: Module {
     let layerType: String
     let enableMoE: Bool
+    private let useCompiledNorm: Bool
 
     @ModuleInfo(key: "self_attn") var selfAttention: Gemma4TextAttention
     @ModuleInfo var mlp: Gemma4TextMLP
@@ -783,6 +980,7 @@ final class Gemma4TextDecoderLayer: Module {
     init(config: Gemma4TextConfiguration, layerIdx: Int, kvSharedOnly: Bool = false) {
         self.layerType = config.layerTypes[layerIdx]
         self.enableMoE = config.enableMoEBlock
+        self.useCompiledNorm = config.rmsNormEps == gemma4FusedRMSEps
         self._selfAttention.wrappedValue = Gemma4TextAttention(
             config: config, layerIdx: layerIdx, kvSharedOnly: kvSharedOnly)
         self._mlp.wrappedValue = Gemma4TextMLP(config: config, layerIdx: layerIdx)
@@ -816,23 +1014,74 @@ final class Gemma4TextDecoderLayer: Module {
         super.init()
     }
 
-    func callAsFunction(
-        _ x: MLXArray,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
-        cache: KVCache? = nil,
-        perLayerInput: MLXArray? = nil,
-        sharedKV: Gemma4SharedKVState? = nil,
-        offset: Int? = nil
-    ) -> (MLXArray, Gemma4SharedKVState?, Int) {
-        var residual = x
-        var h = inputLayerNorm(x)
-        let (attentionOutput, kvState, attentionOffset) = selfAttention(
-            h, mask: mask, cache: cache, sharedKV: sharedKV, offset: offset)
-        h = attentionOutput
-        h = postAttentionLayerNorm(h)
-        h = residual + h
+    /// Thread-safe, `invalidateCompiledTraces()`-aware container for a compiled post-attn closure.
+    private final class CompiledPostAttnBox: CompiledTraceInvalidating {
+        private let lock = NSLock()
+        private var fn: (([MLXArray]) -> [MLXArray])?
 
-        residual = h
+        func invalidate() {
+            lock.withLock { fn = nil }
+        }
+
+        func getOrCreate(_ build: () -> ([MLXArray]) -> [MLXArray]) -> ([MLXArray]) -> [MLXArray] {
+            lock.withLock {
+                if let fn { return fn }
+                let created = build()
+                self.fn = created
+                return created
+            }
+        }
+    }
+
+    // Iris: compiled FFN + per-layer input block (replaces ~18 Swift->MLX ops per layer with
+    // one compiled graph on fixed speculative verify widths L <= 6 or L == 32; skips variable-L prefill).
+    private let compiledPostAttnWithPLE = CompiledPostAttnBox()
+    private let compiledPostAttnNoPLE = CompiledPostAttnBox()
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        compiledPostAttnWithPLE.invalidate()
+        compiledPostAttnNoPLE.invalidate()
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    @discardableResult
+    override func update(
+        modules: ModuleChildren, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        compiledPostAttnWithPLE.invalidate()
+        compiledPostAttnNoPLE.invalidate()
+        return try super.update(
+            modules: modules, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        compiledPostAttnWithPLE.invalidate()
+        compiledPostAttnNoPLE.invalidate()
+        try super.updateModule(key: key, value)
+    }
+
+    func prepareFusedProjections() {
+        selfAttention.prepareFusedQKV()
+        mlp.prepareFusedGateUp()
+    }
+
+    private func postAttnBody(
+        residual: MLXArray, attentionOutput: MLXArray, perLayerInput: MLXArray?
+    ) -> MLXArray {
+        var h: MLXArray
+        if useCompiledNorm {
+            h = gemma4AddRMSNorm(residual, attentionOutput, postAttentionLayerNorm.weight)
+        } else {
+            h = residual + postAttentionLayerNorm(attentionOutput)
+        }
+
+        var res = h
         if enableMoE,
             let router,
             let experts,
@@ -854,22 +1103,90 @@ final class Gemma4TextDecoderLayer: Module {
             h = preFeedforwardLayerNorm(h)
             h = mlp(h)
         }
-        h = postFeedforwardLayerNorm(h)
-        h = residual + h
 
         if let perLayerInputGate, let perLayerProjection, let postPerLayerInputNorm,
             let perLayerInput
         {
-            residual = h
+            if useCompiledNorm {
+                h = gemma4AddRMSNorm(res, h, postFeedforwardLayerNorm.weight)
+            } else {
+                h = res + postFeedforwardLayerNorm(h)
+            }
+            res = h
             var gated = perLayerInputGate(h)
-            gated = geluApproximate(gated)
-            gated = gated * perLayerInput
+            gated = gemma4GeluMul(gated, perLayerInput)
             gated = perLayerProjection(gated)
-            gated = postPerLayerInputNorm(gated)
-            h = residual + gated
+            if useCompiledNorm {
+                h = gemma4AddRMSNormScale(res, gated, postPerLayerInputNorm.weight, layerScalar)
+            } else {
+                h = (res + postPerLayerInputNorm(gated)) * layerScalar
+            }
+            return h
         }
 
-        return (h * layerScalar, kvState, attentionOffset)
+        if useCompiledNorm {
+            h = gemma4AddRMSNormScale(res, h, postFeedforwardLayerNorm.weight, layerScalar)
+        } else {
+            h = (res + postFeedforwardLayerNorm(h)) * layerScalar
+        }
+        return h
+    }
+
+    private func postAttnTraceWeights() -> [MLXArray] {
+        mlp.prepareFusedGateUp()
+        var modules: [Module] = [
+            mlp, postAttentionLayerNorm, preFeedforwardLayerNorm, postFeedforwardLayerNorm,
+        ]
+        modules.append(contentsOf: mlp.fusedProjectionTraceState)
+        if let g = perLayerInputGate { modules.append(g) }
+        if let p = perLayerProjection { modules.append(p) }
+        if let n = postPerLayerInputNorm { modules.append(n) }
+        var weights = modules.flatMap { $0.innerState() }
+        weights.append(layerScalar)
+        return weights
+    }
+
+    func callAsFunction(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+        cache: KVCache? = nil,
+        perLayerInput: MLXArray? = nil,
+        sharedKV: Gemma4SharedKVState? = nil,
+        offset: Int? = nil,
+        offsetArray: MLXArray? = nil
+    ) -> (MLXArray, Gemma4SharedKVState?, Int) {
+        let residual = x
+        let h = inputLayerNorm(x)
+        let (attentionOutput, kvState, attentionOffset) = selfAttention(
+            h, mask: mask, cache: cache, sharedKV: sharedKV, offset: offset,
+            offsetArray: offsetArray)
+
+        let seqLen = x.dim(1)
+        let shouldCompile = !training && !enableMoE && x.dim(0) == 1
+            && (seqLen <= 6 || seqLen == 32)
+        if shouldCompile {
+            if let perLayerInput, perLayerInputGate != nil {
+                let fn = compiledPostAttnWithPLE.getOrCreate {
+                    let weights = postAttnTraceWeights()
+                    return MLX.compile(inputs: [weights]) { [unowned self] args in
+                        [self.postAttnBody(residual: args[0], attentionOutput: args[1], perLayerInput: args[2])]
+                    }
+                }
+                return (fn([residual, attentionOutput, perLayerInput])[0], kvState, attentionOffset)
+            } else {
+                let fn = compiledPostAttnNoPLE.getOrCreate {
+                    let weights = postAttnTraceWeights()
+                    return MLX.compile(inputs: [weights]) { [unowned self] args in
+                        [self.postAttnBody(residual: args[0], attentionOutput: args[1], perLayerInput: nil)]
+                    }
+                }
+                return (fn([residual, attentionOutput])[0], kvState, attentionOffset)
+            }
+        }
+
+        let out = postAttnBody(
+            residual: residual, attentionOutput: attentionOutput, perLayerInput: perLayerInput)
+        return (out, kvState, attentionOffset)
     }
 }
 
@@ -881,9 +1198,13 @@ final class Gemma4TextBackbone: Module {
     let layerIdxToCacheIdx: [Int]
     let firstFullCacheIdx: Int
     let firstSlidingCacheIdx: Int
+    let sharedFullCacheIdx: Int
+    let sharedSlidingCacheIdx: Int
     let embedScale: Float
     let embedTokensPerLayerScale: Float
     let perLayerProjectionScale: Float
+    private let _embedScaleArr: MLXArray
+    private let _embedTokensPerLayerScaleArr: MLXArray
     private let _perLayerInputScale: MLXArray
 
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
@@ -901,6 +1222,8 @@ final class Gemma4TextBackbone: Module {
         self.firstKVSharedLayerIdx = config.hiddenLayers - config.numKVSharedLayers
         self.embedScale = pow(Float(config.hiddenSize), 0.5)
         self.embedTokensPerLayerScale = pow(Float(max(config.hiddenSizePerLayerInput, 1)), 0.5)
+        self._embedScaleArr = MLXArray(self.embedScale, dtype: .float32)
+        self._embedTokensPerLayerScaleArr = MLXArray(self.embedTokensPerLayerScale, dtype: .float32)
         self._perLayerInputScale = rsqrt(MLXArray(2.0))
 
         let concreteLayers = Array(config.layerTypes.prefix(firstKVSharedLayerIdx))
@@ -919,6 +1242,8 @@ final class Gemma4TextBackbone: Module {
         layerIdxToCacheIdx = cacheMap
         firstFullCacheIdx = concreteLayers.firstIndex(of: "full_attention") ?? 0
         firstSlidingCacheIdx = concreteLayers.firstIndex(of: "sliding_attention") ?? 0
+        sharedFullCacheIdx = sharedFullIdx
+        sharedSlidingCacheIdx = sharedSlidingIdx
 
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
@@ -941,7 +1266,10 @@ final class Gemma4TextBackbone: Module {
         if config.hiddenSizePerLayerInput > 0 {
             self.perLayerProjectionScale = pow(Float(config.hiddenSize), -0.5)
             self.wordTableOnDisk = Gemma4TextOnly.wordTableFile.flatMap {
-                Gemma4WordTableOnDisk(file: $0, rowWidth: config.hiddenLayers * config.hiddenSizePerLayerInput)
+                Gemma4WordTableOnDisk(
+                    file: $0,
+                    rowWidth: config.hiddenLayers * config.hiddenSizePerLayerInput,
+                    rowCount: config.vocabularySizePerLayerInput)
             }
             if wordTableOnDisk == nil {
                 self._embedTokensPerLayer.wrappedValue = Embedding(
@@ -978,7 +1306,7 @@ final class Gemma4TextBackbone: Module {
             }
             result = embedTokensPerLayer(tokens)
         }
-        result = (result * MLXArray(embedTokensPerLayerScale, dtype: .float32)).asType(result.dtype)
+        result = (result * _embedTokensPerLayerScaleArr).asType(result.dtype)
         return result.reshaped(
             Array(inputIds.shape) + [config.hiddenLayers, config.hiddenSizePerLayerInput]
         )
@@ -1036,7 +1364,7 @@ final class Gemma4TextBackbone: Module {
             h0 = inputsEmbeds
         } else if let inputs {
             let embeddings = embedTokens(inputs)
-            h0 = (embeddings * MLXArray(embedScale, dtype: .float32)).asType(embeddings.dtype)
+            h0 = (embeddings * _embedScaleArr).asType(embeddings.dtype)
         } else {
             fatalError("Either inputs or inputsEmbeds must be provided")
         }
@@ -1116,35 +1444,37 @@ final class Gemma4TextBackbone: Module {
         var h = h0
         var intermediates = [(kv: Gemma4SharedKVState?, offset: Int?)](
             repeating: (nil, nil), count: config.hiddenLayers)
-        for (idx, layer) in layers.enumerated() {
+        let kvOwningEnd = Swift.min(firstKVSharedLayerIdx, layers.count)
+        for idx in 0 ..< kvOwningEnd {
+            let layer = layers[idx]
             let sourceIdx = layerIdxToCacheIdx[idx]
-            let layerCache: KVCache? =
-                if idx < firstKVSharedLayerIdx, sourceIdx < localCache.count {
-                    localCache[sourceIdx]
-                } else {
-                    nil
-                }
-            let layerMask =
-                if layer.layerType == "full_attention" {
-                    fullMask
-                } else {
-                    slidingMask
-                }
-            let layerInput: MLXArray? =
-                if let finalPerLayerInputs {
-                    finalPerLayerInputs[0..., 0..., idx, 0...]
-                } else {
-                    nil
-                }
+            let layerCache: KVCache? = sourceIdx < localCache.count ? localCache[sourceIdx] : nil
+            let layerMask = layer.layerType == "full_attention" ? fullMask : slidingMask
+            let layerInput: MLXArray? = finalPerLayerInputs?[0..., 0..., idx, 0...]
             let (output, kvState, attentionOffset) = layer(
                 h,
                 mask: layerMask,
                 cache: layerCache,
                 perLayerInput: layerInput,
-                sharedKV: idx >= firstKVSharedLayerIdx
-                    ? intermediates[sourceIdx].kv : nil,
-                offset: idx >= firstKVSharedLayerIdx
-                    ? intermediates[sourceIdx].offset : nil
+                sharedKV: nil,
+                offset: nil
+            )
+            h = output
+            intermediates[idx] = (kvState, attentionOffset)
+        }
+
+        for idx in kvOwningEnd ..< layers.count {
+            let layer = layers[idx]
+            let sourceIdx = layerIdxToCacheIdx[idx]
+            let layerMask = layer.layerType == "full_attention" ? fullMask : slidingMask
+            let layerInput: MLXArray? = finalPerLayerInputs?[0..., 0..., idx, 0...]
+            let (output, kvState, attentionOffset) = layer(
+                h,
+                mask: layerMask,
+                cache: nil,
+                perLayerInput: layerInput,
+                sharedKV: intermediates[sourceIdx].kv,
+                offset: intermediates[sourceIdx].offset
             )
             h = output
             intermediates[idx] = (kvState, attentionOffset)
@@ -1187,6 +1517,12 @@ final class Gemma4TextBackbone: Module {
         // quantized cache for the other) as no-emit — iterator falls back.
         let complete = seenTypes == targetTypes
         return (finalHidden, complete ? sharedKV : nil, complete ? sharedKVSources : [:])
+    }
+
+    func prepareFusedProjections() {
+        for layer in layers {
+            layer.prepareFusedProjections()
+        }
     }
 }
 
@@ -1239,7 +1575,9 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         perLayerInputs: MLXArray? = nil,
         tokenTypeIds: MLXArray? = nil,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
-        emitDrafterState: Bool = false
+        emitDrafterState: Bool = false,
+        lastTokenLogitsOnly: Bool = false,
+        skipLogitSoftcap: Bool = false
     ) -> LMOutput {
         let (hidden, sharedKV, sharedKVSources) = model(
             inputs, inputsEmbeds: inputsEmbeds, mask: mask, cache: cache?.map { $0 as KVCache? },
@@ -1247,14 +1585,19 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             tokenTypeIds: tokenTypeIds,
             emitDrafterState: emitDrafterState
         )
+        // Iris: during prefill, only the final prompt token's logits are ever sampled. Projecting
+        // just hidden[:, -1:, :] avoids L× redundant 262K-vocab matmuls and softcaps.
+        let logitsHidden =
+            (lastTokenLogitsOnly && hidden.dim(1) > 1)
+            ? hidden[0..., (-1)..., 0...] : hidden
         let logits: MLXArray
         if let lmHead {
-            logits = lmHead(hidden)
+            logits = lmHead(logitsHidden)
         } else {
-            logits = model.embedTokens.asLinear(hidden)
+            logits = model.embedTokens.asLinear(logitsHidden)
         }
         let softcappedLogits: MLXArray
-        if let finalLogitSoftcapping, finalLogitSoftcapping > 0 {
+        if !skipLogitSoftcap, let finalLogitSoftcapping, finalLogitSoftcapping > 0 {
             let scale = MLXArray(finalLogitSoftcapping)
             softcappedLogits = gemma4LogitSoftcap(logits, scale)
         } else {
@@ -1265,7 +1608,7 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             return LMOutput(logits: softcappedLogits)
         }
         var state = LMOutput.State()
-        state[mtpLastHiddenStatesKey] = hidden
+        state[mtpLastHiddenStatesKey] = lastTokenLogitsOnly ? logitsHidden : hidden
         state[mtpSharedKVStatesKey] = sharedKV
         state[mtpSharedKVSourceIndicesKey] = sharedKVSources
         return LMOutput(logits: softcappedLogits, state: state)
@@ -1561,8 +1904,22 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Suppresse
             inputTensor: inputsEmbeds, mask: maskExpanded, source: features)
     }
 
+    /// Iris: prefill prompt tokens into `cache` without projecting 262K-vocab logits (for prefix caching).
+    public func prefillOnly(_ tokens: MLXArray, cache: [any KVCache], stepSize: Int = 512) {
+        let y = tokens.ndim == 1 ? tokens.expandedDimensions(axis: 0) : tokens
+        let total = y.dim(1)
+        let optCache = cache.map { $0 as KVCache? }
+        var pos = 0
+        while pos < total {
+            let end = Swift.min(pos + stepSize, total)
+            _ = languageModel.model(y[0..., pos ..< end], cache: optCache)
+            if end < total { asyncEval(cache) }
+            pos = end
+        }
+    }
+
     public func prepare(
-        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
+        _ input: LMInput, cache: [any KVCache], state: LMOutput.State?, prefill: PrefillParameters
     ) throws
         -> PrepareResult
     {
@@ -1574,14 +1931,15 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Suppresse
                 cache: convertedCache,
                 inputsEmbeds: inputsEmbeds,
                 perLayerInputs: perLayerInputs,
-                tokenTypeIds: tokenTypeIds
+                tokenTypeIds: tokenTypeIds,
+                lastTokenLogitsOnly: true
             )
             let total = inputsEmbeds.dim(1)
             prefill.progress?(total, total)
             return .logits(result)
         } else {
             return try gemma4PrepareTextOnly(
-                input, cache: convertedCache, prefill: prefill,
+                input, cache: convertedCache, state: state, prefill: prefill,
                 languageModel: languageModel)
         }
     }
@@ -1597,13 +1955,21 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Suppresse
     /// `mtpSharedKVStatesKey` populated when the flag is set, empty otherwise.
     /// Overrides the protocol-extension default at `LanguageModel` which
     /// would discard `state`.
+    /// Iris: eagerly fuse quantized gate/up and QKV projections once after model load so the
+    /// user's first check doesn't pay the one-time weight concatenation cost.
+    public func prepareFusedProjections() {
+        languageModel.model.prepareFusedProjections()
+    }
+
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
         let emit = state?[mtpEmitFlagKey] ?? false
+        let skipSoftcap = state?[mtpSkipLogitSoftcapKey] ?? false
         return languageModel(
             input.tokens, cache: cache?.map { $0 },
-            emitDrafterState: emit
+            emitDrafterState: emit,
+            skipLogitSoftcap: skipSoftcap
         )
     }
 
@@ -2081,13 +2447,13 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider,
     }
 
     public func prepare(
-        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
+        _ input: LMInput, cache: [any KVCache], state: LMOutput.State?, prefill: PrefillParameters
     ) throws
         -> PrepareResult
     {
         if input.image == nil, input.video == nil, input.audio == nil {
             return try gemma4PrepareTextOnly(
-                input, cache: cache, prefill: prefill, languageModel: languageModel)
+                input, cache: cache, state: state, prefill: prefill, languageModel: languageModel)
         }
 
         let (inputsEmbeds, perLayerInputs, tokenTypeIds) = try multimodalInputs(input)
@@ -2114,13 +2480,21 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider,
     /// `mtpSharedKVStatesKey` populated when the flag is set, empty otherwise.
     /// Overrides the protocol-extension default at `LanguageModel` which
     /// would discard `state`. Mirrors `Gemma4.callAsFunction(_:cache:state:)`.
+    /// Iris: eagerly fuse quantized gate/up and QKV projections once after model load so the
+    /// user's first check doesn't pay the one-time weight concatenation cost.
+    public func prepareFusedProjections() {
+        languageModel.model.prepareFusedProjections()
+    }
+
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
         let emit = state?[mtpEmitFlagKey] ?? false
+        let skipSoftcap = state?[mtpSkipLogitSoftcapKey] ?? false
         return languageModel(
             input.tokens, cache: cache?.map { $0 },
-            emitDrafterState: emit
+            emitDrafterState: emit,
+            skipLogitSoftcap: skipSoftcap
         )
     }
 

@@ -299,7 +299,15 @@ pub fn reduce_motion() -> bool {
         let on: Bool = msg_send![ws, accessibilityDisplayShouldReduceMotion];
         on.as_bool()
     }
-    #[cfg(not(target_os = "macos"))]
+    // Windows: Settings › Accessibility › Visual effects › Animation effects.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
+        let mut on = windows::core::BOOL(1);
+        let asked = SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+        asked.is_ok() && !on.as_bool()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     false
 }
 

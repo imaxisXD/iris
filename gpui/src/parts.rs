@@ -145,7 +145,13 @@ pub fn brush_box(s: &str, size: f32) -> (f32, f32) {
     }
     let lead = (-left).max(0.0);
     let w = (lead, pen.max(right) + lead);
-    W.with(|m| m.borrow_mut().insert(key, w));
+    W.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= 512 {
+            m.clear();
+        }
+        m.insert(key, w);
+    });
     w
 }
 
@@ -241,16 +247,73 @@ pub fn hand_printed(seed: i64, wobble: f32, w: f32, h: f32, rgb: Rgb8, ink_seed:
     printed(w, h, &px_)
 }
 
-/// `MarkerSwipe` as straight RGBA: the pink marker under a brush word, a quick dry-brush swipe
-/// printed through the screen and multiplied onto the paper. `h` is the stroke's height; its box
-/// is 2 taller, turned `degrees` about its middle, with `pad` points above and below for the turn.
+/// Same as `hand_printed`, for widths that change continuously (progress bars) so intermediate
+/// frames are released on the next frame instead of populating `riso::PRINTS`.
+pub fn hand_printed_frame(seed: i64, wobble: f32, w: f32, h: f32, rgb: Rgb8, ink_seed: i64, scale: f32) -> AnyElement {
+    let plate = Plate { w, h, scale };
+    let (pw, ph) = plate.px();
+    let mask = plate.fill(&pen::hand_rect(seed, wobble, 0.0, true, 0.0, 0.0, w, h).skia().unwrap());
+    let px_ = riso::frame_image(pw, ph, riso::print(&plate, rgb, ink_seed, &mask, 1.0));
+    printed(w, h, &px_)
+}
+
+/// Vertical padding needed above and below a `w`-wide marker rotated by `degrees`.
+fn marker_pad(w: f32, degrees: f32) -> f32 {
+    (w * degrees.to_radians().sin().abs() / 2.0).ceil() + 1.0
+}
+
+/// Coverage mask for `MarkerSwipe`: a rough paintbrush stroke inside `0..w × 0..bh` with subtle
+/// dry-brush streaks cut near the trailing right bristles (matching `BrushSlab` DNA), rotated by
+/// `degrees` about its centre.
+fn marker_mask(plate: &Plate, w: f32, bh: f32, pad: f32, seed: i64, degrees: f32) -> tiny_skia::Mask {
+    let path = pen::paintbrush_stroke(seed, w, bh);
+    let turn = tiny_skia::Transform::from_rotate_at(degrees, w / 2.0, pad + bh / 2.0);
+    let stroke = path.translated(0.0, pad).skia().unwrap().transform(turn).unwrap();
+    let shape = plate.fill(&stroke);
+    let mut pm = riso::opaque(plate, 10.0);
+    let mut rng = riso::Rng::new(seed.wrapping_mul(31).wrapping_add(7));
+    let inset_l = 2.8f32.min(w * 0.14);
+    let inset_r = 4.8f32.min(w * 0.22);
+    let body_w = (w - inset_l - inset_r).max(4.0);
+    let xf = plate.transform().pre_concat(turn);
+    for _ in 0..5 {
+        let edge = rng.f() < 0.75;
+        let sy = pad + if edge {
+            if rng.f() < 0.5 { bh * (0.14 + rng.f() * 0.16) } else { bh * (0.72 + rng.f() * 0.16) }
+        } else {
+            bh * (0.38 + rng.f() * 0.24)
+        };
+        let slen = (body_w * 0.45).min(10.0 + rng.f() * 20.0);
+        let sx = (w - inset_r * 0.7 - slen - rng.f() * (body_w * 0.25).min(16.0)).max(inset_l + 2.0);
+        let mut p = Pen::new();
+        p.m(sx, sy);
+        p.l((sx + slen).min(w - 0.5), sy + (rng.f() - 0.5) * 0.5);
+        if let Some(sp) = p.skia() {
+            let mut paint = tiny_skia::Paint::default();
+            let alpha = 0.42 + rng.f() * 0.42;
+            paint.set_color(tiny_skia::Color::from_rgba(0.0, 0.0, 0.0, alpha).unwrap());
+            paint.blend_mode = tiny_skia::BlendMode::DestinationOut;
+            paint.anti_alias = true;
+            let st = tiny_skia::Stroke {
+                width: 0.5 + rng.f() * 0.5,
+                line_cap: tiny_skia::LineCap::Round,
+                ..Default::default()
+            };
+            pm.stroke_path(&sp, &paint, &st, xf, None);
+        }
+    }
+    riso::intersect(&shape, &riso::alpha_mask(&pm))
+}
+
+/// `MarkerSwipe` as straight RGBA: the pink marker under a brush word, a rough paintbrush swipe
+/// with frayed bristles and dry-brush streaks printed through the screen and multiplied onto the
+/// paper. `h` is the stroke's height; its box is 2 taller, turned `degrees` about its middle,
+/// with `pad` points above and below for the turn.
 pub fn marker_rgba(w: f32, h: f32, seed: i64, degrees: f32, scale: f32) -> (Plate, f32, Vec<u8>) {
     let bh = h + 2.0;
-    let pad = (w * degrees.to_radians().sin().abs() / 2.0).ceil() + 1.0;
+    let pad = marker_pad(w, degrees);
     let plate = Plate { w, h: bh + 2.0 * pad, scale };
-    let turn = tiny_skia::Transform::from_rotate_at(degrees, w / 2.0, pad + bh / 2.0);
-    let path = pen::dry_brush(seed, w, bh, bh / w.max(1.0) * 0.95).translated(0.0, pad);
-    let mask = plate.fill(&path.skia().unwrap().transform(turn).unwrap());
+    let mask = marker_mask(&plate, w, bh, pad, seed, degrees);
     let (grid, specks) = riso::ink_screen(ink::PINK);
     let rgba = riso::print_with(&plate, ink::PINK, seed + 20, grid, specks, &mask, 1.0, |c| riso::multiply(c, ink::PAPER));
     (plate, pad, rgba)
@@ -259,8 +322,9 @@ pub fn marker_rgba(w: f32, h: f32, seed: i64, degrees: f32, scale: f32) -> (Plat
 /// `MarkerSwipe` placed: the pink marker `w` wide, its stroke `h` tall, turned `degrees`; returns
 /// it and the room it keeps above and below for the turn.
 pub fn marker_swipe(w: f32, h: f32, seed: i64, degrees: f32, scale: f32) -> (Div, f32) {
-    let (plate, pad, _) = marker_rgba(w, h, seed, degrees, 1.0);
-    let img = riso::cached(format!("marker-{seed}-{h}-{w}-{degrees}"), &Plate { scale, ..plate }, || marker_rgba(w, h, seed, degrees, scale).2);
+    let pad = marker_pad(w, degrees);
+    let plate = Plate { w, h: h + 2.0 + 2.0 * pad, scale };
+    let img = riso::cached(format!("marker-{seed}-{h}-{w}-{degrees}"), &plate, || marker_rgba(w, h, seed, degrees, scale).2);
     (sized(w, plate.h).child(printed(w, plate.h, &img)), pad)
 }
 
@@ -273,6 +337,10 @@ pub fn drop(alpha: f32) -> Rgba {
 
 /// `Keycap.split`: one cap per key, like a real keyboard.
 pub fn split_keys(combo: &str) -> Vec<String> {
+    // Windows writes "Ctrl+R" (`keys::command_chip`): one cap per word.
+    if combo.len() > 1 && combo.contains('+') && !combo.contains(['⌘', '⌥', '⌃', '⇧']) {
+        return combo.split('+').map(str::to_string).collect();
+    }
     let mut caps = Vec::new();
     let mut rest = String::new();
     for c in combo.chars() {
@@ -483,13 +551,24 @@ pub fn tone_tabs(labels: &[&str], selected: usize) -> Vec<(usize, Div)> {
 /// One tone tab: the chosen one in brush, another in mono, darkening from i10 to i12 as the
 /// pointer comes onto it (`hover`, 0 → 1).
 pub fn tone_tab(label: &str, chosen: bool, hover: f32) -> Div {
+    tone_tab_blend(label, if chosen { 1.0 } else { 0.0 }, hover)
+}
+
+/// One tone tab at blend `chosen` (0 = mono, 1 = Caveat Brush): cross-fades between faces while
+/// switching tones, matching SwiftUI's `ToneTabs` transition, and renders only the resting face
+/// once settled.
+pub fn tone_tab_blend(label: &str, chosen: f32, hover: f32) -> Div {
     let tab_h = tab_height();
     let tab = sized(tab_w(label), tab_h);
-    if chosen {
+    let c = chosen.clamp(0.0, 1.0);
+    let ink_ = if hover > 0.0 { crate::interact::mix(hue::I10, hue::I12, hover) } else { hue::I10 };
+    if c >= 0.996 {
         tab.child(at(t(label, brush(23.0), hue::I12), 0.0, tab_h - line_box(23.0, BRUSH_LINE)))
-    } else {
-        let ink_ = if hover > 0.0 { crate::interact::mix(hue::I10, hue::I12, hover) } else { hue::I10 };
+    } else if c <= 0.004 {
         tab.child(at(t(label, body().tracked(-0.12), ink_), 0.0, tab_h - 4.0 - line_box(12.5, MONO_LINE)))
+    } else {
+        tab.child(at(t(label, body().tracked(-0.12), ink_).opacity(1.0 - c), 0.0, tab_h - 4.0 - line_box(12.5, MONO_LINE)))
+            .child(at(t(label, brush(23.0), hue::I12).opacity(c), 0.0, tab_h - line_box(23.0, BRUSH_LINE)))
     }
 }
 
@@ -508,12 +587,64 @@ fn tab_w(label: &str) -> f32 {
 
 /// Where the marker sits under tone `i` in the row: (x, y, width, height, picture).
 pub fn tone_marker(labels: &[&str], i: usize, scale: f32) -> (f32, f32, f32, f32, Img) {
+    let i = i.min(labels.len().saturating_sub(1));
+    let label = labels.get(i).copied().unwrap_or("Fix");
     let x: f32 = labels[..i].iter().map(|l| tab_w(l) + 18.0).sum();
-    let bw = brush_w(labels[i], 23.0);
-    let (w, h, seed, degrees) = (bw + 6.0, 6.0, i as i64 + 3, -1.2);
-    let (plate, pad, _) = marker_rgba(w, h, seed, degrees, 1.0);
-    let img = riso::cached(format!("marker-{seed}-{h}-{w}-{degrees}"), &Plate { scale, ..plate }, || marker_rgba(w, h, seed, degrees, scale).2);
-    (x - 3.0, tab_height() - 8.0 + 1.0 - pad, w, plate.h, img)
+    let bw = brush_w(label, 23.0);
+    let (w, h, seed, degrees) = (bw + 9.0, 6.5, i as i64 + 3, -1.1);
+    let pad = marker_pad(w, degrees);
+    let plate = Plate { w, h: h + 2.0 + 2.0 * pad, scale };
+    let img = riso::cached(format!("marker-{seed}-{h}-{w}-{degrees}"), &plate, || marker_rgba(w, h, seed, degrees, scale).2);
+    (x - 4.0, tab_height() - 8.0 + 0.75 - pad, w, plate.h, img)
+}
+
+/// The pink brushstroke under the chosen tab, animated via `Live`: the old mark lifts/fades out
+/// quickly (`105 ms`) while a fresh loaded-to-dry brushstroke paints itself across the new tab
+/// in the travel direction (`210 ms`, `DS.Motion` ease-out) using a pure GPU `overflow_hidden`
+/// clip over the cached brush image (zero per-frame CPU rasterization). Under Reduce Motion it
+/// cross-fades in place (`150 ms`) with no wipe travel.
+pub fn tone_marker_live(l: &crate::interact::Live, id: &str, labels: &[&str], selected: usize, scale: f32) -> AnyElement {
+    const BRUSH_IN: f32 = 0.21;
+    const BRUSH_OUT: f32 = 0.105;
+    const REDUCE_FADE: f32 = 0.15;
+    let (tx, ty, tw, th, to_img) = tone_marker(labels, selected, scale);
+    if l.view.is_none() {
+        return div().absolute().top(z(ty)).left(z(tx)).w(z(tw)).h(z(th)).child(printed_fill(&to_img)).into_any_element();
+    }
+    if l.reduce_motion {
+        let (from, to, elapsed) = l.flight_elapsed(id, selected, REDUCE_FADE);
+        if from != to && elapsed < REDUCE_FADE {
+            let a = ds_curve((elapsed / REDUCE_FADE).clamp(0.0, 1.0));
+            let (fx, fy, fw, fh, from_img) = tone_marker(labels, from, scale);
+            return div().absolute().top_0().left_0().size_full()
+                .child(div().absolute().top(z(fy)).left(z(fx)).w(z(fw)).h(z(fh)).opacity(1.0 - a).child(printed_fill(&from_img)))
+                .child(div().absolute().top(z(ty)).left(z(tx)).w(z(tw)).h(z(th)).opacity(a).child(printed_fill(&to_img)))
+                .into_any_element();
+        }
+        return div().absolute().top(z(ty)).left(z(tx)).w(z(tw)).h(z(th)).child(printed_fill(&to_img)).into_any_element();
+    }
+    let (from, to, elapsed) = l.flight_elapsed(id, selected, BRUSH_IN);
+    if from != to && elapsed < BRUSH_IN {
+        let out_k = ds_curve((elapsed / BRUSH_OUT).clamp(0.0, 1.0));
+        let in_k = ds_curve((elapsed / BRUSH_IN).clamp(0.0, 1.0));
+        let forward = to >= from;
+        let reveal = (0.06 + 0.94 * in_k).clamp(0.06, 1.0);
+        let clip_w = tw * reveal;
+        let (clip_x, img_x) = if forward { (tx, 0.0) } else { (tx + tw - clip_w, -(tw - clip_w)) };
+        let mut layer = div().absolute().top_0().left_0().size_full();
+        if out_k < 0.996 {
+            let (fx, fy, fw, fh, from_img) = tone_marker(labels, from, scale);
+            layer = layer.child(
+                div().absolute().top(z(fy)).left(z(fx)).w(z(fw)).h(z(fh))
+                    .opacity(1.0 - out_k)
+                    .child(printed_fill(&from_img)),
+            );
+        }
+        let paint_in = div().absolute().top(z(ty)).left(z(clip_x)).w(z(clip_w)).h(z(th)).overflow_hidden()
+            .child(div().absolute().top_0().left(z(img_x)).w(z(tw)).h(z(th)).child(printed_fill(&to_img)));
+        return layer.child(paint_in).into_any_element();
+    }
+    div().absolute().top(z(ty)).left(z(tx)).w(z(tw)).h(z(th)).child(printed_fill(&to_img)).into_any_element()
 }
 
 /// `IRIS_SLOW=n` plays the app's motion n times slower, to look at it frame by frame.
@@ -698,4 +829,55 @@ fn scale_to(rgba: &[u8], n: u32, m: u32) -> Vec<u8> {
 
 pub fn tape_w(text_w: f32, icon: bool) -> f32 {
     text_w + 2.0 * (10.5 * 0.62 + 4.0) + if icon { 16.0 } else { 0.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::marker_rgba;
+
+    #[test]
+    fn marker_paintbrush_stays_in_bounds_with_frayed_bristles() {
+        // Every tone seed stays inside its 0..w × 0..bh strip at 0 degrees (no banana bulge)
+        // while keeping ragged, unclipped bristle tips on the trailing right end.
+        for (seed, w) in [(3, 35.0), (4, 118.0), (5, 83.0), (6, 78.0), (7, 74.0)] {
+            let (plate, pad, rgba) = marker_rgba(w, 6.5, seed, 0.0, 2.0);
+            let (pw, ph) = plate.px();
+            let top = (pad * 2.0) as u32;
+            let bot = ((pad + 8.5) * 2.0) as u32;
+            for y in 0..ph {
+                if y < top || y >= bot {
+                    for x in 0..pw {
+                        assert_eq!(rgba[((y * pw + x) * 4 + 3) as usize], 0, "seed {seed} leaked at y={y}");
+                    }
+                }
+            }
+            // Trailing right bristle region (last ~4 pt = 8 px at 2×) should contain both painted
+            // bristle tips and paper gaps (ragged tips, not a flat vertical rectangle).
+            let mut tip_hits = 0u32;
+            let mut tip_gaps = 0u32;
+            let x_start = pw.saturating_sub(8);
+            for y in (top + 2)..bot.saturating_sub(2) {
+                for x in x_start..(pw.saturating_sub(1)) {
+                    let a = rgba[((y * pw + x) * 4 + 3) as usize];
+                    if a > 100 { tip_hits += 1; } else if a == 0 { tip_gaps += 1; }
+                }
+            }
+            assert!(tip_hits > 0 && tip_gaps > 0, "seed {seed} right end lacked frayed bristles: hits={tip_hits}, gaps={tip_gaps}");
+        }
+    }
+
+    #[test]
+    fn tone_marker_handles_six_tones_and_clamps_bounds() {
+        let six = ["Fix", "Professional", "Friendly", "Shorter", "Clearer", "Funny"];
+        let (x0, _, w0, _, _) = super::tone_marker(&six, 0, 2.0);
+        let (x5, _, w5, _, _) = super::tone_marker(&six, 5, 2.0);
+        assert!(x5 > x0 && w0 > 0.0 && w5 > 0.0);
+        // Out-of-range indices clamp to the last tone instead of panicking.
+        let (x_clamped, _, w_clamped, _, _) = super::tone_marker(&six, 99, 2.0);
+        assert_eq!(x_clamped, x5);
+        assert_eq!(w_clamped, w5);
+        // Empty label slice also never panics.
+        let (_, _, w_empty, _, _) = super::tone_marker(&[], 0, 2.0);
+        assert!(w_empty > 0.0);
+    }
 }

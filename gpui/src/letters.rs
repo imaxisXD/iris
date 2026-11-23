@@ -2,7 +2,7 @@
 //! the glyph outlines of Knewave, stood upright, each tilted and dropped off the line; hollow
 //! letters with the pink plate printed off register inside, fat ones in printed ink.
 
-use gpui::{Div, ParentElement, Styled, div, px};
+use gpui::{Div, IntoElement, ParentElement, Styled, div, px};
 use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::{FontRef, MetadataProvider, instance::{LocationRef, Size}};
 use tiny_skia::{FillRule, FilterQuality, Mask, Paint, Pattern, PathBuilder, Pixmap, SpreadMode, Stroke, LineJoin, Transform};
@@ -217,8 +217,14 @@ pub fn iris_logo(size: f32, scale: f32) -> (Div, f32, f32) {
     let top = frame_top.min(0.0);
     let bottom = (frame_top + h - 2.0 * inset).max(i_box);
     let x = i_w + s * 0.02;
-    let i = div().font_family("Rubik Doodle Shadow").text_size(px(s)).line_height(px(i_box)).whitespace_nowrap()
-        .text_color(col(hue::I12)).child("I");
+    // The Mac sets the I as type. Windows' DirectWrite set it thinner, with ClearType's coloured
+    // fringes (seen in a Windows 11 VM): there it's drawn from the font's outline instead.
+    let i = if crate::keys::is_mac() {
+        div().font_family("Rubik Doodle Shadow").text_size(px(s)).line_height(px(i_box)).whitespace_nowrap()
+            .text_color(col(hue::I12)).child("I").into_any_element()
+    } else {
+        crate::parts::printed(i_w, i_box, &doodle_i(s, i_w, i_box, i_base, scale))
+    };
     let logo = crate::parts::sized(x + w - 2.0 * inset, bottom - top)
         .child(at(i, 0.0, -top))
         .child(at(crate::parts::printed(w, h, &word), x - inset, frame_top - inset - top));
@@ -366,4 +372,30 @@ pub fn star_into(mask: &mut Mask, plate: &Plate, cx: f32, cy: f32, r: f32) {
             mask.fill_path(&p, FillRule::Winding, true, plate.transform());
         }
     }
+}
+
+/// The doodle I from Rubik Doodle Shadow's outline, its baseline at `base` in a `w`×`h` box.
+fn doodle_i(s: f32, w: f32, h: f32, base: f32, scale: f32) -> riso::Img {
+    let plate = Plate { w, h, scale };
+    riso::cached(format!("logo-doodle-i-{s}"), &plate, || {
+        let (pw, ph) = plate.px();
+        let mut pm = Pixmap::new(pw, ph).unwrap();
+        let f = FontRef::new(RUBIK).unwrap();
+        if let Some(g) = f.charmap().map('I').and_then(|gid| f.outline_glyphs().get(gid)) {
+            let mut pen = Outline { b: PathBuilder::new(), m: [1.0, 0.0, 0.0, -1.0, 0.0, base] };
+            let _ = g.draw(DrawSettings::unhinted(Size::new(s), LocationRef::default()), &mut pen);
+            if let Some(path) = pen.b.finish() {
+                let mut paint = Paint::default();
+                let (r, gr, b) = hue::I12;
+                paint.set_color_rgba8(r, gr, b, 255);
+                paint.anti_alias = true;
+                let t = Transform::from_scale(scale, scale);
+                pm.fill_path(&path, &paint, FillRule::Winding, t, None);
+                // Core Text sets this face a touch heavier than its bare outline: a hairline round it.
+                let pen = Stroke { width: s * 0.012, line_join: LineJoin::Round, ..Default::default() };
+                pm.stroke_path(&path, &paint, &pen, t, None);
+            }
+        }
+        pm.pixels().iter().flat_map(|p| { let c = p.demultiply(); [c.red(), c.green(), c.blue(), c.alpha()] }).collect()
+    })
 }

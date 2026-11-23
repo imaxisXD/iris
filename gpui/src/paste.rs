@@ -8,12 +8,30 @@
 //! never lands in another app. Under test, the last step is done through Accessibility instead,
 //! never touching the clipboard or the keyboard (`TextBridge.writeForVerify`).
 
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use gpui::*;
 
 use crate::live::news;
 use crate::textbridge::{self, Captured, Clipboard, Scope};
+
+type QueuedReplace = Box<dyn FnOnce(&mut App)>;
+
+thread_local! {
+    /// Serialises pastes so two Replaces never fight over the clipboard (Swift's `lastReplace`).
+    static REPLACING: Cell<bool> = const { Cell::new(false) };
+    static QUEUED: RefCell<VecDeque<QueuedReplace>> = const { RefCell::new(VecDeque::new()) };
+}
+
+fn finish_replace(cx: &mut App) {
+    if let Some(next) = QUEUED.with(|q| q.borrow_mut().pop_front()) {
+        next(cx);
+    } else {
+        REPLACING.with(|r| r.set(false));
+    }
+}
 
 /// Pastes `text` over what `captured` read. `then` hears whether it landed.
 pub fn replace_then(captured: Captured, text: String, cx: &mut App, then: impl FnOnce(bool, &mut App) + 'static) {
@@ -30,36 +48,65 @@ pub fn replace_then(captured: Captured, text: String, cx: &mut App, then: impl F
         then(ok, cx);
         return;
     }
+    if REPLACING.with(|r| r.replace(true)) {
+        QUEUED.with(|q| {
+            q.borrow_mut().push_back(Box::new(move |cx| start_replace(captured, text, cx, then)));
+        });
+        return;
+    }
+    start_replace(captured, text, cx, then);
+}
+
+fn start_replace(captured: Captured, text: String, cx: &mut App, then: impl FnOnce(bool, &mut App) + 'static) {
     cx.spawn(async move |cx| {
+        let _borrow = textbridge::begin_replace_borrow();
         let saved = Clipboard::take();
         let ours = textbridge::put_on_clipboard(&text, true);
         textbridge::activate(captured.pid);
-        cx.background_executor().timer(Duration::from_millis(120)).await;
+        // Iris is a non-activating panel, so the target app usually already has focus once the
+        // panel gives up keys; yield briefly instead of sleeping a flat 120ms, polling up to ~600ms.
+        cx.background_executor().timer(Duration::from_millis(20)).await;
         let mut has = false;
-        for attempt in 0..9 {
+        for attempt in 0..25 {
             if textbridge::has_keyboard(captured.pid) {
                 has = true;
                 break;
             }
-            if attempt < 8 {
-                cx.background_executor().timer(Duration::from_millis(60)).await;
+            if attempt < 24 {
+                cx.background_executor().timer(Duration::from_millis(25)).await;
             }
         }
         news(&format!("paste: {} has the keyboard: {has}", captured.pid));
         if !has {
             // Not transient any more: it's the person's to paste now.
             textbridge::put_on_clipboard(&text, false);
-            let _ = cx.update(|cx| then(false, cx));
+            drop(_borrow);
+            let _ = cx.update(|cx| {
+                then(false, cx);
+                finish_replace(cx);
+            });
             return;
         }
+        let pid = captured.pid;
         let whole = captured.scope == Scope::WholeField;
-        cx.background_executor().spawn(async move { textbridge::select_all_and_paste(whole) }).await;
+        let pasted = cx.background_executor().spawn(async move { textbridge::select_all_and_paste(pid, whole) }).await;
+        if !pasted {
+            textbridge::put_on_clipboard(&text, false);
+            drop(_borrow);
+            let _ = cx.update(|cx| {
+                then(false, cx);
+                finish_replace(cx);
+            });
+            return;
+        }
         let _ = cx.update(|cx| then(true, cx));
         // Give the app time to read the clipboard before putting the person's back.
         cx.background_executor().timer(Duration::from_millis(450)).await;
         if textbridge::clipboard_count() == ours {
             saved.restore();
         }
+        drop(_borrow);
+        let _ = cx.update(finish_replace);
     })
     .detach();
 }

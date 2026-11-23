@@ -52,12 +52,23 @@ pub enum Placement {
     NearPointer,
 }
 
+/// How long Iris remembers checked answers in memory (never written to disk).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AnswerCache {
+    Off,
+    WhileOpen,
+    #[default]
+    Recent,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     pub placement: Placement,
     pub show_panel_when_clean: bool,
     pub show_changes: bool,
+    pub answer_cache: AnswerCache,
     /// The notes turned off: "undo" (replaced), "undoKeys", "checking", "clean", "excluded".
     pub hidden_notes: Vec<String>,
     pub open_shortcut: KeyCombo,
@@ -99,9 +110,11 @@ impl Default for Settings {
             placement: Placement::AboveField,
             show_panel_when_clean: true,
             show_changes: true,
+            answer_cache: AnswerCache::Recent,
             hidden_notes: vec![],
-            open_shortcut: dev(KeyCombo::OPEN),
-            quick_fix_shortcut: Some(dev(KeyCombo::QUICK_FIX)),
+            // ⌃⌥G and ⌃⌥⇧G on the Mac; Windows has its own (`keys::open_default`).
+            open_shortcut: dev(crate::keys::open_default()),
+            quick_fix_shortcut: Some(dev(crate::keys::quick_fix_default())),
             custom_tones: None,
             tone_order: None,
             hidden_tones: None,
@@ -109,11 +122,21 @@ impl Default for Settings {
             app_modes: None,
             style_rules: vec![],
             glossary: vec![],
+            // Password managers: never read. On Windows an app is its program's file name.
+            #[cfg(not(windows))]
             excluded_apps: vec![
                 app("com.1password.1password", "1Password"),
                 app("com.apple.keychainaccess", "Keychain Access"),
                 app("com.apple.Passwords", "Passwords"),
                 app("com.bitwarden.desktop", "Bitwarden"),
+            ],
+            #[cfg(windows)]
+            excluded_apps: vec![
+                app("1password.exe", "1Password"),
+                app("bitwarden.exe", "Bitwarden"),
+                app("keepass.exe", "KeePass"),
+                app("keepassxc.exe", "KeePassXC"),
+                app("credentialuibroker.exe", "Windows Security"),
             ],
             model: None,
             idle_minutes: 30,
@@ -150,7 +173,7 @@ impl Settings {
             }
             return Settings::default();
         };
-        match serde_json::from_slice(&bytes) {
+        match Settings::parse(&bytes) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("settings: can't read {}: {e}; using the defaults", path.display());
@@ -158,6 +181,12 @@ impl Settings {
                 Settings::default()
             }
         }
+    }
+
+    /// The settings in a file's bytes. A file saved by another editor may start with a byte
+    /// order mark (Notepad and PowerShell write one): the settings after it are still yours.
+    fn parse(bytes: &[u8]) -> serde_json::Result<Settings> {
+        serde_json::from_slice(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes))
     }
 
     /// Saves them: written beside the file, then moved over it, so a crash never leaves half.
@@ -282,6 +311,31 @@ pub fn bundle_id() -> String {
     ID.get_or_init(read_bundle_id).clone()
 }
 
+/// Windows: the installed Iris runs from the installer's folder (%LOCALAPPDATA%\Programs\Iris);
+/// any other copy is a development one, with its own settings and its own shortcut.
+#[cfg(windows)]
+fn read_bundle_id() -> String {
+    let installed = std::env::var("LOCALAPPDATA").ok().map(|l| PathBuf::from(l).join("Programs").join("Iris"));
+    let here = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf()));
+    match (installed, here) {
+        (Some(i), Some(h)) if h.eq_ignore_ascii_case_path(&i) => "local.iris.app".into(),
+        _ => "local.iris.gpui".into(),
+    }
+}
+
+#[cfg(windows)]
+trait SamePath {
+    fn eq_ignore_ascii_case_path(&self, other: &std::path::Path) -> bool;
+}
+
+#[cfg(windows)]
+impl SamePath for PathBuf {
+    fn eq_ignore_ascii_case_path(&self, other: &std::path::Path) -> bool {
+        self.to_string_lossy().eq_ignore_ascii_case(&other.to_string_lossy())
+    }
+}
+
+#[cfg(not(windows))]
 fn read_bundle_id() -> String {
     std::env::current_exe().ok()
         .and_then(|exe| {
@@ -296,6 +350,11 @@ fn read_bundle_id() -> String {
 pub fn home() -> PathBuf {
     if let Ok(h) = std::env::var("IRIS_HOME") {
         return PathBuf::from(h);
+    }
+    // Windows: %APPDATA%\Iris (roaming with the person's profile), a development copy beside it.
+    #[cfg(windows)]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        return PathBuf::from(appdata).join(if is_installed_iris() { "Iris" } else { "Iris (development)" });
     }
     let base = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
     base.join("Library/Application Support").join(bundle_id())
@@ -325,9 +384,23 @@ mod tests {
         let old: Settings = serde_json::from_str(r#"{"glossary":["Northwind"]}"#).unwrap();
         assert_eq!(old.glossary, vec!["Northwind".to_string()]);
         assert_eq!(old.idle_minutes, 30);
+        assert_eq!(old.answer_cache, AnswerCache::Recent);
+        // AnswerCache serializes cleanly across all three options.
+        for (raw, want) in [(r#""off""#, AnswerCache::Off), (r#""whileOpen""#, AnswerCache::WhileOpen), (r#""recent""#, AnswerCache::Recent)] {
+            assert_eq!(serde_json::to_string(&want).unwrap(), raw);
+            assert_eq!(serde_json::from_str::<AnswerCache>(raw).unwrap(), want);
+        }
     }
 
     /// Reads this Mac's Swift Iris settings (read-only): `cargo test print_swift_settings -- --ignored --nocapture`.
+    #[test]
+    fn reads_a_file_that_starts_with_a_byte_order_mark() {
+        let s = Settings::parse(b"\xEF\xBB\xBF{\"onboarded\": true, \"glossary\": [\"Northwind\"]}").unwrap();
+        assert!(s.onboarded);
+        assert_eq!(s.glossary, vec!["Northwind".to_string()]);
+        assert!(Settings::parse(b"\xEF\xBB\xBFnot json").is_err());
+    }
+
     #[test]
     #[ignore]
     fn print_swift_settings() {

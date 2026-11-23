@@ -131,6 +131,46 @@ public final class Gemma4AssistantMaskedEmbedder: Module {
         let scatterIdx = selectedCanonical.reshaped([b, l, n])
         return putAlong(out, scatterIdx, values: selectedLogits, axis: -1)
     }
+
+    /// Iris: fast greedy argmax directly over the `topK * vocabSizePerCentroid` (~4K) selected
+    /// candidates without scattering into and reducing a 262K-element vocab tensor.
+    /// Mathematically identical to `argMax(callAsFunction(...), axis: -1)` because every canonical
+    /// ID in `tokenOrdering` is unique and unselected positions are strictly below `selectedLogits.min()`.
+    func sampleGreedy(
+        _ hiddenStates: MLXArray,
+        tiedEmbedding: Embedding,
+        suppressedIds: MLXArray?
+    ) -> MLXArray {
+        let b = hiddenStates.dim(0)
+        let l = hiddenStates.dim(1)
+        let n = topK * vocabSizePerCentroid
+
+        let centroidLogits = centroids(hiddenStates)
+        let partitioned = argPartition(centroidLogits, kth: -topK, axis: -1)
+        let topkIdx = split(partitioned, indices: [numCentroids - topK], axis: -1)[1]
+
+        let ordering = tokenOrdering.reshaped([numCentroids, vocabSizePerCentroid])
+        let selectedCanonical = ordering.take(topkIdx, axis: 0).reshaped([b, l, n])
+
+        let selectedEmb =
+            tiedEmbedding(selectedCanonical.reshaped([-1]))
+            .reshaped([b, l, n, hiddenSize])
+        var selectedLogits = matmul(
+            hiddenStates.expandedDimensions(axis: -2),
+            selectedEmb.swappedAxes(-1, -2)
+        ).squeezed(axis: -2)  // [B, L, N]
+
+        if let suppressedIds {
+            // suppressedIds: [S] -> mask [B, L, N] where any selectedCanonical matches a suppressed ID.
+            let isSuppressed = (selectedCanonical.expandedDimensions(axis: -1) .== suppressedIds)
+                .any(axis: -1)
+            let negInf = MLXArray(-Float.infinity).asType(selectedLogits.dtype)
+            selectedLogits = MLX.where(isSuppressed, negInf, selectedLogits)
+        }
+
+        let bestLocal = argMax(selectedLogits, axis: -1, keepDims: true)  // [B, L, 1]
+        return takeAlong(selectedCanonical, bestLocal, axis: -1).squeezed(axis: -1)  // [B, L]
+    }
 }
 
 // MARK: - Inner draft module
@@ -182,6 +222,84 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
     @ModuleInfo(key: "post_projection") public var postProjection: Linear
     @ModuleInfo(key: "lm_head") public var lmHead: Linear?
     @ModuleInfo(key: "masked_embedding") public var maskedEmbedding: Gemma4AssistantMaskedEmbedder?
+
+    /// Thread-safe, `invalidateCompiledTraces()`-aware container for the compiled greedy head.
+    private final class CompiledGreedyHeadBox: CompiledTraceInvalidating {
+        private let lock = NSLock()
+        private var fn: (([MLXArray]) -> [MLXArray])?
+        private var suppressedKey: [Int]?
+
+        func invalidate() {
+            lock.withLock {
+                fn = nil
+                suppressedKey = nil
+            }
+        }
+
+        func getOrCreate(
+            suppressedIds: [Int],
+            build: () -> ([MLXArray]) -> [MLXArray]
+        ) -> ([MLXArray]) -> [MLXArray] {
+            lock.withLock {
+                if let fn, suppressedKey == suppressedIds {
+                    return fn
+                }
+                let created = build()
+                self.fn = created
+                self.suppressedKey = suppressedIds
+                return created
+            }
+        }
+    }
+
+    // Iris: compiled static-shape [1, 1, H] drafter head (norm + post_projection + 4K sparse argmax).
+    // Independent of dynamic KV length so it compiles once and never retraces.
+    private let compiledGreedyHead = CompiledGreedyHeadBox()
+
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        compiledGreedyHead.invalidate()
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    @discardableResult
+    public override func update(
+        modules: ModuleChildren, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        compiledGreedyHead.invalidate()
+        return try super.update(
+            modules: modules, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    public override func updateModule(key: String, _ value: Any) throws {
+        compiledGreedyHead.invalidate()
+        try super.updateModule(key: key, value)
+    }
+
+    private func getCompiledGreedyHead(suppressedIds: [Int]) -> (([MLXArray]) -> [MLXArray])? {
+        guard let maskedEmbedding else { return nil }
+        return compiledGreedyHead.getOrCreate(suppressedIds: suppressedIds) {
+            let weights = [model.norm, postProjection, maskedEmbedding, model.embedTokens]
+                .flatMap { $0.innerState() }
+            let suppressedArr: MLXArray? =
+                suppressedIds.isEmpty ? nil : MLXArray(suppressedIds.map(Int32.init))
+            return MLX.compile(inputs: [weights]) { [unowned self] args in
+                let h = self.model.norm(args[0])
+                let newHidden = self.postProjection(h)
+                let nextTok = maskedEmbedding.sampleGreedy(
+                    h,
+                    tiedEmbedding: self.model.embedTokens,
+                    suppressedIds: suppressedArr
+                )
+                return [nextTok, newHidden]
+            }
+        }
+    }
 
     public init(_ config: Gemma4AssistantConfiguration) {
         self.config = config
@@ -332,23 +450,120 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
         var tokens: [MLXArray] = []
         tokens.reserveCapacity(blockSize - 1)
 
+        // Iris: when greedy with masked_embedding, run the entire 4-layer drafter step + 4K sparse
+        // argmax inside a single compiled shapeless graph (zero 262K scatter, minimal Swift dispatch).
+        let embedScaleArr = MLXArray(embedScale, dtype: hPrev.dtype)
+        let greedyInfo: (enabled: Bool, rawIds: [Int]) = {
+            guard maskedEmbedding != nil,
+                let greedy = sampler as? any GreedyTokenSampler,
+                greedy.isGreedyArgMax
+            else { return (false, []) }
+            return (true, greedy.greedySuppressedTokenIds)
+        }()
+
+        if greedyInfo.enabled,
+            !training,
+            hPrev.dim(0) == 1,
+            let fullKV = sharedKV["full_attention"],
+            let slidingKV = sharedKV["sliding_attention"],
+            let headFn = getCompiledGreedyHead(suppressedIds: greedyInfo.rawIds)
+        {
+            precondition(
+                slidingKV.0.dim(-2) <= config.textConfiguration.slidingWindow,
+                "sliding KV length \(slidingKV.0.dim(-2)) exceeds slidingWindow \(config.textConfiguration.slidingWindow)")
+            let fullState = Gemma4SharedKVState.regular(keys: fullKV.0, values: fullKV.1)
+            let slidingState = Gemma4SharedKVState.regular(keys: slidingKV.0, values: slidingKV.1)
+            for _ in 0 ..< (blockSize - 1) {
+                let tokEmbed = inputEmbed(tok) * embedScaleArr
+                var h = preProjection(concatenated([tokEmbed, hPrev], axis: -1))
+                for layer in model.layers {
+                    let isFull = layer.layerType == "full_attention"
+                    let (out, _, _) = layer(
+                        h, mask: .none, cache: nil, perLayerInput: nil,
+                        sharedKV: isFull ? fullState : slidingState,
+                        offset: queryOffset)
+                    h = out
+                }
+                let out = headFn([h])
+                tok = out[0]
+                hPrev = out[1]
+                tokens.append(tok)
+            }
+            return concatenated(tokens, axis: 1)
+        }
+
+        let greedySuppressedArr: MLXArray? =
+            (greedyInfo.enabled && !greedyInfo.rawIds.isEmpty)
+            ? MLXArray(greedyInfo.rawIds.map(Int32.init)) : nil
+
         for _ in 0 ..< (blockSize - 1) {
-            let tokEmbed =
-                inputEmbed(tok) * MLXArray(embedScale, dtype: hPrev.dtype)
+            let tokEmbed = inputEmbed(tok) * embedScaleArr
             let inputsEmbeds = concatenated([tokEmbed, hPrev], axis: -1)
-            let (newHidden, logits) = forwardHidden(
-                inputsEmbeds: inputsEmbeds,
-                sharedKV: sharedKV,
-                queryOffset: queryOffset
-            )
-            hPrev = newHidden
-            // logits: [B, L, vocab]; take last step → [B, vocab]
-            let lastStepLogits = logits[0..., -1, 0...]
-            let nextTok = sampler.sample(logits: lastStepLogits)
-            tok = nextTok.ndim == 1 ? nextTok.reshaped([nextTok.dim(0), 1]) : nextTok
-            tokens.append(tok)
+            if greedyInfo.enabled, let maskedEmbedding {
+                let (hNorm, newHidden) = forwardBackbone(
+                    inputsEmbeds: inputsEmbeds,
+                    sharedKV: sharedKV,
+                    queryOffset: queryOffset
+                )
+                hPrev = newHidden
+                let nextTok = maskedEmbedding.sampleGreedy(
+                    hNorm[0..., (-1)..., 0...],
+                    tiedEmbedding: model.embedTokens,
+                    suppressedIds: greedySuppressedArr
+                )
+                tok = nextTok
+                tokens.append(tok)
+            } else {
+                let (newHidden, logits) = forwardHidden(
+                    inputsEmbeds: inputsEmbeds,
+                    sharedKV: sharedKV,
+                    queryOffset: queryOffset
+                )
+                hPrev = newHidden
+                // logits: [B, L, vocab]; take last step → [B, vocab]
+                let lastStepLogits = logits[0..., -1, 0...]
+                let nextTok = sampler.sample(logits: lastStepLogits)
+                tok = nextTok.ndim == 1 ? nextTok.reshaped([nextTok.dim(0), 1]) : nextTok
+                tokens.append(tok)
+            }
         }
         return concatenated(tokens, axis: 1)
+    }
+
+    /// Iris: shared drafter backbone returning `(normedHidden, postProjectedHidden)`.
+    /// Uses `.none` SDPA mask since the precondition guarantees both full and sliding K/V are
+    /// fully visible (all-zero additive mask == no mask, skipping mask allocations and memory reads).
+    private func forwardBackbone(
+        inputsEmbeds: MLXArray,
+        sharedKV: [String: (MLXArray, MLXArray)],
+        queryOffset: Int
+    ) -> (normed: MLXArray, lastHidden: MLXArray) {
+        let textCfg = config.textConfiguration
+        var h = preProjection(inputsEmbeds)
+
+        let slidingKvLen = sharedKV["sliding_attention"].map { $0.0.dim(-2) } ?? 0
+        precondition(
+            slidingKvLen <= textCfg.slidingWindow,
+            "sliding KV length \(slidingKvLen) exceeds slidingWindow \(textCfg.slidingWindow) — "
+                + "the production invariant that lets the bidirectional sliding-window "
+                + "mask early-exit to all-zeros has been violated"
+        )
+
+        for layer in model.layers {
+            guard let kvPair = sharedKV[layer.layerType] else {
+                fatalError("Gemma4 drafter: missing sharedKV for layer_type \(layer.layerType)")
+            }
+            let kvState = Gemma4SharedKVState.regular(
+                keys: kvPair.0, values: kvPair.1)
+            let (out, _, _) = layer(
+                h, mask: .none, cache: nil, perLayerInput: nil,
+                sharedKV: kvState, offset: queryOffset)
+            h = out
+        }
+
+        h = model.norm(h)
+        let lastHidden = postProjection(h)
+        return (h, lastHidden)
     }
 
     /// One drafter forward — pre-projection, layer loop with shared K/V,
@@ -362,56 +577,8 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
         sharedKV: [String: (MLXArray, MLXArray)],
         queryOffset: Int
     ) -> (lastHidden: MLXArray, logits: MLXArray) {
-        let textCfg = config.textConfiguration
-        var h = preProjection(inputsEmbeds)
-        let queryLen = h.dim(1)
-
-        // Per-layer-type masks; KV tensor shape is [B, H, S, D] so axis -2 = seq.
-        let fullKvLen = sharedKV["full_attention"].map { $0.0.dim(-2) } ?? 0
-        let slidingKvLen = sharedKV["sliding_attention"].map { $0.0.dim(-2) } ?? 0
-        // Production invariant: the target's sliding-attention KV cache is
-        // capped at `slidingWindow` by `RotatingKVCache(maxSize:keep:)` (see
-        // `Gemma4TextLanguageModel.newCache`), so `slidingKvLen` is always
-        // bounded by `textCfg.slidingWindow`. That bound is what makes the
-        // bidirectional sliding-window mask's early-exit branch
-        // (`windowSize >= kvLen` → all-zeros mask) fire on every production
-        // call. If this invariant ever changes — e.g. a different cache
-        // policy that lets the sliding KV grow past `slidingWindow` — the
-        // mask helper's `windowSize >= kvLen` branch would NOT fire, and the
-        // helper's non-degenerate path produces an absolute-position mask
-        // that does not match the distance-from-`queryOffset` mask the
-        // drafter actually needs. Catching the violation here is much louder
-        // than a silently wrong attention pattern downstream.
-        precondition(
-            slidingKvLen <= textCfg.slidingWindow,
-            "sliding KV length \(slidingKvLen) exceeds slidingWindow \(textCfg.slidingWindow) — "
-                + "the production invariant that lets the bidirectional sliding-window "
-                + "mask early-exit to all-zeros has been violated"
-        )
-        let fullMask = createBidirectionalMask(
-            queryLen: queryLen, kvLen: fullKvLen, dtype: h.dtype)
-        let slidingMask = createBidirectionalSlidingWindowMask(
-            queryLen: queryLen, kvLen: slidingKvLen,
-            windowSize: textCfg.slidingWindow, dtype: h.dtype)
-
-        for layer in model.layers {
-            guard let kvPair = sharedKV[layer.layerType] else {
-                fatalError("Gemma4 drafter: missing sharedKV for layer_type \(layer.layerType)")
-            }
-            let kvState = Gemma4SharedKVState.regular(
-                keys: kvPair.0, values: kvPair.1)
-            let layerMask: MLXFast.ScaledDotProductAttentionMaskMode =
-                layer.layerType == "full_attention"
-                ? .array(fullMask)
-                : .array(slidingMask)
-            let (out, _, _) = layer(
-                h, mask: layerMask, cache: nil, perLayerInput: nil,
-                sharedKV: kvState, offset: queryOffset)
-            h = out
-        }
-
-        h = model.norm(h)
-        let lastHidden = postProjection(h)
+        let (h, lastHidden) = forwardBackbone(
+            inputsEmbeds: inputsEmbeds, sharedKV: sharedKV, queryOffset: queryOffset)
 
         let logits: MLXArray
         if let maskedEmbedding {

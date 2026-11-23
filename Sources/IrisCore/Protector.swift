@@ -39,30 +39,39 @@ public struct Protector: Sendable {
         ":[a-z0-9_+\\-]+:",  // :emoji:
     ]
 
+    private static let builtInRegexes: [NSRegularExpression] = builtInPatterns.compactMap {
+        try? NSRegularExpression(pattern: $0, options: [])
+    }
+
     public func mask(_ input: String) -> Masked {
         var text = input
         var originals: [String] = []
 
-        var patterns = Self.builtInPatterns
+        var regexes = Self.builtInRegexes
         // Longest glossary terms first so "Opentaps CRM" wins over "Opentaps".
-        for term in glossary.map({ $0.trimmingCharacters(in: .whitespaces) })
-            .filter({ !$0.isEmpty })
-            .sorted(by: { $0.count > $1.count })
-        {
-            patterns.append("(?<!\\w)" + NSRegularExpression.escapedPattern(for: term) + "(?!\\w)")
+        if !glossary.isEmpty {
+            for term in glossary.map({ $0.trimmingCharacters(in: .whitespaces) })
+                .filter({ !$0.isEmpty })
+                .sorted(by: { $0.count > $1.count })
+            {
+                let pattern = "(?<!\\w)" + NSRegularExpression.escapedPattern(for: term) + "(?!\\w)"
+                if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+                    regexes.append(regex)
+                } else {
+                    assertionFailure("Protector pattern \(pattern) doesn't compile")
+                }
+            }
         }
 
-        for pattern in patterns {
-            // Built in, or a glossary term escaped above: a pattern that fails is a bug here.
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
-                assertionFailure("Protector pattern \(pattern) doesn't compile"); continue
-            }
+        for (passIndex, regex) in regexes.enumerated() {
             let ns = text as NSString
             let matches = regex.matches(in: text, range: NSRange(location: 0, length: ns.length))
             guard !matches.isEmpty else { continue }
 
             // Placeholders from earlier passes stay as they are; one a later pattern swallows
-            // whole (inside code, say) goes into that piece and comes back out with it.
+            // whole (inside code, say) is expanded back to its true original text before being
+            // stored, so every entry in `originals` is verbatim user text and restoration never
+            // needs recursive multi-pass substitution.
             let before = originals.count
             var rebuilt = ""
             var cursor = 0
@@ -71,7 +80,10 @@ public struct Protector: Sendable {
                 let found = ns.substring(with: range)
                 if Self.isOurPlaceholder(found, count: before) { continue }
                 rebuilt += ns.substring(with: NSRange(location: cursor, length: range.location - cursor))
-                originals.append(found)
+                let original = passIndex > 0 && before > 0
+                    ? Self.substitute(found, originals: originals, maxIndex: before, allowed: nil)
+                    : found
+                originals.append(original)
                 rebuilt += Self.placeholder(originals.count)
                 cursor = range.location + range.length
             }
@@ -101,18 +113,54 @@ public struct Protector: Sendable {
     /// Puts back every placeholder that's in `output`, whole, and leaves the rest: for text
     /// still streaming, which may not have reached them all yet.
     public func restoringWhatsThere(_ output: String, from masked: Masked) -> String {
-        // Highest index first so {{1}} never clobbers part of {{12}}.
-        var text = output
-        for index in stride(from: masked.originals.count, through: 1, by: -1) {
-            text = text.replacingOccurrences(of: Self.placeholder(index), with: masked.originals[index - 1])
-        }
-        return text
+        guard !masked.originals.isEmpty else { return output }
+        // Single left-to-right pass over only the placeholders actually shown in `masked.text`,
+        // so restored text containing literal `{{k}}` is never re-scanned and swallowed indices
+        // cannot be hallucinated back in.
+        let shown = Self.placeholderIndices(in: masked.text, maxIndex: masked.originals.count)
+        return Self.substitute(output, originals: masked.originals, maxIndex: masked.originals.count, allowed: shown)
     }
 
     /// What the model sees in place of the `n`th protected piece (counting from 1).
     public static func placeholder(_ n: Int) -> String { "{{\(n)}}" }
     /// Matches any placeholder, for code that must treat one as a single word.
     public static let placeholderPattern = #"\{\{\d+\}\}"#
+
+    private static let placeholderRegex = try! NSRegularExpression(pattern: #"\{\{(\d+)\}\}"#)
+
+    private static func placeholderIndices(in text: String, maxIndex: Int) -> Set<Int> {
+        let ns = text as NSString
+        var out: Set<Int> = []
+        for match in placeholderRegex.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            if let n = Int(ns.substring(with: match.range(at: 1))), n >= 1, n <= maxIndex {
+                out.insert(n)
+            }
+        }
+        return out
+    }
+
+    private static func substitute(
+        _ input: String, originals: [String], maxIndex: Int, allowed: Set<Int>?
+    ) -> String {
+        let ns = input as NSString
+        let matches = placeholderRegex.matches(in: input, range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty else { return input }
+        var rebuilt = ""
+        var cursor = 0
+        for match in matches {
+            let range = match.range
+            guard let n = Int(ns.substring(with: match.range(at: 1))),
+                n >= 1, n <= maxIndex,
+                allowed == nil || allowed!.contains(n)
+            else { continue }
+            rebuilt += ns.substring(with: NSRange(location: cursor, length: range.location - cursor))
+            rebuilt += originals[n - 1]
+            cursor = range.location + range.length
+        }
+        if cursor == 0 { return input }
+        rebuilt += ns.substring(from: cursor)
+        return rebuilt
+    }
 
     private static func isOurPlaceholder(_ s: String, count: Int) -> Bool {
         guard s.hasPrefix("{{"), s.hasSuffix("}}"), let n = Int(s.dropFirst(2).dropLast(2)) else { return false }

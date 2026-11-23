@@ -257,46 +257,53 @@ pub fn tape(w: f32, h: f32) -> Pen {
     p
 }
 
-/// `DryBrushStroke` from left middle to right middle of a `w`×`h` box: one flat stroke of a dry
-/// brush with frayed ends, `width` its width as a share of its length.
-pub fn dry_brush(seed: i64, w: f32, h: f32, width: f32) -> Pen {
+/// One flat stroke of a rough paintbrush inside `0..w × 0..h`: loaded where it lands on the
+/// left, tapering slightly toward the right, with a tiny organic hand sway (capped at ±0.45 pt
+/// so it never looks banana-curved) and ragged bristle tips on both ends that stay strictly
+/// inside `0..w` so they are never chopped flat.
+pub fn paintbrush_stroke(seed: i64, w: f32, h: f32) -> Pen {
     let mut rng = Rng::new(seed);
-    let a = [0.0, h * 0.5];
-    let b = [w, h * 0.5];
-    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-    let length = dx.hypot(dy).max(1.0);
-    let dir = [dx / length, dy / length];
-    let n = [-dir[1], dir[0]];
-    let bw = length * width;
-    let bend = (rng.f() - 0.5) * length * 0.07;
-    let steps = 22;
-    let mut left = Vec::new();
-    let mut right = Vec::new();
+    let inset_l = 2.8f32.min(w * 0.14);
+    let inset_r = 4.8f32.min(w * 0.22);
+    let body_w = (w - inset_l - inset_r).max(2.0);
+    let steps = 20usize;
+    // Tiny organic sway capped at ±0.45 pt — hand-drawn, never banana-curved.
+    let bend = (rng.f() - 0.5) * (body_w * 0.012).min(0.9);
+    let mut top = Vec::with_capacity(steps + 1);
+    let mut bot = Vec::with_capacity(steps + 1);
     for i in 0..=steps {
         let t = i as f32 / steps as f32;
-        let off = (t * PI).sin() * bend;
-        let c = [a[0] + dx * t + n[0] * off, a[1] + dy * t + n[1] * off];
-        let half = bw / 2.0 * (1.12 - 0.22 * t);
-        let l = half * (1.0 + (rng.f() - 0.5) * 0.16);
-        let r = half * (1.0 + (rng.f() - 0.5) * 0.16);
-        left.push([c[0] + n[0] * l, c[1] + n[1] * l]);
-        right.push([c[0] - n[0] * r, c[1] - n[1] * r]);
+        let cx = inset_l + body_w * t;
+        let cy = h * 0.5 + (t * PI).sin() * bend;
+        // Loaded press on the left (1.08×), gentle lift taper toward the right (0.84×).
+        let half = (h * 0.42) * (1.08 - 0.24 * t);
+        let top_off = half * (1.0 + (rng.f() - 0.5) * 0.22);
+        let bot_off = half * (1.0 + (rng.f() - 0.5) * 0.22);
+        top.push([cx, (cy - top_off).clamp(0.15, h - 0.15)]);
+        bot.push([cx, (cy + bot_off).clamp(0.15, h - 0.15)]);
     }
-    let mut fray = |from: [f32; 2], to: [f32; 2], out_dir: [f32; 2], reach: f32| -> Vec<[f32; 2]> {
-        let tips = 9;
+    let mut fray = |from: [f32; 2], to: [f32; 2], dir: f32, reach: f32, tips: usize, long_chance: f32| -> Vec<[f32; 2]> {
         (0..=tips * 2)
             .map(|k| {
                 let u = k as f32 / (tips * 2) as f32;
-                let base = [from[0] + (to[0] - from[0]) * u, from[1] + (to[1] - from[1]) * u];
-                let out = if k % 2 == 1 { reach * (0.35 + rng.f() * 0.65) } else { reach * rng.f() * 0.15 };
-                [base[0] + out_dir[0] * out, base[1] + out_dir[1] * out]
+                let bx = from[0] + (to[0] - from[0]) * u;
+                let by = from[1] + (to[1] - from[1]) * u;
+                let out = if k % 2 == 1 {
+                    let boost = if rng.f() < long_chance { 0.85 + rng.f() * 0.15 } else { 0.42 + rng.f() * 0.48 };
+                    reach * boost
+                } else {
+                    reach * (rng.f() * 0.14)
+                };
+                [(bx + dir * out).clamp(0.1, w - 0.1), by]
             })
             .collect()
     };
-    let mut pts: Vec<[f32; 2]> = left.clone();
-    pts.extend(fray(left[steps], right[steps], dir, bw * 0.32));
-    pts.extend(right.iter().rev().skip(1).copied());
-    pts.extend(fray(right[0], left[0], [-dir[0], -dir[1]], bw * 0.22));
+    let r_reach = (inset_r - 0.15).max(0.5);
+    let l_reach = (inset_l - 0.15).max(0.5);
+    let mut pts = top.clone();
+    pts.extend(fray(top[steps], bot[steps], 1.0, r_reach, 7, 0.28));
+    pts.extend(bot.iter().rev().skip(1).copied());
+    pts.extend(fray(bot[0], top[0], -1.0, l_reach, 5, 0.15));
     Pen::poly(&pts)
 }
 

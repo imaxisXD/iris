@@ -5,8 +5,8 @@
 //! same place. Printed areas are baked on the CPU into RGBA at the window's device scale and
 //! drawn by GPUI as images (`Img`); pen lines are GPUI vector paths (`pen.rs`).
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 use std::sync::Arc;
 
@@ -59,8 +59,13 @@ pub fn image(w: u32, h: u32, mut rgba: Vec<u8>) -> Img {
 }
 
 thread_local! {
-    /// Pictures made for one frame (a garden caught at this moment), and the last frame's.
-    static FRAME_PICTURES: RefCell<(Vec<Img>, Vec<Img>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    /// The window currently building its frame (`let_go_of_last_frame` sets it).
+    static CURRENT_WINDOW: Cell<Option<gpui::WindowId>> = const { Cell::new(None) };
+    /// Pictures made for one frame per window (a garden caught at this moment), and the last frame's.
+    static FRAME_PICTURES: RefCell<HashMap<Option<gpui::WindowId>, (Vec<Img>, Vec<Img>)>> = RefCell::new(HashMap::new());
+    /// Evicted `PRINTS` queued per window that previously rendered them, drained only when that
+    /// window itself starts its next frame (never dropping textures out from under an idle window).
+    static WINDOW_EVICTED: RefCell<HashMap<gpui::WindowId, Vec<Img>>> = RefCell::new(HashMap::new());
 }
 
 /// A picture for this frame only: GPUI keeps every picture it has drawn in its texture atlas
@@ -68,20 +73,43 @@ thread_local! {
 /// next frame has replaced it (`let_go_of_last_frame`).
 pub fn frame_image(w: u32, h: u32, rgba: Vec<u8>) -> Img {
     let img = image(w, h, rgba);
-    FRAME_PICTURES.with(|f| f.borrow_mut().0.push(img.clone()));
+    let win = CURRENT_WINDOW.get();
+    FRAME_PICTURES.with(|f| f.borrow_mut().entry(win).or_default().0.push(img.clone()));
     img
 }
 
-/// At the start of a frame: drops the pictures of the frame before last from GPUI's atlas.
+/// At the start of a frame: drops this window's pictures from the frame before last, and drops
+/// any `PRINTS` entries evicted since this window's last frame from this window's atlas only.
 pub fn let_go_of_last_frame(window: &mut gpui::Window) {
+    let id = window.window_handle().window_id();
+    CURRENT_WINDOW.set(Some(id));
     let old = FRAME_PICTURES.with(|f| {
         let mut f = f.borrow_mut();
-        let made = std::mem::take(&mut f.0);
-        std::mem::replace(&mut f.1, made)
+        let entry = f.entry(Some(id)).or_default();
+        let made = std::mem::take(&mut entry.0);
+        std::mem::replace(&mut entry.1, made)
     });
     for img in old {
         let _ = window.drop_image(img);
     }
+    let evicted = WINDOW_EVICTED.with(|e| e.borrow_mut().remove(&id)).unwrap_or_default();
+    for img in evicted {
+        let _ = window.drop_image(img);
+    }
+}
+
+/// Releases any retained per-frame pictures and queued evictions for a window that just closed.
+pub fn forget_window(id: gpui::WindowId) {
+    if CURRENT_WINDOW.get() == Some(id) {
+        CURRENT_WINDOW.set(None);
+    }
+    FRAME_PICTURES.with(|f| {
+        f.borrow_mut().remove(&Some(id));
+    });
+    WINDOW_EVICTED.with(|e| {
+        e.borrow_mut().remove(&id);
+    });
+    PRINTS.with(|m| m.borrow_mut().forget_window(id));
 }
 
 /// An sRGB byte colour.
@@ -287,42 +315,192 @@ pub fn lay(under: &mut [u8], top: &[u8]) {
 
 // MARK: - Cache
 
-thread_local! {
-    static PRINTS: RefCell<HashMap<String, Img>> = RefCell::new(HashMap::new());
+/// Soft ceiling on cached `RenderImage` pixel bytes kept in `PRINTS` (~64 MiB).
+const PRINTS_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Soft ceiling on cached crisp source RGBA buffers kept in `RAW` (~8 MiB).
+const RAW_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+struct ByteLru<V> {
+    map: HashMap<String, (V, usize, u64)>,
+    bytes: usize,
+    tick: u64,
+    limit: usize,
 }
 
-/// Prints once per key and keeps it, so a redraw never re-dithers.
+impl<V: Clone> ByteLru<V> {
+    fn new(limit: usize) -> Self {
+        Self { map: HashMap::new(), bytes: 0, tick: 0, limit }
+    }
+
+    fn get(&mut self, key: &str) -> Option<V> {
+        let tick = self.tick.wrapping_add(1);
+        self.tick = tick;
+        let entry = self.map.get_mut(key)?;
+        entry.2 = tick;
+        Some(entry.0.clone())
+    }
+
+    fn insert(&mut self, key: String, val: V, size: usize) -> Vec<V> {
+        let tick = self.tick.wrapping_add(1);
+        self.tick = tick;
+        let mut evicted = Vec::new();
+        if let Some((old_val, old_size, _)) = self.map.insert(key, (val, size, tick)) {
+            self.bytes = self.bytes.saturating_sub(old_size);
+            evicted.push(old_val);
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        while self.bytes > self.limit && self.map.len() > 1 {
+            let Some(oldest) = self.map.iter().min_by_key(|(_, (_, _, t))| *t).map(|(k, _)| k.clone()) else {
+                break;
+            };
+            if let Some((old_val, old_size, _)) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(old_size);
+                evicted.push(old_val);
+            }
+        }
+        evicted
+    }
+}
+
+struct PrintEntry<V, W> {
+    val: V,
+    bytes: usize,
+    tick: u64,
+    windows: HashSet<W>,
+}
+
+struct PrintLru<V, W> {
+    map: HashMap<String, PrintEntry<V, W>>,
+    bytes: usize,
+    tick: u64,
+    limit: usize,
+}
+
+impl<V: Clone, W: Eq + std::hash::Hash + Copy> PrintLru<V, W> {
+    fn new(limit: usize) -> Self {
+        Self { map: HashMap::new(), bytes: 0, tick: 0, limit }
+    }
+
+    fn get(&mut self, key: &str, win: Option<W>) -> Option<V> {
+        let tick = self.tick.wrapping_add(1);
+        self.tick = tick;
+        let entry = self.map.get_mut(key)?;
+        entry.tick = tick;
+        if let Some(w) = win {
+            entry.windows.insert(w);
+        }
+        Some(entry.val.clone())
+    }
+
+    fn insert(&mut self, key: String, val: V, size: usize, win: Option<W>) -> Vec<(V, HashSet<W>)> {
+        let tick = self.tick.wrapping_add(1);
+        self.tick = tick;
+        let mut windows = HashSet::new();
+        if let Some(w) = win {
+            windows.insert(w);
+        }
+        let mut evicted = Vec::new();
+        if let Some(old) = self.map.insert(key, PrintEntry { val, bytes: size, tick, windows }) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+            evicted.push((old.val, old.windows));
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        while self.bytes > self.limit && self.map.len() > 1 {
+            let Some(oldest) = self.map.iter().min_by_key(|(_, e)| e.tick).map(|(k, _)| k.clone()) else {
+                break;
+            };
+            if let Some(old) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(old.bytes);
+                evicted.push((old.val, old.windows));
+            }
+        }
+        evicted
+    }
+
+    fn forget_window(&mut self, win: W) {
+        for entry in self.map.values_mut() {
+            entry.windows.remove(&win);
+        }
+    }
+}
+
+thread_local! {
+    static PRINTS: RefCell<PrintLru<Img, gpui::WindowId>> = RefCell::new(PrintLru::new(PRINTS_MAX_BYTES));
+}
+
+fn cache_get(key: &str) -> Option<Img> {
+    let win = CURRENT_WINDOW.get();
+    PRINTS.with(|m| m.borrow_mut().get(key, win))
+}
+
+fn cache_insert(key: String, img: Img, bytes: usize) {
+    let win = CURRENT_WINDOW.get();
+    let evicted = PRINTS.with(|m| m.borrow_mut().insert(key, img, bytes, win));
+    if !evicted.is_empty() {
+        WINDOW_EVICTED.with(|e| {
+            let mut queues = e.borrow_mut();
+            for (img, windows) in evicted {
+                for w in windows {
+                    queues.entry(w).or_default().push(img.clone());
+                }
+            }
+        });
+    }
+}
+
+/// Prints once per key and keeps it (bounded by an LRU byte budget), so a redraw never re-dithers.
 pub fn cached(key: String, plate: &Plate, make: impl FnOnce() -> Vec<u8>) -> Img {
+    try_cached(key, plate, || Some(make())).expect("`make` always gives a picture")
+}
+
+/// `cached` for a picture that may not exist (an app without an icon): `make` runs only on a
+/// miss, and a `None` is not kept.
+pub fn try_cached(key: String, plate: &Plate, make: impl FnOnce() -> Option<Vec<u8>>) -> Option<Img> {
     let key = format!("{key}@{}x{}x{}", plate.w, plate.h, plate.scale);
-    if let Some(p) = PRINTS.with(|m| m.borrow().get(&key).cloned()) {
-        return p;
+    if let Some(p) = cache_get(&key) {
+        return Some(p);
     }
     let (w, h) = plate.px();
     let began = std::time::Instant::now();
-    let p = image(w, h, make());
+    let bytes = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+    let p = image(w, h, make()?);
     if std::env::var("IRIS_TRACE").is_ok() {
         eprintln!("print ms={:.2} {key}", began.elapsed().as_secs_f64() * 1000.0);
     }
-    PRINTS.with(|m| m.borrow_mut().insert(key, p.clone()));
-    p
+    cache_insert(key, p.clone(), bytes);
+    Some(p)
 }
 
 /// A small picture made at `src` pixels square and shown `points` square without smoothing
 /// (SwiftUI's `.interpolation(.none)`): scaled up a whole source pixel at a time, as Swift
 /// draws the riso icons, so every printed dot stays crisp instead of blurring into the paper.
 pub fn cached_crisp(key: String, src: u32, make: impl FnOnce() -> Vec<u8>, points: f32, scale: f32) -> Img {
-    thread_local! { static RAW: RefCell<HashMap<String, std::rc::Rc<Vec<u8>>>> = RefCell::new(HashMap::new()); }
+    thread_local! { static RAW: RefCell<ByteLru<std::rc::Rc<Vec<u8>>>> = RefCell::new(ByteLru::new(RAW_MAX_BYTES)); }
     let n = ((points * scale).round() as u32).max(1);
     let out_key = format!("crisp-{key}-{n}");
-    if let Some(p) = PRINTS.with(|m| m.borrow().get(&out_key).cloned()) {
+    if let Some(p) = cache_get(&out_key) {
         return p;
     }
-    let raw = RAW.with(|r| r.borrow().get(&key).cloned()).unwrap_or_else(|| {
-        let v = std::rc::Rc::new(make());
-        RAW.with(|r| r.borrow_mut().insert(key.clone(), v.clone()));
+    let raw = RAW.with(|r| r.borrow_mut().get(&key)).unwrap_or_else(|| {
+        let data = make();
+        let size = data.len();
+        let v = std::rc::Rc::new(data);
+        RAW.with(|r| {
+            let _ = r.borrow_mut().insert(key.clone(), v.clone(), size);
+        });
         v
     });
-    let mut out = vec![0u8; (n * n * 4) as usize];
+    let bytes = (n as usize).saturating_mul(n as usize).saturating_mul(4);
+    // Windows at 100–150 %: fewer pixels than the print, and a nearest-pixel shrink drops whole
+    // rows and columns of its dots (Settings' ⌘ broke apart, the Tones squiggle went). Blended
+    // down instead, each screen pixel the dots it covers: the print as a Mac's 2× reads from
+    // arm's length. Windows only: the Mac draws exactly as it did.
+    if cfg!(windows) && n < src {
+        let p = image(n, n, blend_down(&raw, src, n));
+        cache_insert(out_key, p.clone(), bytes);
+        return p;
+    }
+    let mut out = vec![0u8; bytes];
     for y in 0..n {
         let sy = (((y as f32 + 0.5) * src as f32 / n as f32) as u32).min(src - 1);
         for x in 0..n {
@@ -332,8 +510,45 @@ pub fn cached_crisp(key: String, src: u32, make: impl FnOnce() -> Vec<u8>, point
         }
     }
     let p = image(n, n, out);
-    PRINTS.with(|m| m.borrow_mut().insert(out_key, p.clone()));
+    cache_insert(out_key, p.clone(), bytes);
     p
+}
+
+/// A `src`-pixel RGBA print shrunk to `n` pixels by area: each pixel the average of the dots it
+/// covers (premultiplied, so the paper between dots stays see-through).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn blend_down(raw: &[u8], src: u32, n: u32) -> Vec<u8> {
+    let r = src as f32 / n as f32;
+    let span = |i: u32| -> Vec<(u32, f32)> {
+        let (a, b) = (i as f32 * r, (i + 1) as f32 * r);
+        (a.floor() as u32..(b.ceil() as u32).min(src)).map(|s| (s, (b.min(s as f32 + 1.0) - a.max(s as f32)).max(0.0))).collect()
+    };
+    let mut out = vec![0u8; (n * n * 4) as usize];
+    for y in 0..n {
+        let ys = span(y);
+        for x in 0..n {
+            let mut acc = [0f32; 4];
+            for &(sx, wx) in &span(x) {
+                for &(sy, wy) in &ys {
+                    let i = ((sy * src + sx) * 4) as usize;
+                    let a = raw[i + 3] as f32 / 255.0 * wx * wy;
+                    for c in 0..3 {
+                        acc[c] += raw[i + c] as f32 * a;
+                    }
+                    acc[3] += a;
+                }
+            }
+            let o = ((y * n + x) * 4) as usize;
+            let alpha = acc[3] / (r * r);
+            if acc[3] > 0.0 {
+                for c in 0..3 {
+                    out[o + c] = (acc[c] / acc[3]).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            out[o + 3] = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
 }
 
 // MARK: - Paper grain
@@ -489,4 +704,63 @@ pub fn intersect(a: &Mask, b: &Mask) -> Mask {
         *x = ((*x as u32 * *y as u32 + 127) / 255) as u8;
     }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ByteLru, PrintLru, blend_down};
+
+    /// Shrinking 44 to 24 keeps every dot's share: solid ink stays solid, the paper stays clear,
+    /// and a checkerboard of dots comes out as that ink at half strength, not as holes or blots.
+    #[test]
+    fn blend_down_keeps_the_ink() {
+        let (src, n) = (44u32, 24u32);
+        let px = |f: &dyn Fn(u32, u32) -> bool| -> Vec<u8> {
+            (0..src * src).flat_map(|i| if f(i % src, i / src) { [0x58, 0x2A, 0x20, 255] } else { [0, 0, 0, 0] }).collect()
+        };
+        let solid = blend_down(&px(&|_, _| true), src, n);
+        assert!(solid.chunks(4).all(|p| p == [0x58, 0x2A, 0x20, 255]));
+        let clear = blend_down(&px(&|_, _| false), src, n);
+        assert!(clear.chunks(4).all(|p| p[3] == 0));
+        let checks = blend_down(&px(&|x, y| (x + y) % 2 == 0), src, n);
+        for p in checks.chunks(4) {
+            assert_eq!(&p[..3], &[0x58, 0x2A, 0x20]);
+            assert!((100..=155).contains(&p[3]), "alpha {}", p[3]);
+        }
+    }
+
+    #[test]
+    fn byte_lru_evicts_least_recently_used() {
+        let mut lru = ByteLru::new(100);
+        assert!(lru.insert("a".into(), 1, 40).is_empty());
+        assert!(lru.insert("b".into(), 2, 40).is_empty());
+        // Touch "a" so "b" becomes least recently used.
+        assert_eq!(lru.get("a"), Some(1));
+        let evicted = lru.insert("c".into(), 3, 40);
+        assert_eq!(evicted, vec![2]);
+        assert_eq!(lru.get("b"), None);
+        assert_eq!(lru.get("a"), Some(1));
+        assert_eq!(lru.get("c"), Some(3));
+        assert_eq!(lru.bytes, 80);
+    }
+
+    #[test]
+    fn print_lru_tracks_per_window_evictions_and_forget() {
+        let mut lru: PrintLru<u32, u32> = PrintLru::new(100);
+        assert!(lru.insert("a".into(), 1, 40, Some(10)).is_empty());
+        assert!(lru.insert("b".into(), 2, 40, Some(20)).is_empty());
+        // Window 20 also uses "a", moving "a" ahead of "b" and recording both windows.
+        assert_eq!(lru.get("a", Some(20)), Some(1));
+        // Evicting "b" only reports window 20.
+        let evicted = lru.insert("c".into(), 3, 40, Some(30));
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0, 2);
+        assert!(evicted[0].1.contains(&20) && !evicted[0].1.contains(&10));
+        // Forgetting window 10 strips it from "a"'s usage set before "a" is evicted.
+        lru.forget_window(10);
+        let evicted2 = lru.insert("d".into(), 4, 40, Some(30));
+        assert_eq!(evicted2.len(), 1);
+        assert_eq!(evicted2[0].0, 1);
+        assert!(evicted2[0].1.contains(&20) && !evicted2[0].1.contains(&10));
+    }
 }

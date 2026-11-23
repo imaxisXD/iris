@@ -494,12 +494,23 @@ fn now_ref() -> f64 {
 /// The picture's room round the stage: the flight goes up past its top and out past its right.
 const ROOM: (f32, f32) = (10.0, 30.0);
 
-/// A half of the letter, printed once and kept: `draw` through a transform from the half's own
-/// points, with 4 points of room round it.
+/// A half of the letter, printed once and kept (LRU-bounded): `draw` through a transform from
+/// the half's own points, with 4 points of room round it.
 fn half_picture(key: String, w: f32, h: f32, scale: f32, draw: &dyn Fn(&mut Sheet, Transform)) -> std::rc::Rc<(u32, u32, Vec<u8>)> {
-    thread_local! { static HALVES: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<(u32, u32, Vec<u8>)>>> = Default::default(); }
+    const HALVES_MAX: usize = 16;
+    type Half = std::rc::Rc<(u32, u32, Vec<u8>)>;
+    thread_local! {
+        static HALVES: std::cell::RefCell<(std::collections::HashMap<String, (Half, u64)>, u64)> = Default::default();
+    }
     let key = format!("{key}@{scale}");
-    if let Some(h) = HALVES.with(|m| m.borrow().get(&key).cloned()) {
+    if let Some(h) = HALVES.with(|m| {
+        let mut guard = m.borrow_mut();
+        guard.1 = guard.1.wrapping_add(1);
+        let tick = guard.1;
+        let entry = guard.0.get_mut(&key)?;
+        entry.1 = tick;
+        Some(entry.0.clone())
+    }) {
         return h;
     }
     let plate = Plate { w: w + 8.0, h: h + 8.0, scale };
@@ -507,7 +518,19 @@ fn half_picture(key: String, w: f32, h: f32, scale: f32, draw: &dyn Fn(&mut Shee
     let mut sh = Sheet::new(plate, 0.0, 0.0, 0.0);
     draw(&mut sh, Transform::from_translate(4.0, 4.0));
     let out = std::rc::Rc::new((pw, ph, sh.rgba()));
-    HALVES.with(|m| m.borrow_mut().insert(key, out.clone()));
+    HALVES.with(|m| {
+        let mut guard = m.borrow_mut();
+        guard.1 = guard.1.wrapping_add(1);
+        let tick = guard.1;
+        guard.0.insert(key, (out.clone(), tick));
+        while guard.0.len() > HALVES_MAX {
+            if let Some(oldest) = guard.0.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| k.clone()) {
+                guard.0.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    });
     out
 }
 

@@ -12,8 +12,14 @@ date: <YYYY-MM-DD>
 - <a small thing, also in this version>
 -->
 
-# 0.4.1 · Right there
-date: 2026-11-20
+# 0.5.0 · Right there
+date: 2026-11-24
+
+## Iris on Windows
+Iris now comes to Windows PCs as a beta: press Ctrl+Win+G in any app and the same panel, tones and Replace are there, with the flower by the clock and everything still on your own computer.
+
+## Answers arrive faster
+Fixes and tone rewrites start showing sooner and finish up to twice as fast, especially on longer messages, while using less memory, however long Iris stays open and whenever you switch models.
 
 ## The panel opens as soon as the answer is ready
 When you press the shortcut, the panel opens the moment Iris has its answer, most times about a second sooner. The flower's full arrival plays your first few times, the first time each day and now and then after that, so it stays a treat instead of a wait.
@@ -21,8 +27,17 @@ When you press the shortcut, the panel opens the moment Iris has its answer, mos
 ## Messages stay on your screen
 A message beside a box near the edge of your screen, or by your pointer there, now always fits on the screen, so you can read all of it.
 
+## Download a model right where you pick it
+Choosing a model in Settings › Model & memory that isn't on your computer yet tells you straight away and puts a Download button right under it, so you never find out only when you press your shortcut.
+
+- Pressing your shortcut reads your box and starts checking right away, and switching between tones stays quick even after you've tried them all.
+- Switching back to a tone you already checked is instant, and Settings › General › Remember answers lets you pick Off, While open, or Recent; switching tones paints the pink brushstroke smoothly onto the next tab while the panel eases to the new height.
 - When Iris can't fix something, it says why at the bottom left of the panel, where "looks good" appears, so you always know where to look.
 - Typing in a window that floats above the others, like a launcher's, Iris and its messages open in front of it, never behind.
+- If you built Iris yourself, Check for Updates installs the latest Iris even while you're working on something else in its project folder, and leaves your work as it is.
+- Apps you turned Iris off in are never read when you press a shortcut, and your clipboard comes back as you left it even in slower apps or back-to-back replacements.
+- The panel shows the tones you turned on or added in Settings, opens on each app's chosen starting tone, and lets you jump to any of them with keys 1–6.
+- Pressing your shortcut right after closing the panel opens it again straight away, and closing Settings while choosing a new shortcut leaves your shortcuts working.
 
 # 0.4.0 · Delivered to your door
 date: 2026-11-20

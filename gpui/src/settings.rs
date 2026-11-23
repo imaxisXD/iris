@@ -64,20 +64,20 @@ impl Page {
     /// The Swift picture's height in points (a snapshot draws the page whole), for a snapshot
     /// that doesn't give its size. These move with the pages (Updates with every changelog entry).
     pub fn snapshot_height(self) -> f32 {
-        [1639.0, 936.0, 1111.0, 729.0, 829.0, 1172.5, 627.0, 1180.0, 1118.0][self.index()]
+        [1715.0, 936.0, 1111.0, 729.0, 829.0, 1172.5, 627.0, 1180.0, 1118.0][self.index()]
     }
     fn icon(self) -> Icon {
         [Icon::General, Icon::Shortcuts, Icon::Tones, Icon::Words, Icon::Apps, Icon::Model, Icon::Privacy, Icon::Updates, Icon::About][self.index()]
     }
     fn heading(self) -> [&'static str; 2] {
         [["How Iris", "behaves"], ["Keys for", "your hands"], ["Tones based", "on your words"], ["Words to", "never change"],
-         ["Where Iris", "works"], ["The model", "on this Mac"], ["Nothing", "leaves here"], ["What's new", "in Iris"], ["Who made", "Iris"]][self.index()]
+         ["Where Iris", "works"], ["The model", crate::words::w("on this Mac")], ["Nothing", "leaves here"], ["What's new", "in Iris"], ["Who made", "Iris"]][self.index()]
     }
     fn running_head(self) -> [String; 3] {
         let n = format!("{:02} of {:02}", self.index() + 1, PAGES.len());
         let [a, b] = [["When and where Iris shows up", "Changes save right away"], ["The keys that call Iris", "They work in any app"],
                       ["How each rewrite sounds", "Names and links stay as written"], ["Names and terms to keep", "Iris never changes them"],
-                      ["Where Iris reads text", "Turn it off in any app"], ["What runs on this Mac", "Downloaded once"],
+                      ["Where Iris reads text", "Turn it off in any app"], [crate::words::w("What runs on this Mac"), "Downloaded once"],
                       ["What Iris can see", "Your text stays here"], ["New versions and what changed", "Iris looks only when you ask"],
                       ["Who made Iris and why", "Free and open source"]][self.index()];
         [n, a.into(), b.into()]
@@ -100,6 +100,8 @@ pub struct Values {
     pub starts_in: usize,
     pub show_changes: bool,
     pub panel_when_clean: bool,
+    /// Remember checked answers: 0 = Off, 1 = While open, 2 = Recent.
+    pub answer_cache: usize,
     pub notes: [bool; 5],
     pub open_at_login: bool,
     /// What macOS still needs before Iris opens at login.
@@ -168,10 +170,10 @@ impl Default for Values {
     fn default() -> Self {
         let s = crate::store::Settings::default();
         Values {
-            placement: 0, modes: vec![("fix".into(), "Fix".into())], starts_in: 0, show_changes: true, panel_when_clean: true,
-            notes: [true; 5], open_at_login: false, login_problem: None, demo: None, demo_keys: crate::pages::notes::QUICK_FIX.to_vec(),
+            placement: 0, modes: vec![("fix".into(), "Fix".into())], starts_in: 0, show_changes: true, panel_when_clean: true, answer_cache: 2,
+            notes: [true; 5], open_at_login: false, login_problem: None, demo: None, demo_keys: crate::pages::notes::quick_fix_caps(),
             // The snapshots draw the installed Iris's shortcuts.
-            open_shortcut: crate::store::KeyCombo::OPEN, quick_fix: Some(crate::store::KeyCombo::QUICK_FIX), recording: None,
+            open_shortcut: crate::keys::open_default(), quick_fix: Some(crate::keys::quick_fix_default()), recording: None,
             tones: tone_rows(&s), style_rules: vec![], glossary: vec![],
             excluded: s.excluded_apps.iter().map(|a| (a.bundle_id.clone(), a.name.clone())).collect(), per_app: vec![],
             model: None, idle_minutes: 30, load_at_launch: true, fields: None, update_check: None,
@@ -421,7 +423,7 @@ fn page_foot(page: Page, w: f32, scale: f32) -> Div {
     });
     let light = (255, 251, 247);
     let mut sign = column();
-    for (i, line) in ["your words", "— stay on", "this Mac"].iter().enumerate() {
+    for (i, line) in ["your words", "— stay on", crate::words::w("this Mac")].iter().enumerate() {
         let (l, _) = martian_line(line, 11.5, 600.0, 87.5, 0.0, 11.5 * MONO_LINE, light, scale);
         sign = sign.child(div().flex_none().pl(z(i as f32 * 18.0)).mt(z(if i > 0 { 1.0 } else { 0.0 })).child(l));
     }
@@ -452,10 +454,11 @@ fn page_content(page: Page, v: &Values, w: f32, cx: &Ctx) -> Vec<Div> {
 fn general(v: &Values, w: f32, cx: &Ctx) -> Vec<Div> {
     use crate::controls as c;
     use crate::interact::{act, change};
-    use crate::store::Placement;
+    use crate::store::{AnswerCache, Placement};
     let s = cx.scale;
     let place = ["Above", "Below", "By the mouse"];
     let clean = ["Panel", "Message"];
+    let cache = ["Off", "While open", "Recent"];
     let labels: Vec<String> = v.modes.iter().map(|m| m.1.clone()).collect();
     let ids: Vec<String> = v.modes.iter().map(|m| m.0.clone()).collect();
     let starts = c::menu(labels, v.starts_in, None, 170.0, move |i, _| {
@@ -475,11 +478,21 @@ fn general(v: &Values, w: f32, cx: &Ctx) -> Vec<Div> {
         .child(hairline(545, w))
         .child(setting_row("Nothing to fix", Some("Show the panel, or a small message that fades."),
             c::choice(&clean, if v.panel_when_clean { 0 } else { 1 }, "Nothing to fix", s, |i| change(move |s| s.show_panel_when_clean = i == 0)),
-            ink_choice_w(&clean), w));
+            ink_choice_w(&clean), w))
+        .child(hairline(549, w))
+        .child(setting_row("Remember answers", Some("Instant when you switch back to a tone. In memory only; Try again asks fresh."),
+            c::choice(&cache, v.answer_cache, "Remember answers", s, |i| act(move |_, _| {
+                let mode = [AnswerCache::Off, AnswerCache::WhileOpen, AnswerCache::Recent][i];
+                crate::app::change(move |s| s.answer_cache = mode);
+                if mode != AnswerCache::Recent {
+                    crate::live::clear_memo();
+                }
+            })),
+            ink_choice_w(&cache), w));
 
     let notes = [
         ("After replacing", "Says “fixed 4 words” or “replaced”."),
-        ("With the undo keys", "Adds “Undo with ⌘ Z” to that message."),
+        ("With the undo keys", undo_line()),
         ("While Quick Fix works", "Says “checking…” while Iris reads your text."),
         ("When there's nothing to fix", "Says “looks good”."),
         ("Where Iris is off", "Says “turned off here” if you press the shortcut there."),
@@ -539,7 +552,7 @@ fn general(v: &Values, w: f32, cx: &Ctx) -> Vec<Div> {
     };
     let login = c::toggle(v.open_at_login, "Open at login", s, act(|_, _| crate::login_item::set(!crate::login_item::enabled())));
     let mut mac = column().gap(z(12.0)).w(z(w))
-        .child(setting_row("Open at login", Some("Start Iris in the menu bar when you log in."), login, 50.0, w));
+        .child(setting_row("Open at login", Some(crate::words::w("Start Iris in the menu bar when you log in.")), login, 50.0, w));
     if let Some(p) = &v.login_problem {
         mac = mac.child(t(p.clone(), caption(), hue::WARN_TEXT));
     }
@@ -550,6 +563,15 @@ fn general(v: &Values, w: f32, cx: &Ctx) -> Vec<Div> {
     vec![
         section(Some(1), "The panel", Some("What you see when you press the shortcut."), None, Some(panel), w, s),
         section(Some(2), "When Iris speaks up", Some("After you press the keys, Iris tells you what happened in a small message by your text. It fades on its own. Errors always show."), None, Some(speaks), w, s),
-        section(Some(3), "Your Mac", None, None, Some(mac), w, s),
+        section(Some(3), crate::words::w("Your Mac"), None, None, Some(mac), w, s),
     ]
+}
+
+/// "Adds “Undo with ⌘ Z” to that message.", in this system's keys (Ctrl+Z on Windows).
+fn undo_line() -> &'static str {
+    static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LINE.get_or_init(|| {
+        let keys = crate::keys::command("Z").join(if crate::keys::is_mac() { " " } else { "+" });
+        format!("Adds “Undo with {keys}” to that message.")
+    })
 }

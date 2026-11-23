@@ -32,11 +32,11 @@ pub fn content(_v: &Values, w: f32, cx: &Ctx) -> Vec<Div> {
     let rows = column().w(z(w)).gap(z(12.0))
         .child(fact(Icon::Words, "Free and open source", "MIT licence. Anyone can read how Iris works or suggest a change.", Some("The code"), w, s))
         .child(hairline(941, w))
-        .child(fact(Icon::Model, "Writes with Gemma 4", "Google's open model, running right on this Mac. Its terms and the fonts' licences are in the credits.", Some("Credits"), w, s))
+        .child(fact(Icon::Model, "Writes with Gemma 4", crate::words::w("Google's open model, running right on this Mac. Its terms and the fonts' licences are in the credits."), Some("Credits"), w, s))
         .child(hairline(942, w))
         .child(fact(Icon::About, "Other work", "Abhishek's other projects, all on GitHub.", Some("More by Abhishek"), w, s))
         .child(hairline(943, w))
-        .child(fact(Icon::Updates, "This copy", &format!("Iris dev with Gemma 4, on macOS {}.", mac_os()), None, w, s));
+        .child(fact(Icon::Updates, "This copy", &crate::words::ws(format!("Iris dev with Gemma 4, on macOS {}.", mac_os())), None, w, s));
     // Both sections in one stack: the page puts 30 between what it's given, About has 34.
     vec![column().w(z(w)).gap(z(34.0))
         .child(section(Some(1), "Where Iris comes from", None, None, Some(story), w, s))
@@ -58,7 +58,7 @@ pub const REPO: &str = "https://github.com/imaxisXD/iris";
 /// `ProblemReport.url`: a new GitHub issue with the questions to answer and this copy's
 /// versions filled in.
 pub fn problem_report_url() -> String {
-    let body = format!("**What happened?**\n\n\n**What did you expect?**\n\n\n**How can I make it happen again?**\n1.\n\n---\nIris dev · macOS {}", mac_os());
+    let body = crate::words::ws(format!("**What happened?**\n\n\n**What did you expect?**\n\n\n**How can I make it happen again?**\n1.\n\n---\nIris dev · macOS {}", mac_os()));
     let mut q = String::new();
     for b in body.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { q.push(b as char) } else { q.push_str(&format!("%{b:02X}")) }
@@ -69,6 +69,18 @@ pub fn problem_report_url() -> String {
 /// The macOS version as people know it ("26.1"), without the build code.
 pub fn mac_os() -> &'static str {
     static V: OnceLock<String> = OnceLock::new();
+    // Windows: "11 25H2 (build 26300)" from the registry (its ProductName says 10 on 11 too).
+    #[cfg(windows)]
+    return V.get_or_init(|| {
+        let key = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+        let read = |name: &str| std::process::Command::new("reg").args(["query", key, "/v", name]).output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.lines().find(|l| l.contains(name)).and_then(|l| l.split_whitespace().last().map(str::to_string)));
+        let build = read("CurrentBuild").unwrap_or_default();
+        let major = if build.parse::<u32>().unwrap_or(0) >= 22000 { "11" } else { "10" };
+        format!("{major} {} (build {build})", read("DisplayVersion").unwrap_or_default())
+    });
+    #[cfg(not(windows))]
     V.get_or_init(|| {
         std::process::Command::new("sw_vers").arg("-productVersion").output().ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -1909,6 +1921,13 @@ pub fn reset() {
         }
     });
     TOKENS.with(|t| t.borrow_mut().clear());
+}
+
+/// Settings window closed: stops the meadow thread and immediately drops any retained frames
+/// (the closing window's GPU atlas is torn down by GPUI, so nothing needs to wait for `let_go`).
+pub fn shutdown() {
+    reset();
+    RETIRED.with(|r| r.borrow_mut().clear());
 }
 
 /// The live meadow's picture for now, asking for the next frame. Waits for the very first

@@ -14,14 +14,14 @@ use crate::settings_kit::*;
 pub fn content(_v: &Values, w: f32, cx: &Ctx) -> Vec<Div> {
     let sc = cx.scale;
     let rows = column().w(z(w)).gap(z(12.0))
-        .child(item(Icon::Model.image_at(26.0, sc), "Runs on your Mac", "The model runs on this Mac. Your text is never sent to a server.", w))
+        .child(item(Icon::Model.image_at(26.0, sc), crate::words::w("Runs on your Mac"), crate::words::w("The model runs on this Mac. Your text is never sent to a server."), w))
         // `Hairline()` takes the line it's called on as its seed.
         .child(hairline(955, w))
         .child(item(hand(26.0, sc), "Reads only when you ask", "Only after a shortcut, only the box you're in, never password fields.", w))
         .child(hairline(957, w))
         .child(item(paper_plane(26.0, sc), "Never sends for you", "Iris replaces the text; you still press send. Read it first, especially for customers.", w))
         .child(hairline(959, w))
-        .child(item(Icon::Tray.image_at(26.0, sc), "Keeps no history", "Your text isn't saved. Settings stay on this Mac.", w));
+        .child(item(Icon::Tray.image_at(26.0, sc), "Keeps no history", crate::words::w("Your text isn't saved. Settings stay on this Mac."), w));
     vec![section_wrapped(1, "Privacy", None, None, rows, w, cx.scale)]
 }
 

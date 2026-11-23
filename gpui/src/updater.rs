@@ -77,14 +77,25 @@ fn info(key: &str) -> Option<String> {
 
 /// "0.1.0", or "dev" for a build without one.
 pub fn version() -> String {
-    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    V.get_or_init(|| info("CFBundleShortVersionString").unwrap_or_else(|| "dev".into())).clone()
+    // Windows: built in by the build that made the installer (`IRIS_VERSION`).
+    #[cfg(windows)]
+    return option_env!("IRIS_VERSION").unwrap_or("dev").to_string();
+    #[cfg(not(windows))]
+    {
+        static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        V.get_or_init(|| info("CFBundleShortVersionString").unwrap_or_else(|| "dev".into())).clone()
+    }
 }
 
 /// The commit this copy was built from, short.
 pub fn commit() -> Option<String> {
-    static C: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    C.get_or_init(|| info("IrisCommit").filter(|c| c != "unknown")).clone()
+    #[cfg(windows)]
+    return option_env!("IRIS_COMMIT").map(str::to_string);
+    #[cfg(not(windows))]
+    {
+        static C: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        C.get_or_init(|| info("IrisCommit").filter(|c| c != "unknown")).clone()
+    }
 }
 
 /// The checkout this copy was built from, if it's still there.
@@ -134,10 +145,15 @@ const OFFLINE: &str = "Couldn't reach GitHub. Check your connection and try agai
 /// A downloaded copy: its version against GitHub's latest release. Nothing about you or your
 /// text is sent; only when you choose Check for Updates.
 fn check_releases() -> Status {
-    if info("IrisChannel").as_deref() != Some("release") && local_releases().is_none() {
+    // Windows: the installed copy is a release (`store::is_installed_iris`).
+    #[cfg(windows)]
+    let release = crate::store::is_installed_iris();
+    #[cfg(not(windows))]
+    let release = info("IrisChannel").as_deref() == Some("release");
+    if !release && local_releases().is_none() {
         return Status::NoCheckout;
     }
-    let out = Command::new("/usr/bin/curl")
+    let out = Command::new(if cfg!(windows) { "curl.exe" } else { "/usr/bin/curl" })
         .args(["--silent", "--max-time", "15", "--header", "Accept: application/vnd.github+json", "--write-out", "\n%{http_code}"])
         .arg(local_releases().unwrap_or_else(|| LATEST_API.into()))
         .output();
@@ -161,8 +177,17 @@ fn check_releases() -> Status {
         return Status::UpToDate;
     }
     // Its Iris.zip (release.sh attaches it under that name), from GitHub's release files only.
+    // Windows: its installer, and only when this copy can check one's signature.
+    #[cfg(windows)]
+    let package = crate::update_win::SETUP;
+    #[cfg(not(windows))]
+    let package = "Iris.zip";
+    #[cfg(windows)]
+    if !crate::update_win::can_verify() {
+        return Status::NewRelease(tag.into(), page, None);
+    }
     let zip = v["assets"].as_array().into_iter().flatten()
-        .find(|a| a["name"].as_str() == Some("Iris.zip"))
+        .find(|a| a["name"].as_str() == Some(package))
         .and_then(|a| a["browser_download_url"].as_str())
         .filter(|u| u.starts_with(DOWNLOADS) || (local_releases().is_some() && u.starts_with("http://127.0.0.1:")))
         .map(String::from)
@@ -183,6 +208,16 @@ pub fn is_newer(tag: &str, installed: &str) -> bool {
     false
 }
 
+/// The branch updates follow (`iris_followed_branch` in scripts/lib.sh): GitHub's default, or
+/// main if the checkout doesn't say.
+fn followed_branch(path: &str) -> String {
+    let (code, out) = git(&["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], path, None);
+    match out.trim().strip_prefix("origin/") {
+        Some(b) if code == 0 && !b.is_empty() => b.to_string(),
+        _ => "main".into(),
+    }
+}
+
 fn status_of(path: &str, built_from: Option<&str>) -> Status {
     if git(&["remote", "get-url", "origin"], path, None).0 != 0 {
         return Status::NoRemote;
@@ -192,13 +227,20 @@ fn status_of(path: &str, built_from: Option<&str>) -> Status {
     if git(&["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=15", "fetch", "--quiet", "origin"], path, Some(30)).0 != 0 {
         return Status::Failed(OFFLINE.into());
     }
-    // What this copy is missing: new commits on GitHub, and commits made in the checkout since
-    // it was built.
-    let mut missing: Vec<String> = vec!["HEAD..@{u}".into()];
+    // What this copy is missing: new commits on GitHub's main, and commits made on main in the
+    // checkout since it was built. Main, never the branch the checkout has out: it's what
+    // update.sh installs (`iris_update_target` in scripts/lib.sh).
+    let branch = followed_branch(path);
+    let (ours, theirs) = (format!("refs/heads/{branch}"), format!("refs/remotes/origin/{branch}"));
+    let has_ours = git(&["rev-parse", "--verify", "--quiet", &ours], path, None).0 == 0;
+    let mut missing: Vec<String> = vec![format!("{}..{theirs}", if has_ours { &ours } else { "HEAD" })];
     if let Some(b) = built_from
         && git(&["cat-file", "-e", &format!("{b}^{{commit}}")], path, None).0 == 0
     {
-        missing = vec![format!("^{b}"), "HEAD".into(), "@{u}".into()];
+        missing = vec![format!("^{b}"), theirs];
+        if has_ours {
+            missing.push(ours);
+        }
     }
     let refs: Vec<&str> = missing.iter().map(String::as_str).collect();
     let (code, count) = git(&[&["rev-list", "--count"][..], &refs].concat(), path, None);
@@ -231,6 +273,7 @@ fn git(args: &[&str], path: &str, timeout: Option<u64>) -> (i32, String) {
             }
             if start.elapsed() > Duration::from_secs(t) {
                 let _ = child.kill();
+                let _ = child.wait();
                 return (-1, String::new());
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -283,7 +326,7 @@ pub fn words(status: &Status) -> (String, String, bool) {
         Status::UpToDate => ("Up to date".into(), "You have the latest Iris.".into(), false),
         Status::Behind(n, _) => (if *n == 1 { "1 new change".into() } else { format!("{n} new changes") }, "Ready to install.".into(), false),
         Status::NewRelease(tag, _, Some(_)) => (format!("Iris {} is out", tag.trim_start_matches('v')), "Ready to install. Your settings stay.".into(), false),
-        Status::NewRelease(tag, _, None) => (format!("Iris {} is out", tag.trim_start_matches('v')), "Download it, then replace Iris in Applications. Your settings stay.".into(), false),
+        Status::NewRelease(tag, _, None) => (format!("Iris {} is out", tag.trim_start_matches('v')), crate::words::w("Download it, then replace Iris in Applications. Your settings stay.").into(), false),
         Status::NoCheckout => ("Can't update".into(), "This copy of Iris wasn't installed from its project folder, so it can't update itself.".into(), true),
         Status::NoRemote => ("Can't update".into(), "Iris doesn't know where to get updates yet: its project folder isn't linked to GitHub.".into(), true),
         Status::Failed(m) => ("Couldn't check".into(), m.chars().take(80).collect(), true),
@@ -303,11 +346,45 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.2.0"));
         assert!(is_newer("1.0", "0.9.9"));
     }
+
+    /// A checkout with another branch out still counts what's new on GitHub's main, which is what
+    /// update.sh installs, not what's new on that branch's own upstream.
+    #[test]
+    fn checks_follow_main_whatever_branch_is_out() {
+        use super::{Status, status_of};
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("iris-updater-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = |script: &str| {
+            let ok = Command::new("/bin/sh").arg("-c").arg(script).current_dir(&dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+                .status().unwrap().success();
+            assert!(ok, "{script}");
+        };
+        // GitHub's main has one, feature another; the checkout has feature out, rebased since
+        // its push (as when Check for Updates failed).
+        sh("git init -q --bare -b main o.git && git clone -q o.git seed 2>/dev/null && cd seed \
+            && git commit -q --allow-empty -m one && git push -q origin main \
+            && git checkout -q -b feature && git commit -q --allow-empty -m feat && git push -q -u origin feature \
+            && cd .. && git clone -q o.git c && cd c && git checkout -q feature \
+            && git commit -q --allow-empty --amend -m feat-rebased");
+        let c = dir.join("c");
+        let c = c.to_str().unwrap();
+        let built = String::from_utf8(Command::new("git").args(["-C", c, "rev-parse", "main"]).output().unwrap().stdout).unwrap();
+        assert_eq!(status_of(c, Some(built.trim())), Status::UpToDate);
+        sh("cd seed && git checkout -q main && git commit -q --allow-empty -m 'Iris: two' && git push -q origin main");
+        assert_eq!(status_of(c, Some(built.trim())), Status::Behind(1, vec!["two".into()]));
+        assert_eq!(status_of(c, None), Status::Behind(1, vec!["two".into()]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // MARK: - Installing
 
-/// Update & reopen (`Updater.install`): the checkout's update script (`scripts/update.sh`) pulls,
+/// Update & reopen (`Updater.install`): the checkout's update script (`scripts/update.sh`) fetches,
 /// builds and reopens Iris, detached (it quits this one), its lines added to the update log.
 /// Never under test: it would replace the app.
 pub fn install(cx: &mut App) {
@@ -323,9 +400,16 @@ pub fn install(cx: &mut App) {
         .current_dir(&path)
         .env_remove("IRIS_COMMIT").env_remove("IRIS_SOURCE_PATH").env_remove("SIGN_IDENTITY")
         .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").spawn();
-    if started.is_err() {
-        crate::live::news("updates: the update couldn't start");
-        return;
+    match started {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(_) => {
+            crate::live::news("updates: the update couldn't start");
+            return;
+        }
     }
     // The slip's header says Updating while the new Iris builds; the script quits and reopens it.
     let st = state(cx);
@@ -343,7 +427,13 @@ pub fn progress(elapsed: f64) -> f64 {
 
 // MARK: - Installing a release (a downloaded copy)
 
-/// This copy's app bundle (…/Iris.app), from the running program.
+/// This copy's app bundle (…/Iris.app), from the running program. Windows: its folder.
+#[cfg(windows)]
+fn app_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe().ok()?.parent().map(|p| p.to_path_buf())
+}
+
+#[cfg(not(windows))]
 fn app_path() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     let app = exe.parent()?.parent()?.parent()?.to_path_buf();
@@ -352,7 +442,8 @@ fn app_path() -> Option<std::path::PathBuf> {
 
 /// Whether this copy may be swapped for another where it stands (its folder takes new files).
 fn can_replace(app: &std::path::Path) -> bool {
-    let Some(dir) = app.parent() else { return false };
+    // Windows: the folder Iris runs from is the one the installer writes into.
+    let Some(dir) = (if cfg!(windows) { Some(app) } else { app.parent() }) else { return false };
     let probe = dir.join(format!(".iris-update-probe-{}", std::process::id()));
     let ok = std::fs::write(&probe, b"").is_ok();
     let _ = std::fs::remove_file(&probe);
@@ -361,6 +452,9 @@ fn can_replace(app: &std::path::Path) -> bool {
 
 fn update_log(line: &str) {
     use std::io::Write;
+    #[cfg(windows)]
+    let log = crate::update_win::folder().with_file_name("update.log");
+    #[cfg(not(windows))]
     let log = std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_default().join("Library/Logs/Iris-update.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
         let _ = writeln!(f, "{line}");
@@ -450,6 +544,40 @@ pub fn install_release(tag: String, url: String, cx: &mut App) {
     if under_test() && !(local_releases().is_some() && url.starts_with("http://127.0.0.1:")) {
         return crate::live::news("updates: a release would have been installed");
     }
+    #[cfg(windows)]
+    return install_windows(tag, url, cx);
+    #[cfg(not(windows))]
+    install_mac(tag, url, cx)
+}
+
+/// Windows: the installer, checked against Iris's own signature (`update_win`), run once Iris
+/// has quit; Iris opens again whatever the installer did.
+#[cfg(windows)]
+fn install_windows(tag: String, url: String, cx: &mut App) {
+    let st = state(cx);
+    st.update(cx, |s, cx| {
+        s.phase = Phase::Updating(Instant::now());
+        cx.notify();
+    });
+    let installed = version();
+    cx.spawn(async move |cx| {
+        let fetched = cx.background_executor().spawn(async move { crate::update_win::fetch(&url, &installed) }).await;
+        let _ = cx.update(|cx| match fetched {
+            Ok((setup, v)) => match crate::update_win::launch(&setup, std::process::id()) {
+                Ok(()) => {
+                    update_log(&format!("── installing Iris {v} ({tag})"));
+                    cx.quit()
+                }
+                Err(e) => answered(Status::InstallFailed("Iris couldn't start installing. Try again.".into()), &format!("launch: {e}"), cx),
+            },
+            Err(words) => answered(Status::InstallFailed(words), "release: not installed", cx),
+        });
+    })
+    .detach();
+}
+
+#[cfg(not(windows))]
+fn install_mac(tag: String, url: String, cx: &mut App) {
     let Some(current) = app_path() else { return };
     let st = state(cx);
     st.update(cx, |s, cx| {
@@ -470,7 +598,12 @@ pub fn install_release(tag: String, url: String, cx: &mut App) {
                     .arg(&log).arg(std::process::id().to_string()).arg(&current).arg(&new).arg(dir.join("previous.app"))
                     .spawn();
                 match started {
-                    Ok(_) => cx.quit(),
+                    Ok(mut child) => {
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                        cx.quit();
+                    }
                     Err(e) => answered(Status::InstallFailed("Iris couldn't start installing. Try again.".into()), &format!("swap: {e}"), cx),
                 }
             }

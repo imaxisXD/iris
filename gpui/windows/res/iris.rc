@@ -1,0 +1,3 @@
+// Iris on Windows: the flower as the program's icon. GPUI loads icon resource 1 for every
+// window, so this is also the taskbar's and the window's icon.
+1 ICON "iris.ico"

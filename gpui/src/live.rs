@@ -7,7 +7,8 @@
 //! threads draw it a frame ahead (`RigFeed`), the main thread only shows the newest picture,
 //! and once the flower has settled it's drawn once and kept.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -19,6 +20,7 @@ use gpui::*;
 use crate::model::{self, Phase};
 use crate::opening::{self, Script};
 use crate::riso::Img;
+use crate::store::AnswerCache;
 
 /// A picture of the flower drawn for a moment of the script.
 struct Drawn {
@@ -141,7 +143,12 @@ pub struct OpeningView {
     /// When the panel went, in seconds into the moment, and whether by Replace.
     pub went: Option<(f64, bool)>,
     pub due: Option<Instant>,
-    pub flight: Option<(usize, usize)>,
+    /// Answers already computed while this panel stays open, keyed by tone id.
+    pub results: HashMap<String, model::Answer>,
+    /// The tones this panel shows, in tab order (matches `panel.tones` 1-for-1).
+    pub modes: Vec<crate::brain::Mode>,
+    /// Generation counter for the 1.2 s "copied" flash so rapid ⌘C presses don't clear early.
+    pub copied_gen: u64,
     pub focus: FocusHandle,
     pub paper_h: Rc<Cell<f32>>,
     pub feed: RigFeed,
@@ -165,11 +172,69 @@ pub struct OpeningView {
     pub readable: Option<f64>,
 }
 
+const MEMO_LIMIT: usize = 32;
+
+/// In-memory LRU of recent answers (`PanelModel.memo`), kept only while Iris runs and never
+/// written to disk. Keyed by everything an answer depends on (`memo_key`).
+#[derive(Default)]
+struct AnswerMemo {
+    entries: HashMap<String, model::Answer>,
+    order: VecDeque<String>,
+}
+
+impl AnswerMemo {
+    fn get(&self, key: &str) -> Option<model::Answer> {
+        self.entries.get(key).cloned()
+    }
+
+    fn put(&mut self, key: String, answer: model::Answer) {
+        self.order.retain(|k| k != &key);
+        self.order.push_back(key.clone());
+        self.entries.insert(key, answer);
+        while self.order.len() > MEMO_LIMIT {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.entries.remove(key);
+        self.order.retain(|k| k != key);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+}
+
+/// Names one answer (`CheckSetup.key`): this draft, in this tone (with its instruction), under
+/// this glossary, style rules and model.
+fn memo_key(text: &str, mode: &crate::brain::Mode, glossary: &[String], style_rules: &[String], model_id: &str) -> String {
+    [
+        mode.id.as_str(),
+        mode.instruction.as_str(),
+        &glossary.join("\x01"),
+        &style_rules.join("\x01"),
+        model_id,
+        text,
+    ]
+    .join("\x02")
+}
+
+/// Drops all remembered cross-panel answers (called when Remember answers leaves Recent).
+pub fn clear_memo() {
+    MEMO.with(|m| m.borrow_mut().clear());
+}
+
 thread_local! {
     /// When the open or Quick Fix shortcut was last pressed (`pressed`).
     static PRESSED: Cell<Option<Instant>> = const { Cell::new(None) };
     /// The panel that's open, for a second press of the shortcut and for tests' keys.
     static OPEN: std::cell::RefCell<Option<WindowHandle<OpeningView>>> = const { std::cell::RefCell::new(None) };
+    /// Recent answers across panels (up to 32), used when `Settings.answer_cache == Recent`.
+    static MEMO: RefCell<AnswerMemo> = RefCell::new(AnswerMemo::default());
 }
 
 /// Whether this arrival of the flower plays in full (`BudShow.next`), counted on this Mac: the
@@ -225,8 +290,9 @@ pub fn key(name: &str, cx: &mut App) -> bool {
 
 /// Tells a test what happened ("iris: panel open", "iris: replaced …"), on stderr.
 pub fn news(s: &str) {
+    static NEWS_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Under test, or asked for (`IRIS_NEWS=1`, a person's run with the steps written down).
-    if crate::textbridge::under_test() || std::env::var("IRIS_NEWS").is_ok() {
+    if crate::textbridge::under_test() || *NEWS_ENV.get_or_init(|| std::env::var("IRIS_NEWS").is_ok()) {
         eprintln!("iris: {s}");
     }
 }
@@ -234,6 +300,9 @@ pub fn news(s: &str) {
 impl OpeningView {
     pub fn new(cx: &mut Context<Self>) -> OpeningView {
         let mut v = OpeningView::new_blank(cx);
+        let modes = current_modes(cx);
+        v.panel.tones = modes.iter().map(|m| m.label.clone()).collect();
+        v.modes = modes;
         // With the brain running, the panel opens on the real answer for its draft; without
         // it, on the stand-in's, the flower opening as the design frames have it.
         if crate::brain::get(cx).is_some() {
@@ -250,7 +319,9 @@ impl OpeningView {
             panel: opening::panel_state(),
             went: None,
             due: None,
-            flight: None,
+            results: HashMap::new(),
+            modes: vec![crate::brain::Mode::fix()],
+            copied_gen: 0,
             focus: cx.focus_handle(),
             paper_h: Rc::new(Cell::new(173.0)),
             feed: RigFeed::new(2),
@@ -268,6 +339,10 @@ impl OpeningView {
     /// The panel for a text box that was read: its words, its app, the tone it starts on.
     pub fn for_captured(captured: crate::textbridge::Captured, starting: usize, cx: &mut Context<Self>) -> OpeningView {
         let mut v = OpeningView::new_blank(cx);
+        let modes = current_modes(cx);
+        let starting = starting.min(modes.len().saturating_sub(1));
+        v.panel.tones = modes.iter().map(|m| m.label.clone()).collect();
+        v.modes = modes;
         v.panel.original = captured.text.clone();
         v.panel.app_name = captured.app_name.clone();
         v.panel.app_bundle = captured.bundle_id.clone();
@@ -282,11 +357,26 @@ impl OpeningView {
     /// The panel for a Quick Fix a person should look at: its answer already in.
     pub fn with_answer(captured: crate::textbridge::Captured, answer: model::Answer, cx: &mut Context<Self>) -> OpeningView {
         let mut v = OpeningView::new_blank(cx);
+        let modes = current_modes(cx);
+        v.panel.tones = modes.iter().map(|m| m.label.clone()).collect();
+        v.modes = modes;
         v.panel.original = captured.text.clone();
         v.panel.app_name = captured.app_name.clone();
         v.panel.app_bundle = captured.bundle_id.clone();
         v.panel.can_replace = captured.can_replace;
         v.panel.selected = 0;
+        let s = crate::app::settings();
+        if s.answer_cache != AnswerCache::Off {
+            v.results.insert("fix".into(), answer.clone());
+            if s.answer_cache == AnswerCache::Recent {
+                let model_id = crate::brain::get(cx)
+                    .and_then(|b| b.read(cx).chosen.clone())
+                    .or_else(|| s.model.clone())
+                    .unwrap_or_default();
+                let key = memo_key(&captured.text, &crate::brain::Mode::fix(), &s.glossary, &s.style_rules, &model_id);
+                MEMO.with(|m| m.borrow_mut().put(key, answer.clone()));
+            }
+        }
         v.panel.phase = Phase::Done(answer);
         v.captured = Some(captured);
         v.full = next_arrival();
@@ -294,28 +384,61 @@ impl OpeningView {
         v
     }
 
-    /// Asks the brain for tone `tone` on the draft; the panel waits (waking the model first
-    /// if it isn't in memory) and the answer streams in.
+    /// Asks the brain for tone `tone` on the draft; uses the per-panel or recent memory cache
+    /// when enabled (bypassed on `retry` / ⌘R), otherwise waits while the answer streams in.
     fn ask(&mut self, tone: usize, retry: bool, cx: &mut Context<Self>) {
         // A new answer coming: "copied" was about the last one (`clearCopiedFlash`).
         self.panel.copied = false;
+        self.panel.retry_note = None;
         let Some(brain) = crate::brain::get(cx) else { return };
         if let Some(old) = self.check.take() {
             crate::brain::cancel(old);
         }
         let b = brain.read(cx);
-        let mode = b.tones.get(tone).cloned().unwrap_or_else(crate::brain::Mode::fix);
+        let mode = self.modes.get(tone).cloned().or_else(|| b.tones.get(tone).cloned()).unwrap_or_else(crate::brain::Mode::fix);
+        let s = crate::app::settings();
+        let model_id = b.chosen.as_deref().or(s.model.as_deref()).unwrap_or("");
+        let key = memo_key(&self.panel.original, &mode, &s.glossary, &s.style_rules, model_id);
+        let policy = s.answer_cache;
+        if retry {
+            self.results.remove(&mode.id);
+            MEMO.with(|m| m.borrow_mut().remove(&key));
+        } else {
+            let cached = match policy {
+                AnswerCache::Off => None,
+                AnswerCache::WhileOpen => self.results.get(&mode.id).cloned(),
+                AnswerCache::Recent => self.results.get(&mode.id).cloned().or_else(|| MEMO.with(|m| m.borrow().get(&key))),
+            };
+            if let Some(answer) = cached {
+                if policy != AnswerCache::Off {
+                    self.results.insert(mode.id.clone(), answer.clone());
+                }
+                self.panel.phase = Phase::Done(answer);
+                if self.bloomed.is_none() {
+                    self.bloomed = Some(self.t());
+                }
+                return;
+            }
+        }
         self.panel.phase = if matches!(b.engine, crate::brain::Engine::Ready(_)) { Phase::Generating(String::new()) } else { Phase::Preparing };
         if matches!(self.panel.phase, Phase::Preparing) {
             // The panel explains the wait (downloading, waking up).
             self.read_now();
         }
+        let mode_id = mode.id.clone();
         let this = cx.entity().downgrade();
         let id = crate::brain::check(&self.panel.original, &mode, retry, move |event, cx| {
             let _ = this.update(cx, |v, cx| {
                 match event {
                     crate::brain::Event::Partial(p) => v.panel.phase = Phase::Generating(p),
                     crate::brain::Event::Finished(a, _) => {
+                        let policy = crate::app::settings().answer_cache;
+                        if policy != AnswerCache::Off {
+                            v.results.insert(mode_id.clone(), a.clone());
+                        }
+                        if policy == AnswerCache::Recent {
+                            MEMO.with(|m| m.borrow_mut().put(key.clone(), a.clone()));
+                        }
                         v.panel.phase = Phase::Done(a);
                         v.check = None;
                         // The answer is in: the flower opens (once: a later tone doesn't open
@@ -368,14 +491,21 @@ impl OpeningView {
     }
 
     fn pick(&mut self, tone: usize, cx: &mut Context<Self>) {
-        if !self.open() || (tone == self.panel.selected && self.due.is_none()) {
+        if !self.open() || tone >= self.panel.tones.len().max(1) || (tone == self.panel.selected && self.due.is_none()) {
             return;
         }
-        let moves = self.flight.map_or(0, |f| f.1) + 1;
-        self.flight = Some((self.panel.selected, moves));
         self.panel.selected = tone;
         if crate::brain::get(cx).is_some() {
             self.ask(tone, false, cx);
+            cx.notify();
+            return;
+        }
+        let key = tone.to_string();
+        if crate::app::settings().answer_cache != AnswerCache::Off
+            && let Some(cached) = self.results.get(&key).cloned()
+        {
+            self.due = None;
+            self.panel.phase = Phase::Done(cached);
             cx.notify();
             return;
         }
@@ -387,7 +517,11 @@ impl OpeningView {
             let _ = this.update(cx, |v, cx| {
                 if v.due == Some(due) {
                     v.due = None;
-                    v.panel.phase = Phase::Done(opening::answer(v.panel.selected));
+                    let answer = opening::answer(v.panel.selected);
+                    if crate::app::settings().answer_cache != AnswerCache::Off {
+                        v.results.insert(v.panel.selected.to_string(), answer.clone());
+                    }
+                    v.panel.phase = Phase::Done(answer);
                     cx.notify();
                 }
             });
@@ -405,6 +539,11 @@ impl OpeningView {
             return;
         }
         self.went = Some((self.t(), replaced));
+        // Clear the active-panel slot as soon as closing starts so a quick follow-up ⌃⌥G
+        // opens a fresh panel instead of trying to dismiss this wilting window.
+        if open_panel().is_some_and(|h| h.window_id() == window.window_handle().window_id()) {
+            set_open_panel(None);
+        }
         if let Some(c) = self.check.take() {
             crate::brain::cancel(c);
         }
@@ -436,6 +575,9 @@ impl OpeningView {
     /// Copy when the text can't be replaced (a selection in a page): copied, the panel goes and
     /// says so by the text; Done when there's nothing to fix; Try again after a failure.
     fn accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.went.is_some() {
+            return;
+        }
         match self.panel.footer().action {
             model::Action::Replace => self.go(true, window, cx),
             model::Action::Done => self.go(false, window, cx),
@@ -458,29 +600,44 @@ impl OpeningView {
 
     /// ⌘C (`PanelModel.copy`): the answer on the clipboard, "copied" in the footer for a moment.
     fn copy(&mut self, cx: &mut Context<Self>) {
+        if self.went.is_some() {
+            return;
+        }
         let Phase::Done(answer) = &self.panel.phase else { return };
         put_on_clipboard(&answer.text.clone());
         news("panel copied");
         self.panel.copied = true;
+        self.copied_gen = self.copied_gen.wrapping_add(1);
+        let gen_id = self.copied_gen;
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs_f64(1.2)).await;
             let _ = this.update(cx, |v, cx| {
-                v.panel.copied = false;
-                cx.notify();
+                if v.copied_gen == gen_id {
+                    v.panel.copied = false;
+                    cx.notify();
+                }
             });
         })
         .detach();
         cx.notify();
     }
 
-    /// A key in the panel (`PanelController.handle`): Tab and ⇧Tab move through the tones,
-    /// 1–5 pick one, Return replaces, Escape puts it away, ⌘R tries again.
+    /// A key in the panel (`PanelController.handle`): Tab, ⇧Tab, Left/Right and 1–6 move through
+    /// the tones, Return replaces, Escape puts it away, ⌘R tries again, ⌘C copies.
     pub fn key(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let n = model::TONES.len();
+        if self.went.is_some() {
+            return false;
+        }
+        let n = self.panel.tones.len().max(1);
         match name {
-            "tab" => self.pick((self.panel.selected + 1) % n, cx),
-            "shift-tab" => self.pick((self.panel.selected + n - 1) % n, cx),
-            "1" | "2" | "3" | "4" | "5" => self.pick(name.parse::<usize>().unwrap() - 1, cx),
+            "tab" | "right" => self.pick((self.panel.selected + 1) % n, cx),
+            "shift-tab" | "left" => self.pick((self.panel.selected + n - 1) % n, cx),
+            "1" | "2" | "3" | "4" | "5" | "6" => {
+                let idx = name.parse::<usize>().unwrap() - 1;
+                if idx < n {
+                    self.pick(idx, cx);
+                }
+            }
             "enter" | "return" => self.accept(window, cx),
             "cmd-c" => self.copy(cx),
             "escape" => self.go(false, window, cx),
@@ -495,9 +652,26 @@ impl OpeningView {
     }
 }
 
+/// The tones the panel should display right now: from settings (or `mock::tones()` under mock mode),
+/// always keeping Fix first and never returning an empty list.
+pub fn current_modes(cx: &App) -> Vec<crate::brain::Mode> {
+    if crate::mock::on() {
+        if let Some(b) = crate::brain::get(cx) {
+            let tones = b.read(cx).tones.clone();
+            if !tones.is_empty() {
+                return tones;
+            }
+        }
+        return crate::mock::tones();
+    }
+    let shown = crate::tones::ToneList::from_settings(&crate::app::settings()).shown();
+    if shown.is_empty() { vec![crate::brain::Mode::fix()] } else { shown }
+}
+
 impl Render for OpeningView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let frame_began = Instant::now();
+        crate::riso::let_go_of_last_frame(window);
         let t = self.t();
         let script = self.script();
         let scale = window.scale_factor();
@@ -519,20 +693,22 @@ impl Render for OpeningView {
             let e = entity.clone();
             crate::interact::act(move |window, cx| e.update(cx, |v, cx| v.accept(window, cx)))
         };
-        let look = crate::panel::Look { scale, icon: &crate::app_icon, pick: Some(&pick_fn), flight: self.flight, act: Some(act) };
+        let look = crate::panel::Look { scale, icon: &crate::app_icon, pick: Some(&pick_fn), act: Some(act) };
         let anim = self.anim.clone();
         let (panel, paper_h) = (self.panel.clone(), self.paper_h.clone());
-        let body = crate::interact::build(&anim, false, window, cx, || opening::scene(t, &script, &panel, &look, paper_h.get(), paper_h.clone(), rig.as_ref()));
+        let body = crate::interact::build(&anim, crate::live_slip::reduce_motion(), window, cx, || opening::scene(t, &script, &panel, &look, paper_h.get(), paper_h.clone(), rig.as_ref()));
 
         // Keep drawing while anything moves: the flower, the unroll, the waiting dots, the going.
-        let working = matches!(self.panel.phase, Phase::Generating(_));
-        if opening::rig_moving(t, &script) || t < 3.2 || working || self.went.is_some() {
+        let working = matches!(self.panel.phase, Phase::Preparing | Phase::Generating(_));
+        let unrolling = opening::unroll(t, &script).0 < 0.9999 && self.went.is_none();
+        if opening::rig_moving(t, &script) || unrolling || working || self.went.is_some() {
             window.request_animation_frame();
         } else if self.feed.shown.as_ref().is_none_or(|s| s.t < script.bloom + 2.15) {
             // The still flower is on its way.
             window.request_animation_frame();
         }
-        let trace = std::env::var("IRIS_TRACE").is_ok();
+        static TRACE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let trace = *TRACE_ENV.get_or_init(|| std::env::var("IRIS_TRACE").is_ok());
         let done = canvas(|_, _, _| (), move |_, _, _, _| {
             if trace {
                 eprintln!("frame cpu_ms={:.3} t={t:.3}", frame_began.elapsed().as_secs_f64() * 1000.0);
@@ -545,6 +721,7 @@ impl Render for OpeningView {
                     ("tab", true, _) => "shift-tab".to_string(),
                     ("r", _, true) => "cmd-r".to_string(),
                     ("c", _, true) => "cmd-c".to_string(),
+                    ("left" | "right", _, true) => String::new(),
                     (key, _, _) => key.to_string(),
                 };
                 // Handled: said so, or GPUI hands the same press on by its other routes (macOS
@@ -565,5 +742,47 @@ fn put_on_clipboard(text: &str) {
         crate::text_field::set_test_clipboard(text);
     } else {
         crate::textbridge::put_on_clipboard(text, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AnswerMemo, MEMO_LIMIT, memo_key};
+    use crate::brain::Mode;
+    use crate::model::Answer;
+
+    #[test]
+    fn answer_memo_lru_cap_and_remove() {
+        let mut memo = AnswerMemo::default();
+        for i in 0..(MEMO_LIMIT + 4) {
+            memo.put(format!("k{i}"), Answer::tone("a", &format!("v{i}"), false));
+        }
+        assert_eq!(memo.entries.len(), MEMO_LIMIT);
+        assert!(memo.get("k0").is_none() && memo.get("k3").is_none());
+        assert_eq!(memo.get("k4").unwrap().text, "v4");
+        // Re-putting an existing key refreshes its recency without growing past the cap.
+        memo.put("k4".into(), Answer::tone("a", "v4-fresh", false));
+        memo.put("k-new".into(), Answer::tone("a", "v-new", false));
+        assert_eq!(memo.entries.len(), MEMO_LIMIT);
+        assert_eq!(memo.get("k4").unwrap().text, "v4-fresh");
+        assert!(memo.get("k5").is_none());
+        memo.remove("k4");
+        assert!(memo.get("k4").is_none());
+        memo.clear();
+        assert!(memo.entries.is_empty());
+    }
+
+    #[test]
+    fn memo_key_separates_every_answer_input() {
+        let fix = Mode::fix();
+        let custom = Mode { id: "custom-1".into(), label: "Pirate".into(), instruction: "talk like a pirate".into() };
+        let custom_edited = Mode { instruction: "keep it subtle".into(), ..custom.clone() };
+        let base = memo_key("hello", &fix, &[], &[], "best");
+        assert_ne!(base, memo_key("hello!", &fix, &[], &[], "best"));
+        assert_ne!(base, memo_key("hello", &custom, &[], &[], "best"));
+        assert_ne!(memo_key("hello", &custom, &[], &[], "best"), memo_key("hello", &custom_edited, &[], &[], "best"));
+        assert_ne!(base, memo_key("hello", &fix, &["Iris".into()], &[], "best"));
+        assert_ne!(base, memo_key("hello", &fix, &[], &["keep it brief".into()], "best"));
+        assert_ne!(base, memo_key("hello", &fix, &[], &[], "lighter"));
     }
 }

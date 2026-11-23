@@ -8,7 +8,7 @@ import Testing
     /// back on new buttons. Buttons and links take the printed `PenArrow` (DESIGN.md,
     /// "Patterns we don't use").
     @Test func theStrokedCurlOnlyMarksThingsUp() throws {
-        let sources = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("../../Sources/Iris")
+        let sources = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("../../Sources/Iris").standardizedFileURL
         // Where it may be drawn: the hand-lettered label pointing at a box, the panel's red pen.
         let markingUp: Set = ["Zine.swift", "PanelView.swift"]
         let files = try FileManager.default.contentsOfDirectory(at: sources, includingPropertiesForKeys: nil)

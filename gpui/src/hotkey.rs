@@ -1,6 +1,7 @@
 //! The global shortcuts (`HotkeyCenter` in the Swift app): the open shortcut and Quick Fix,
-//! registered with Carbon's `RegisterEventHotKey`, the same key code and modifier mask the
-//! settings store. A shortcut another app already holds can't be registered: that's the
+//! registered with Carbon's `RegisterEventHotKey` on the Mac and `RegisterHotKey` on Windows,
+//! from the key code and modifier mask the settings store (on Windows the ⌘ bit is the Windows
+//! key: `keys.rs`). A shortcut another app already holds can't be registered: that's the
 //! "taken" state the slip and setup tell people about.
 //!
 //! Never under test (`IRIS_CONTROL`): a test drives the shortcuts' handlers itself, so the
@@ -20,7 +21,7 @@ pub enum Action {
 }
 
 thread_local! {
-    static PRESSED: RefCell<Vec<Action>> = const { RefCell::new(Vec::new()) };
+    static APP_CX: RefCell<Option<AsyncApp>> = const { RefCell::new(None) };
 }
 
 #[cfg(target_os = "macos")]
@@ -78,9 +79,160 @@ extern "C" fn on_hotkey(_call: carbon::EventHandlerCallRef, event: carbon::Event
     };
     if status == 0 && id.signature == carbon::SIGNATURE {
         let action = if id.id == Action::QuickFix as u32 { Action::QuickFix } else { Action::Open };
-        PRESSED.with(|p| p.borrow_mut().push(action));
+        APP_CX.with(|cell| {
+            if let Some(acx) = cell.borrow().clone() {
+                let acx_inner = acx.clone();
+                acx.foreground_executor()
+                    .spawn(async move {
+                        let _ = acx_inner.update(|cx| match action {
+                            Action::Open => crate::flow::open_panel(None, cx),
+                            Action::QuickFix => crate::flow::quick_fix(None, cx),
+                        });
+                    })
+                    .detach();
+            }
+        });
     }
     0
+}
+
+/// Windows: `RegisterHotKey` against a message-only window of Iris's own, whose messages GPUI's
+/// loop hands on like any of its windows'. WM_HOTKEY's id is the action.
+#[cfg(windows)]
+mod win {
+    use super::{Action, APP_CX};
+    use crate::store::{carbon, KeyCombo};
+    use windows::core::w;
+    use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, FindWindowExW, PostMessageW, RegisterClassW, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WM_APP, WM_HOTKEY, WNDCLASSW,
+    };
+
+    /// Another app holds it (ERROR_HOTKEY_ALREADY_REGISTERED).
+    const TAKEN: u32 = 1409;
+
+    thread_local! {
+        static WINDOW: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Another copy of Iris was opened (the Start menu, say): this one shows Settings instead.
+    const SHOW_SETTINGS: u32 = WM_APP + 7;
+
+    /// Hands `f` to GPUI on the main thread's next turn, as the Mac's Carbon handler does (the
+    /// window procedure runs inside Windows' message dispatch, not inside a GPUI update).
+    fn run(f: impl FnOnce(&mut gpui::App) + 'static) {
+        APP_CX.with(|cell| {
+            if let Some(acx) = cell.borrow().clone() {
+                let inner = acx.clone();
+                acx.foreground_executor().spawn(async move { let _ = inner.update(f); }).detach();
+            }
+        });
+    }
+
+    /// The window class, one per copy of Iris (the installed one and a development one apart).
+    fn class() -> Vec<u16> {
+        format!("IrisHotkeys-{}", crate::store::bundle_id()).encode_utf16().chain([0]).collect()
+    }
+
+    /// Whether this copy of Iris is already running: if so it's asked to show Settings.
+    pub fn already_running() -> bool {
+        let class = class();
+        unsafe {
+            match FindWindowExW(Some(HWND_MESSAGE), None, windows::core::PCWSTR(class.as_ptr()), None) {
+                Ok(h) if !h.0.is_null() => {
+                    let _ = PostMessageW(Some(h), SHOW_SETTINGS, WPARAM(0), LPARAM(0));
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+
+    unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if msg == SHOW_SETTINGS {
+            run(|cx| crate::open_settings(crate::settings::Page::General, cx));
+            return LRESULT(0);
+        }
+        if msg == WM_HOTKEY {
+            let action = if wparam.0 == Action::QuickFix as usize { Action::QuickFix } else { Action::Open };
+            eprintln!("hotkey: {action:?} pressed");
+            run(move |cx| match action {
+                Action::Open => crate::flow::open_panel(None, cx),
+                Action::QuickFix => crate::flow::quick_fix(None, cx),
+            });
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    fn window() -> HWND {
+        let made = WINDOW.with(|w| w.get());
+        if made != 0 {
+            return HWND(made as _);
+        }
+        unsafe {
+            let instance = GetModuleHandleW(None).unwrap_or_default();
+            let name = class();
+            let class = WNDCLASSW { lpfnWndProc: Some(proc_), hInstance: instance.into(), lpszClassName: windows::core::PCWSTR(name.as_ptr()), ..Default::default() };
+            RegisterClassW(&class);
+            let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), windows::core::PCWSTR(name.as_ptr()), w!("Iris shortcuts"), WINDOW_STYLE(0), 0, 0, 0, 0,
+                Some(HWND_MESSAGE), None, Some(instance.into()), None).unwrap_or_default();
+            WINDOW.with(|w| w.set(hwnd.0 as isize));
+            hwnd
+        }
+    }
+
+    /// The virtual-key code of a stored key (`app::key_name`), none for keys a shortcut can't use.
+    fn vk(k: KeyCombo) -> Option<u32> {
+        let name = crate::app::key_name(k.key_code);
+        let mut chars = name.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) if c.is_ascii_uppercase() || c.is_ascii_digit() => Some(c as u32),
+            _ => match name.as_str() {
+                "Space" => Some(0x20),
+                "↩" => Some(0x0D),
+                "⇥" => Some(0x09),
+                "esc" => Some(0x1B),
+                "⌫" => Some(0x08),
+                f if f.starts_with('F') => f[1..].parse::<u32>().ok().filter(|n| (1..=24).contains(n)).map(|n| 0x6F + n),
+                _ => None,
+            },
+        }
+    }
+
+    fn mods(k: KeyCombo) -> HOT_KEY_MODIFIERS {
+        let mut m = MOD_NOREPEAT;
+        for (bit, flag) in [(carbon::CONTROL, MOD_CONTROL), (carbon::OPTION, MOD_ALT), (carbon::SHIFT, MOD_SHIFT), (carbon::CMD, MOD_WIN)] {
+            if k.modifiers & bit != 0 {
+                m |= flag;
+            }
+        }
+        m
+    }
+
+    /// Registers `k` for `id`; Ok, or whether another app holds it.
+    pub fn register(k: KeyCombo, id: i32) -> Result<(), bool> {
+        let Some(code) = vk(k) else { return Err(false) };
+        unsafe {
+            RegisterHotKey(Some(window()), id, mods(k), code).map_err(|_| GetLastError().0 == TAKEN)
+        }
+    }
+
+    /// Makes the window now, so a second copy can find this one before any shortcut is set.
+    pub fn listen() {
+        let _ = window();
+    }
+
+    pub fn unregister(id: i32) {
+        unsafe {
+            let _ = UnregisterHotKey(Some(window()), id);
+        }
+    }
 }
 
 thread_local! {
@@ -94,9 +246,14 @@ thread_local! {
 pub fn apply(open: KeyCombo, quick_fix: Option<KeyCombo>) -> bool {
     #[cfg(target_os = "macos")]
     unsafe {
-        if !INSTALLED.with(|i| i.replace(true)) {
+        if !INSTALLED.with(|i| i.get()) {
             let spec = carbon::EventTypeSpec { event_class: carbon::EVENT_CLASS_KEYBOARD, event_kind: carbon::EVENT_HOTKEY_PRESSED };
-            carbon::InstallEventHandler(carbon::GetApplicationEventTarget(), on_hotkey, 1, &spec, std::ptr::null_mut(), std::ptr::null_mut());
+            let status = carbon::InstallEventHandler(carbon::GetApplicationEventTarget(), on_hotkey, 1, &spec, std::ptr::null_mut(), std::ptr::null_mut());
+            if status == 0 {
+                INSTALLED.with(|i| i.set(true));
+            } else {
+                eprintln!("hotkey: InstallEventHandler failed ({status})");
+            }
         }
         REGISTERED.with(|r| {
             for k in r.borrow_mut().drain(..) {
@@ -112,13 +269,31 @@ pub fn apply(open: KeyCombo, quick_fix: Option<KeyCombo>) -> bool {
             }
             status
         };
-        let taken = register(open, Action::Open) == carbon::HOTKEY_EXISTS;
+        let open_status = register(open, Action::Open);
+        let taken = open_status != 0;
+        if open_status != 0 && open_status != carbon::HOTKEY_EXISTS {
+            eprintln!("hotkey: open shortcut registration failed ({open_status})");
+        }
         if let Some(q) = quick_fix {
-            register(q, Action::QuickFix);
+            let q_status = register(q, Action::QuickFix);
+            if q_status != 0 {
+                eprintln!("hotkey: quick-fix shortcut registration failed ({q_status})");
+            }
         }
         taken
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        let _ = &INSTALLED;
+        win::unregister(Action::Open as i32);
+        win::unregister(Action::QuickFix as i32);
+        let taken = win::register(open, Action::Open as i32) == Err(true);
+        if let Some(q) = quick_fix {
+            let _ = win::register(q, Action::QuickFix as i32);
+        }
+        taken
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (open, quick_fix);
         false
@@ -134,22 +309,10 @@ pub fn start(cx: &mut App) {
         return;
     }
     let taken = apply(s.open_shortcut, s.quick_fix_shortcut);
-    let keys = crate::app::shortcut_caps(s.open_shortcut).concat();
+    let keys = crate::keys::inline(s.open_shortcut);
     eprintln!("hotkey: {keys} {}", if taken { "is taken by another app" } else { "registered" });
     crate::app::set_shortcut_taken(taken);
-    cx.spawn(async move |cx| {
-        loop {
-            cx.background_executor().timer(std::time::Duration::from_millis(15)).await;
-            let pressed: Vec<Action> = PRESSED.with(|p| p.borrow_mut().drain(..).collect());
-            for action in pressed {
-                let _ = cx.update(|cx| match action {
-                    Action::Open => crate::flow::open_panel(None, cx),
-                    Action::QuickFix => crate::flow::quick_fix(None, cx),
-                });
-            }
-        }
-    })
-    .detach();
+    APP_CX.with(|cell| *cell.borrow_mut() = Some(cx.to_async()));
 }
 
 /// Lets go of the shortcuts while a recorder listens, so the current keys can be pressed again
@@ -165,6 +328,11 @@ pub fn set_paused(paused: bool) {
                 unsafe { carbon::UnregisterEventHotKey(k) };
             }
         });
+        #[cfg(windows)]
+        {
+            win::unregister(Action::Open as i32);
+            win::unregister(Action::QuickFix as i32);
+        }
     } else {
         refresh();
     }
@@ -196,11 +364,29 @@ pub fn is_available(combo: KeyCombo) -> bool {
         if status == 0 {
             carbon::UnregisterEventHotKey(out);
         }
-        status != carbon::HOTKEY_EXISTS
+        status == 0
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        let free = win::register(combo, 99).is_ok();
+        win::unregister(99);
+        free
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = combo;
         true
     }
+}
+
+/// Windows: whether this copy of Iris already runs (it's asked to show Settings, and this one
+/// should quit), and the window a later copy looks for, made at once.
+#[cfg(windows)]
+pub fn already_running() -> bool {
+    win::already_running()
+}
+
+#[cfg(windows)]
+pub fn listen() {
+    win::listen()
 }

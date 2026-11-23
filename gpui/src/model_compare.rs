@@ -24,6 +24,14 @@ pub struct Strengths {
 impl Strengths {
     /// By the model's id (`ModelChoice`'s raw value).
     pub fn of(id: &str) -> Option<Strengths> {
+        // Windows: llama.cpp on the CPU, memory measured there (the server's working set).
+        if !crate::keys::is_mac() {
+            return match id {
+                "best" => Some(Strengths { english: 91, hindi: 85, seconds: 1.4, memory_gb: 5.5 }),
+                "lighter" => Some(Strengths { english: 87, hindi: 59, seconds: 0.6, memory_gb: 2.9 }),
+                _ => None,
+            };
+        }
         match id {
             "best" => Some(Strengths { english: 91, hindi: 85, seconds: 0.3, memory_gb: 3.7 }),
             "lighter" => Some(Strengths { english: 87, hindi: 59, seconds: 0.2, memory_gb: 2.9 }),
@@ -52,7 +60,17 @@ pub fn mac_memory_gb() -> u32 {
         unsafe { libc_sysctlbyname(name.as_ptr(), &mut size as *mut u64 as *mut _, &mut len, std::ptr::null_mut(), 0) };
         (size as f64 / 1_073_741_824.0).round() as u32
     }
-    #[cfg(not(target_os = "macos"))]
+    // Windows: the installed memory, as Task Manager rounds it.
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut m = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+        if unsafe { GlobalMemoryStatusEx(&mut m) }.is_ok() {
+            return (m.ullTotalPhys as f64 / 1_073_741_824.0).round() as u32;
+        }
+        16
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     16
 }
 
@@ -63,16 +81,24 @@ unsafe extern "C" {
 }
 
 /// `ModelChoice.recommended(memoryGB:)`: best quality with 16 GB or more (`roomyMemoryGB`).
+/// Windows: Lighter, whatever the memory (`LlamaModel.recommended`): on a CPU, Best came near its
+/// time limits on long drafts.
 pub fn recommended(memory_gb: u32) -> &'static str {
+    if !crate::keys::is_mac() {
+        return "lighter";
+    }
     if memory_gb >= 16 { "best" } else { "lighter" }
 }
 
 /// Why the recommended model suits this Mac (`recommendationLine`).
 pub fn recommendation_line(memory_gb: u32) -> String {
+    if !crate::keys::is_mac() {
+        return format!("This PC has {memory_gb} GB of memory. Lighter answers quicker on its processor; Best writes a little better, more slowly.");
+    }
     if recommended(memory_gb) == "best" {
-        format!("This Mac has {memory_gb} GB of memory, room for best quality.")
+        crate::words::ws(format!("This Mac has {memory_gb} GB of memory, room for best quality."))
     } else {
-        format!("This Mac has {memory_gb} GB of memory. Lighter leaves room for your other apps.")
+        crate::words::ws(format!("This Mac has {memory_gb} GB of memory. Lighter leaves room for your other apps."))
     }
 }
 

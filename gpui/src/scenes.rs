@@ -17,7 +17,7 @@ use crate::slip::{self, Engine, Slip, rows};
 pub fn build(name: &str, at: f64, scale: f32, paper_h: &Rc<Cell<f32>>) -> Option<AnyElement> {
     Some(match name {
         "opening-full" | "opening-quick" | "opening-away" => {
-            let look = panel::Look { scale, icon: &crate::app_icon, pick: None, flight: None, act: None };
+            let look = panel::Look { scale, icon: &crate::app_icon, pick: None, act: None };
             let script = match name { "opening-quick" => opening::QUICK, "opening-away" => opening::AWAY, _ => opening::FULL };
             let (w, h, rgba) = opening::rig_rgba(at, &script, scale);
             let rig = riso::image(w, h, rgba);

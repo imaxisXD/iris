@@ -498,21 +498,25 @@ impl Tile {
         let ty = y.rem_euclid(self.h as i64) as usize;
         self.px[ty * self.w + tx]
     }
-    /// The tile at (`u`, `v`) in its own pixels.
-    fn sample(&self, u: f64, v: f64) -> [f32; 4] {
-        if TILE_FILTER.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+    /// The tile at (`u`, `v`) in its own pixels, with caller-hoisted filter mode.
+    #[inline(always)]
+    fn sample_with_filter(&self, u: f64, v: f64, filter: u8) -> [f32; 4] {
+        if filter == 0 {
             return self.at(u.floor() as i64, v.floor() as i64);
         }
         let (w, h) = (self.w as f64, self.h as f64);
-        if TILE_FILTER.load(std::sync::atomic::Ordering::Relaxed) == 2 {
+        if filter == 2 {
             // Each tile smoothed on its own, clamped at its edges: the seams don't blend.
+            // Coordinates are already in [0, w-1] × [0, h-1], so index directly without rem_euclid.
             let (lu, lv) = (u - (u / w).floor() * w - 0.5, v - (v / h).floor() * h - 0.5);
             let (lu, lv) = (lu.clamp(0.0, w - 1.0), lv.clamp(0.0, h - 1.0));
-            let (x0, y0) = (lu.floor(), lv.floor());
-            let (fx, fy) = ((lu - x0) as f32, (lv - y0) as f32);
-            let (x0, y0) = (x0 as i64, y0 as i64);
-            let (x1, y1) = ((x0 + 1).min(self.w as i64 - 1), (y0 + 1).min(self.h as i64 - 1));
-            let (a, b, c, d) = (self.at(x0, y0), self.at(x1, y0), self.at(x0, y1), self.at(x1, y1));
+            let (x0f, y0f) = (lu.floor(), lv.floor());
+            let (fx, fy) = ((lu - x0f) as f32, (lv - y0f) as f32);
+            let (x0, y0) = (x0f as usize, y0f as usize);
+            let (x1, y1) = ((x0 + 1).min(self.w - 1), (y0 + 1).min(self.h - 1));
+            let r0 = y0 * self.w;
+            let r1 = y1 * self.w;
+            let (a, b, c, d) = (self.px[r0 + x0], self.px[r0 + x1], self.px[r1 + x0], self.px[r1 + x1]);
             let mut out = [0f32; 4];
             for i in 0..4 {
                 let top = a[i] + (b[i] - a[i]) * fx;
@@ -538,6 +542,16 @@ impl Tile {
 
 struct Canvas {
     pm: Pixmap,
+    /// Reused per-call raster mask so tiled fills don't allocate+free 50+ full-canvas masks per frame.
+    scratch: Mask,
+}
+
+impl Canvas {
+    fn new(w: u32, h: u32) -> Canvas {
+        let w = w.max(1);
+        let h = h.max(1);
+        Canvas { pm: Pixmap::new(w, h).unwrap(), scratch: Mask::new(w, h).unwrap() }
+    }
 }
 
 fn color(c: Rgb, alpha: f32) -> Paint<'static> {
@@ -609,6 +623,74 @@ impl Canvas {
         self.stroke_skia(ctx, path, c, alpha, &s);
     }
 
+    fn path_pixel_bounds(&self, ctx: &Ctx, path: &tiny_skia::Path) -> (usize, usize, usize, usize) {
+        let (w, h) = (self.pm.width() as usize, self.pm.height() as usize);
+        let b = path.bounds();
+        let corners = [(b.left(), b.top()), (b.right(), b.top()), (b.left(), b.bottom()), (b.right(), b.bottom())]
+            .map(|(x, y)| ctx.ts.apply(x as f64, y as f64));
+        let x0 = corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min).floor().max(0.0) as usize;
+        let x1 = (corners.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max).ceil() + 1.0).min(w as f64).max(0.0) as usize;
+        let y0 = corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min).floor().max(0.0) as usize;
+        let y1 = (corners.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max).ceil() + 1.0).min(h as f64).max(0.0) as usize;
+        (x0, x1, y0, y1)
+    }
+
+    fn composite_tiled_mask(
+        pm: &mut Pixmap,
+        inv: &Affine,
+        md: &[u8],
+        clip: Option<&[u8]>,
+        bounds: (usize, usize, usize, usize),
+        tile: &Tile,
+        opacity: f32,
+    ) {
+        let (x0, x1, y0, y1) = bounds;
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let w = pm.width() as usize;
+        let data = pm.data_mut();
+        let filter = TILE_FILTER.load(std::sync::atomic::Ordering::Relaxed);
+        let inv_pitch = 1.0 / tile.pitch;
+        let du_dx = inv.a * inv_pitch;
+        let dv_dx = inv.b * inv_pitch;
+        let op_scale = opacity / 255.0;
+        for y in y0..y1 {
+            let row = y * w;
+            let (mut u, mut v) = inv.apply(x0 as f64 + 0.5, y as f64 + 0.5);
+            u *= inv_pitch;
+            v *= inv_pitch;
+            for x in x0..x1 {
+                let mut cov = md[row + x];
+                if cov != 0 {
+                    if let Some(cd) = clip {
+                        cov = ((cov as u32 * cd[row + x] as u32 + 127) / 255) as u8;
+                    }
+                    if cov != 0 {
+                        let s = tile.sample_with_filter(u, v, filter);
+                        if !(s[3] == 0.0 && s[0] == 0.0 && s[1] == 0.0 && s[2] == 0.0) {
+                            let k = cov as f32 * op_scale;
+                            let sa = s[3] / 255.0 * k;
+                            let inv_sa = 1.0 - sa;
+                            let o = (row + x) * 4;
+                            for i in 0..4 {
+                                let d = data[o + i] as f32;
+                                let val = s[i] * k + d * inv_sa;
+                                data[o + i] = val.round().clamp(0.0, 255.0) as u8;
+                            }
+                            let a = data[o + 3];
+                            for i in 0..3 {
+                                data[o + i] = data[o + i].min(a);
+                            }
+                        }
+                    }
+                }
+                u += du_dx;
+                v += dv_dx;
+            }
+        }
+    }
+
     /// `fill(path, with: .tiledImage(tile))` at `opacity`, the tile's origin at the context's
     /// origin, sampled at each pixel's centre (no smoothing), composited source-over in
     /// premultiplied bytes as CoreGraphics does.
@@ -617,44 +699,50 @@ impl Canvas {
             return;
         }
         let Some(inv) = ctx.ts.invert() else { return };
-        let m = self.mask(ctx, path);
-        let (w, h) = (self.pm.width() as usize, self.pm.height() as usize);
-        // Only the rows and columns the path can reach.
-        let b = path.bounds();
-        let corners = [(b.left(), b.top()), (b.right(), b.top()), (b.left(), b.bottom()), (b.right(), b.bottom())]
-            .map(|(x, y)| ctx.ts.apply(x as f64, y as f64));
-        let x0 = corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min).floor().max(0.0) as usize;
-        let x1 = (corners.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max).ceil() + 1.0).min(w as f64).max(0.0) as usize;
-        let y0 = corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min).floor().max(0.0) as usize;
-        let y1 = (corners.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max).ceil() + 1.0).min(h as f64).max(0.0) as usize;
-        let md = m.data();
-        let data = self.pm.data_mut();
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let cov = md[y * w + x];
-                if cov == 0 {
-                    continue;
-                }
-                let (ux, uy) = inv.apply(x as f64 + 0.5, y as f64 + 0.5);
-                let s = tile.sample(ux / tile.pitch, uy / tile.pitch);
-                let k = cov as f32 / 255.0 * opacity;
-                let sa = s[3] / 255.0 * k;
-                if s[3] == 0.0 && s[0] == 0.0 && s[1] == 0.0 && s[2] == 0.0 {
-                    continue;
-                }
-                let o = (y * w + x) * 4;
-                for i in 0..4 {
-                    let d = data[o + i] as f32;
-                    let v = s[i] * k + d * (1.0 - sa);
-                    data[o + i] = v.round().clamp(0.0, 255.0) as u8;
-                }
-                // Keep premultiplied colour within its alpha.
-                let a = data[o + 3];
-                for i in 0..3 {
-                    data[o + i] = data[o + i].min(a);
-                }
-            }
+        let bounds = self.path_pixel_bounds(ctx, path);
+        if bounds.0 >= bounds.1 || bounds.2 >= bounds.3 {
+            return;
         }
+        self.scratch.data_mut().fill(0);
+        self.scratch.fill_path(path, FillRule::Winding, true, ctx.ts.skia());
+        Self::composite_tiled_mask(
+            &mut self.pm,
+            &inv,
+            self.scratch.data(),
+            ctx.clip.as_deref().map(Mask::data),
+            bounds,
+            tile,
+            opacity,
+        );
+    }
+
+    /// Composite two tiled layers over one rasterized mask (used by `fill_pink_skia`).
+    fn fill_tiled_pair(&mut self, ctx: &Ctx, path: &tiny_skia::Path, t1: &Tile, o1: f32, t2: &Tile, o2: f32) {
+        if !ctx.ok() {
+            return;
+        }
+        let Some(inv) = ctx.ts.invert() else { return };
+        let bounds = self.path_pixel_bounds(ctx, path);
+        if bounds.0 >= bounds.1 || bounds.2 >= bounds.3 {
+            return;
+        }
+        self.scratch.data_mut().fill(0);
+        self.scratch.fill_path(path, FillRule::Winding, true, ctx.ts.skia());
+        let clip = ctx.clip.as_deref().map(Mask::data);
+        Self::composite_tiled_mask(&mut self.pm, &inv, self.scratch.data(), clip, bounds, t1, o1);
+        Self::composite_tiled_mask(&mut self.pm, &inv, self.scratch.data(), clip, bounds, t2, o2);
+    }
+
+    /// Composite a tiled layer directly against `ctx.clip` (no extra mask rasterization needed
+    /// when the filled area strictly covers the clip, e.g. `fill_screen`'s outer band).
+    fn fill_tiled_clipped(&mut self, ctx: &Ctx, bounds_path: &tiny_skia::Path, tile: &Tile, opacity: f32) {
+        if !ctx.ok() {
+            return;
+        }
+        let Some(inv) = ctx.ts.invert() else { return };
+        let Some(clip) = ctx.clip.as_deref() else { return };
+        let bounds = self.path_pixel_bounds(ctx, bounds_path);
+        Self::composite_tiled_mask(&mut self.pm, &inv, clip.data(), None, bounds, tile, opacity);
     }
 }
 
@@ -750,11 +838,15 @@ fn fill_screen(cv: &mut Canvas, ctx: &Ctx, path: &P, reg: (f64, f64), tone: Tone
     let moved = path.offset(reg.0, reg.1);
     let g = cv.clip(ctx, &moved);
     let bands = [(1.0, 0.0), (0.84, 0.25), (0.69, 0.5), (0.55, 0.75), (0.42, 1.0)];
+    let moved_skia = moved.skia();
     for (shrink, m) in bands {
-        let area = if shrink == 1.0 { P::rect(moved.bounds().inset(-4.0)) } else { path.scaled(shrink).offset(reg.0, reg.1) };
         let ink = along(tone.ramp, m);
         let tile = dots(ink, tone.tip + (tone.base - tone.tip) * m);
-        if let Some(a) = area.skia() {
+        if shrink == 1.0 {
+            if let Some(ms) = &moved_skia {
+                cv.fill_tiled_clipped(&g, ms, &tile, 1.0);
+            }
+        } else if let Some(a) = path.scaled(shrink).offset(reg.0, reg.1).skia() {
             cv.fill_tiled(&g, &a, &tile, 1.0);
         }
     }
@@ -774,8 +866,7 @@ fn fill_pink_skia(cv: &mut Canvas, ctx: &Ctx, moved: &tiny_skia::Path) {
     }
     cv.pm.fill_path(moved, &color(PINK, 1.0), FillRule::Winding, ctx.ts.skia(), ctx.clip.as_deref());
     // Clipped to the shape, the grained box round it is the shape itself.
-    SALT.with(|t| cv.fill_tiled(ctx, moved, t, 0.18));
-    GRAIN.with(|t| cv.fill_tiled(ctx, moved, t, 0.45));
+    SALT.with(|salt| GRAIN.with(|grain| cv.fill_tiled_pair(ctx, moved, salt, 0.18, grain, 0.45)));
 }
 
 // MARK: - The pen
@@ -1537,7 +1628,7 @@ fn straight(pm: &Pixmap) -> Vec<u8> {
 /// (`dx`, `dy`), `size` the flower's size (92 is the rig's own) at `scale` pixels per point.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_rig_at(clock: &RigClock, size: f32, scale: f32, w: u32, h: u32, dx: f64, dy: f64) -> Vec<u8> {
-    let mut cv = Canvas { pm: Pixmap::new(w.max(1), h.max(1)).unwrap() };
+    let mut cv = Canvas::new(w, h);
     let ctx = Ctx { ts: Affine::IDENTITY.translate(dx, dy).scale(scale as f64, scale as f64), clip: None };
     draw(&mut cv, &ctx, &Pose::new(clock), size as f64 / 92.0);
     straight(&cv.pm)
@@ -1563,7 +1654,7 @@ pub fn flower(points: f32, crop: Crop, open: bool, scale: f32) -> (u32, u32, Vec
     };
     let s = scale as f64 * points as f64 / side;
     let px = (side * s).round() as u32;
-    let mut cv = Canvas { pm: Pixmap::new(px.max(1), px.max(1)).unwrap() };
+    let mut cv = Canvas::new(px, px);
     let ctx = Ctx { ts: Affine::IDENTITY.scale(s, s).translate(-x, -y), clip: None };
     draw(&mut cv, &ctx, &Pose::new(&clock), 1.0);
     (px, px, straight(&cv.pm))

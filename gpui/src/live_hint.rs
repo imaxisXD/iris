@@ -1,7 +1,9 @@
 //! The note under the menu bar flower (`MenuBarHint`): "find me up here" and the keys that open
 //! Iris, said once when setup finishes (or other news from the menu bar). It hangs from the
 //! flower by its tail for eight seconds, fading in and out as the messages do, and goes at once
-//! on a click anywhere. Never takes the keyboard.
+//! on a click anywhere. Never takes the keyboard. Windows has no menu bar: there the news is a
+//! message standing on the taskbar by the clock (`show`).
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
 
 use std::time::{Duration, Instant};
 
@@ -70,6 +72,23 @@ pub fn find_me(cx: &mut App) {
 /// Hangs the note from the flower: `lead` and `detail` in place of "find me up here" and "In
 /// any text box, press" for other news.
 pub fn show(keys: Vec<String>, lead: Option<String>, detail: Option<String>, cx: &mut App) {
+    // Windows: no menu bar to hang from; the news is a message standing on the taskbar at the
+    // bottom right, by the clock where Iris's icon is.
+    #[cfg(windows)]
+    {
+        let lead = lead.unwrap_or_else(|| "find me by the clock".into());
+        let detail = detail.unwrap_or_else(|| "In any text box, press".into());
+        let [vx, vy, vw, vh] = crate::visible_frame_at(1.0, 1.0);
+        let corner = [vx + vw - 13.0, vy + vh - 8.0, 1.0, 1.0];
+        crate::notes_live::show(crate::toast::Message::news(&lead, &detail, keys, 8.0), None, Some(corner), cx);
+        return;
+    }
+    #[cfg(not(windows))]
+    show_under_flower(keys, lead, detail, cx)
+}
+
+#[cfg(not(windows))]
+fn show_under_flower(keys: Vec<String>, lead: Option<String>, detail: Option<String>, cx: &mut App) {
     close(cx);
     let [x, y, w, h] = crate::menubar::anchor();
     let refs: Vec<&str> = keys.iter().map(String::as_str).collect();

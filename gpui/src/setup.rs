@@ -57,9 +57,9 @@ impl Failure {
     /// What to do, after a lead that already says what happened.
     pub fn next_step(self) -> String {
         match self {
-            Failure::NoRoom { needed, free } => format!("The model needs {needed} free, and this Mac has {free}. Free up some space."),
+            Failure::NoRoom { needed, free } => crate::words::ws(format!("The model needs {needed} free, and this Mac has {free}. Free up some space.")),
             Failure::Offline => "The model downloads once and needs the internet for that. It picks up where it stopped.".into(),
-            Failure::NotDownloaded => "Open the menu bar flower and finish setup to download it.".into(),
+            Failure::NotDownloaded => crate::words::w("Open the menu bar flower and finish setup to download it.").into(),
             Failure::Other => "Something got in the way. Try again in a moment; it picks up where it stopped.".into(),
         }
     }
@@ -110,7 +110,18 @@ pub enum Step {
 
 pub const STEPS: [Step; 3] = [Step::Allow, Step::Model, Step::TryIt];
 
+/// The steps this computer's setup has: Windows asks no permission to read text, so it has no
+/// Allow step (it's always done there, and never shown).
+pub fn steps() -> &'static [Step] {
+    if crate::keys::is_mac() { &STEPS } else { &STEPS[1..] }
+}
+
 impl Step {
+    /// The step's number as setup shows it: 1 to 3 on the Mac, 1 to 2 on Windows.
+    pub fn number(self) -> i32 {
+        if crate::keys::is_mac() { self as i32 } else { self as i32 - 1 }
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             Step::Allow => "Allow",
@@ -282,37 +293,37 @@ fn key_refs(v: &[(Option<String>, String)]) -> Vec<(Option<&str>, &str)> {
     v.iter().map(|(s, w)| (s.as_deref(), w.as_str())).collect()
 }
 
-fn open_keys(state: &SetupState) -> Vec<(Option<&str>, &str)> {
+fn open_keys(state: &SetupState) -> Vec<(Option<String>, String)> {
     match &state.live {
-        Some(l) => key_refs(&l.open_keys),
+        Some(l) => l.open_keys.clone(),
         // A preview shows the keys the settings have, as Swift's does; a snapshot keeps ⌃⌥G.
-        None => crate::slip::told_keys().map_or(OPEN_KEYS.to_vec(), |(open, _)| open.into_iter().map(word_of).collect()),
+        None => crate::slip::told_keys().map_or_else(
+            || default_keys(crate::keys::open_default()).into_iter().map(|(s, w)| (s.map(str::to_string), w.to_string())).collect(),
+            |(open, _)| open.into_iter().map(word_of).collect(),
+        ),
     }
 }
 
-fn quick_keys(state: &SetupState) -> Option<Vec<(Option<&str>, &str)>> {
+fn quick_keys(state: &SetupState) -> Option<Vec<(Option<String>, String)>> {
     match &state.live {
-        Some(l) => l.quick_keys.as_deref().map(key_refs),
+        Some(l) => l.quick_keys.clone(),
         None => match crate::slip::told_keys() {
             Some((_, quick)) => quick.map(|q| q.into_iter().map(word_of).collect()),
-            None => Some(QUICK_KEYS.to_vec()),
+            None => Some(default_keys(crate::keys::quick_fix_default()).into_iter().map(|(s, w)| (s.map(str::to_string), w.to_string())).collect()),
         },
     }
 }
 
 /// A keycap as setup labels it: (symbol, word) for a modifier, (none, key) for the key.
-fn word_of(cap: &'static str) -> (Option<&'static str>, &'static str) {
-    match cap {
-        "⌃" => (Some(cap), "control"),
-        "⌥" => (Some(cap), "option"),
-        "⇧" => (Some(cap), "shift"),
-        "⌘" => (Some(cap), "command"),
-        _ => (None, cap),
+fn word_of(cap: String) -> (Option<String>, String) {
+    match crate::keys::word(&cap) {
+        Some(w) => (Some(cap), w.to_string()),
+        None => (None, cap),
     }
 }
 
 fn chosen(state: &SetupState) -> usize {
-    state.live.as_ref().map_or(CHOSEN, |l| l.chosen)
+    state.live.as_ref().map_or_else(default_model, |l| l.chosen)
 }
 
 const FIXED: &str = "hey, I have checked the PR and it looks fine, but one thing needs to change before merge";
@@ -360,18 +371,32 @@ const MODELS: [Model; 2] = [
     Model { id: "best", name: "Best quality", model_bytes: 4.58e9, download_bytes: 4.78e9 },
     Model { id: "lighter", name: "Lighter", model_bytes: 3.77e9, download_bytes: 3.97e9 },
 ];
-const CHOSEN: usize = 0;
+
+/// Windows' models: the same two, as the GGUF files llama.cpp reads (one file each, no drafter).
+const WINDOWS_MODELS: [Model; 2] = [
+    Model { id: "best", name: "Best quality", model_bytes: 4.58e9, download_bytes: 4.58e9 },
+    Model { id: "lighter", name: "Lighter", model_bytes: 2.81e9, download_bytes: 2.81e9 },
+];
+
+/// The models this computer's setup offers.
+fn models() -> &'static [Model; 2] {
+    if crate::keys::is_mac() { &MODELS } else { &WINDOWS_MODELS }
+}
+/// Without the app's facts (a snapshot): Best on the Mac, Lighter on Windows, where Best on a
+/// CPU came near its time limits.
+fn default_model() -> usize {
+    if crate::keys::is_mac() { 0 } else { 1 }
+}
 
 /// Where the model named `id` is in `MODELS`.
 pub fn model_index(id: &str) -> Option<usize> {
-    MODELS.iter().position(|m| m.id == id)
+    models().iter().position(|m| m.id == id)
 }
 
 /// The id of `MODELS[i]`.
 pub fn model_id(i: usize) -> &'static str {
-    MODELS[i.min(MODELS.len() - 1)].id
+    models()[i.min(models().len() - 1)].id
 }
-const RECOMMENDED: usize = 0;
 
 impl Model {
     fn figure(&self) -> String {
@@ -387,9 +412,14 @@ impl Model {
 }
 
 /// The shortcuts as keys you press: (symbol, word).
-const OPEN_KEYS: [(Option<&str>, &str); 3] = [(Some("⌃"), "control"), (Some("⌥"), "option"), (None, "G")];
-const QUICK_KEYS: [(Option<&str>, &str); 4] = [(Some("⌃"), "control"), (Some("⌥"), "option"), (Some("⇧"), "shift"), (None, "G")];
-const RETURN_KEY: [(Option<&str>, &str); 1] = [(Some("↩"), "return")];
+/// A default shortcut as setup labels it (⌃⌥G and ⌃⌥⇧G on the Mac, as Swift's snapshot has them).
+fn default_keys(k: crate::store::KeyCombo) -> Vec<(Option<&'static str>, &'static str)> {
+    crate::tones::caps(k)
+}
+/// Return as setup labels it: ↩ with its word on the Mac, Enter on Windows.
+fn return_key() -> Vec<(Option<&'static str>, &'static str)> {
+    if crate::keys::is_mac() { vec![(Some("↩"), "return")] } else { vec![(None, "Enter")] }
+}
 
 // MARK: - Type
 
@@ -600,7 +630,7 @@ fn fixed_w(p: &Progress, scale: f32) -> f32 {
 
 fn page(p: &Progress, state: &SetupState, look: &Look) -> (Div, f32) {
     let page_w = look.col + BESIDE;
-    let (head, head_h) = running_head(&["Setup", if p.is_returning() { "One step" } else { "About five minutes" }, "Everything runs on this Mac"], look.head);
+    let (head, head_h) = running_head(&["Setup", if p.is_returning() { "One step" } else { "About five minutes" }, crate::words::w("Everything runs on this Mac")], look.head);
     let (step, step_h) = step_page(p, state, look);
     let (list, list_h) = step_list(p, look.scale);
     let body_h = step_h.max(list_h);
@@ -1156,7 +1186,7 @@ fn allow_page(p: &Progress, look: &Look) -> (Div, f32) {
 
 fn model_page(p: &Progress, state: &SetupState, look: &Look) -> (Div, f32) {
     let (w, s) = (look.col, look.scale);
-    let m = &MODELS[chosen(state)];
+    let m = &models()[chosen(state)];
     let mut st = Stack::new(w, 10.0);
     let drawing = (p.0.activity != Activity::None).then(|| crate::pages::model::chip(76, DRAWING_TURN, s));
     st.push(headline(["Get", "✻ the model"], drawing, w, s));
@@ -1165,7 +1195,7 @@ fn model_page(p: &Progress, state: &SetupState, look: &Look) -> (Div, f32) {
             st.push(body_para(&format!("Downloading {}, one time.", m.name.to_lowercase()), hue::I11, w, true));
             st.push((crate::slip::progress_track(f, w, s), 18.0));
             st.push((t(m.downloaded(f), caption(), hue::I10), 11.0 * MONO_LINE));
-            st.push(body_para("You can close this window. When the model's in, the menu bar flower will say so.", hue::I11, w, true));
+            st.push(body_para(crate::words::w("You can close this window. When the model's in, the menu bar flower will say so."), hue::I11, w, true));
             let (stop, _) = secondary_button("Stop download", 32.0, Act::StopDownload, "stop", s);
             st.push((stop, 32.0));
         }
@@ -1215,7 +1245,7 @@ fn model_chooser(state: &SetupState, scale: f32) -> (Div, f32) {
     use crate::pages::model::{chip, recommended_mark, ring, stacked_figure};
     let mut r = div();
     let mut h: f32 = 0.0;
-    for (i, m) in MODELS.iter().enumerate() {
+    for (i, m) in models().iter().enumerate() {
         let chosen = i == self::chosen(state);
         let on_disk = state.live.as_ref().is_some_and(|l| l.on_disk[i]);
         let first = i == 0;
@@ -1244,7 +1274,7 @@ fn model_chooser(state: &SetupState, scale: f32) -> (Div, f32) {
             opt.push((b, 26.0));
         }
         let (mut o, oh) = opt.done();
-        if i == state.live.as_ref().map_or(RECOMMENDED, |l| l.recommended) {
+        if i == state.live.as_ref().map_or_else(default_model, |l| l.recommended) {
             // Rune scales the mark 0.85 from its top left: laid out at 0.85 here.
             o = o.child(at(with_zoom(0.85, || recommended_mark(scale)), 84.0, 0.0));
         }
@@ -1258,18 +1288,19 @@ fn try_page(state: &SetupState, look: &Look) -> (Div, f32) {
     let (w, s) = (look.col, look.scale);
     let mut st = Stack::new(w, 12.0);
     st.push(headline(["Try", "✻ it once"], Some(tones_drawing(s)), w, s));
+    let open = open_keys(state);
     if state.shortcut_taken {
         st.push(problem_line("another app took these keys", s));
-        let shown: String = open_keys(state).iter().map(|(sym, word)| sym.unwrap_or(word)).collect();
+        let shown: String = open.iter().map(|(sym, word)| sym.as_deref().unwrap_or(word.as_str())).collect();
         st.push(body_para(&format!("{shown} is in use by another app, so it can't open Iris. Pick other keys, then come back."), hue::I11, w, true));
         let (b, _) = primary("Change shortcut", None, Act::ChangeShortcut, s);
         st.push((b, 32.0));
     }
-    st.push(key_line("Click in the box and press", &open_keys(state), None, false, w, s));
+    st.push(key_line("Click in the box and press", &key_refs(&open), None, false, w, s));
     st.push(practice_box(w, state.live.as_ref().and_then(|l| l.practice.as_ref()), s));
-    st.push(key_line("In the panel, press", &RETURN_KEY, Some("to replace it."), false, w, s));
+    st.push(key_line("In the panel, press", &return_key(), Some("to replace it."), false, w, s));
     if let Some(quick) = quick_keys(state) {
-        st.push(key_line("Skip the panel with Quick Fix:", &quick, None, true, w, s));
+        st.push(key_line("Skip the panel with Quick Fix:", &key_refs(&quick), None, true, w, s));
     }
     st.done()
 }
@@ -1335,7 +1366,12 @@ fn done_page(state: &SetupState, look: &Look) -> (Div, f32) {
         let (note, _) = done_note("that's it", 26.0, s);
         st.push((note, line_box(26.0, BRUSH_LINE)));
     }
-    st.push(key_line("Same keys in any app:", &open_keys(state), None, false, w, s));
+    let open = open_keys(state);
+    st.push(key_line("Same keys in any app:", &key_refs(&open), None, false, w, s));
+    // Windows tucks a new app's icon under the ^ arrow by the clock: say where Iris is.
+    if !crate::keys::is_mac() {
+        st.push(caption_para("Iris lives by the clock. Windows hides new icons under the ^ arrow: drag Iris's flower onto the taskbar to keep it in view.", hue::I10, w, false));
+    }
     let (b, bw) = primary("Done", None, Act::Done, s);
     st.push((sized(bw, 36.0).child(at(b, 0.0, 4.0)), 36.0));
     st.done()
@@ -1348,10 +1384,12 @@ fn step_list(p: &Progress, scale: f32) -> (Div, f32) {
     let mut e = div();
     let mut y = 0.0;
     let title_h = brush_line_h(21.0, scale);
-    for step in STEPS {
+    for &step in steps() {
         let status = p.status(step);
         let strong = matches!(status, Status::Now | Status::Stuck);
+        // `n` seeds the pen and names the row for tests; `shown` is the number people read.
         let n = step as i64;
+        let shown = step.number();
         // The folio on the title's first baseline.
         let folio_y = brush_base(21.0, scale) - mono_base(11.0);
         let mut title = sized(LIST_W - 30.0, title_h);
@@ -1371,9 +1409,9 @@ fn step_list(p: &Progress, scale: f32) -> (Div, f32) {
         let folio_w = mono_w("01", 11.0, 0.0);
         let row_h = 10.0 + title_h + 3.0 + word_h + 10.0 - if status == Status::Later { 1.0 } else { 1.5 };
         let row = sized(LIST_W, row_h)
-            .child(at(t(format!("{n:02}"), caption(), ink::PINK_TEXT), 0.0, 10.0 + folio_y))
+            .child(at(t(format!("{shown:02}"), caption(), ink::PINK_TEXT), 0.0, 10.0 + folio_y))
             .child(at(words, folio_w + 10.0, 10.0));
-        e = e.child(at(labelled(row, format!("setup-step-{n}"), Role::Label, format!("Step {n}, {}", step.title())), 0.0, y));
+        e = e.child(at(labelled(row, format!("setup-step-{n}"), Role::Label, format!("Step {shown}, {}", step.title())), 0.0, y));
         y += row_h;
         e = e.child(at(pen_rule(60 + n * 3, LIST_W, over(hue::I12, 0.3, ink::PAPER), 1.0), 0.0, y));
         y += 3.0;
@@ -1391,7 +1429,7 @@ fn status_word(status: Status, step: Step, scale: f32) -> (Div, f32) {
         Status::Now => (t("now", brush_px(18.0, scale), ink::PINK_TEXT), bh),
         Status::Stuck => (t(step.stuck_word(), brush_px(18.0, scale), hue::RED_TEXT), bh),
         Status::Later => {
-            let words = format!("AFTER {}", step as i32 - 1);
+            let words = format!("AFTER {}", step.number() - 1);
             (t(words, caption().tracked(1.3), hue::I10), 11.0 * MONO_LINE)
         }
     }
@@ -1402,7 +1440,7 @@ fn status_word(status: Status, step: Step, scale: f32) -> (Div, f32) {
 /// The big folio for the step; Set up later only on a stuck step; Open at login once there's
 /// something to open. On one last baseline, 6 points under the page.
 fn foot(p: &Progress, state: &SetupState, w: f32, scale: f32) -> (Div, f32) {
-    let folio = format!("/0{}", p.current().map_or(3, |s| s as i32));
+    let folio = format!("/0{}", p.current().map_or(steps().len() as i32, |s| s.number()));
     // The folio's line on whole points (55.2 takes 56).
     let fh = line_box(46.0, MONO_LINE);
     let mut bottom = 6.0 + fh;

@@ -21,20 +21,46 @@
 
 import Foundation
 import IrisCore
-import IrisEngine
-import IrisSpelling
+#if os(Windows)
+import ucrt
+#endif
 
 // MARK: - Out
 
-/// Writes one line of JSON to stdout, one writer at a time.
+/// Writes one line of JSON to the original stdout pipe, one writer at a time.
+/// Duplicates fd 1 and redirects fd 1 → stderr so stray `print()` calls from any library
+/// can never corrupt the JSON-lines IPC stream.
 final class Out: @unchecked Sendable {
     static let shared = Out()
     private let lock = NSLock()
+    private let pipe: FileHandle
+
+    private init() {
+        #if os(Windows)
+        // The C runtime's names; it has no STDOUT_FILENO (stdout is 1, stderr 2).
+        let dupFd = _dup(1)
+        if dupFd >= 0 {
+            _ = _dup2(2, 1)
+            pipe = FileHandle(fileDescriptor: dupFd, closeOnDealloc: true)
+        } else {
+            pipe = FileHandle.standardOutput
+        }
+        #else
+        let dupFd = dup(STDOUT_FILENO)
+        if dupFd >= 0 {
+            _ = dup2(STDERR_FILENO, STDOUT_FILENO)
+            pipe = FileHandle(fileDescriptor: dupFd, closeOnDealloc: true)
+        } else {
+            pipe = FileHandle.standardOutput
+        }
+        #endif
+    }
+
     func send(_ object: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return }
         lock.lock()
-        FileHandle.standardOutput.write(data)
-        FileHandle.standardOutput.write(Data([0x0A]))
+        pipe.write(data)
+        pipe.write(Data([0x0A]))
         lock.unlock()
     }
 }
@@ -42,15 +68,16 @@ final class Out: @unchecked Sendable {
 func log(_ s: String) {
     FileHandle.standardError.write(("brain: " + s + "\n").data(using: .utf8)!)
 }
+// The engine (`Engines.swift`): MLX on the Mac, llama.cpp on Windows.
 
 // MARK: - Encoding
 
-func encode(_ state: EngineState) -> [String: Any] {
+func encode(_ state: BrainState) -> [String: Any] {
     switch state {
     case .idle: return ["event": "state", "state": "idle"]
     case .downloading(let f): return ["event": "state", "state": "downloading", "fraction": f]
     case .loading: return ["event": "state", "state": "loading"]
-    case .ready(let m): return ["event": "state", "state": "ready", "model": m.rawValue]
+    case .ready(let m): return ["event": "state", "state": "ready", "model": m]
     case .failed(let failure):
         return ["event": "state", "state": "failed", "failure": encode(failure)]
     }
@@ -119,13 +146,23 @@ actor Brain {
     /// The rewriter the app's `CheckSetup` builds: the engine, the writer's words and rules,
     /// the language and spelling checks, and the prompt style of the model in use.
     func rewriter(_ req: [String: Any]) async -> Rewriter {
-        let model = await Engine.shared.preferredChoice
-        return Rewriter(generator: Engine.shared,
+        let style = await engine.promptStyle()
+        // Windows' app sends its own language check and unknown words (it has the dictionaries;
+        // the brain there doesn't). The Mac's app sends neither: the brain asks the Mac's own.
+        let foreign = req["looksForeign"] as? Bool
+        let misspelled = (req["misspelled"] as? [[String: Any]]).map { flagged($0, in: req["text"] as? String ?? "") }
+        return Rewriter(generator: engine.generator,
                         glossary: req["glossary"] as? [String] ?? [],
                         styleRules: req["styleRules"] as? [String] ?? [],
-                        isForeign: { await LanguageCheck.looksNonEnglish($0) },
-                        spellingHints: { await SpellCheck.hints(for: $0) },
-                        promptStyle: model.promptStyle)
+                        isForeign: { text in
+                            if let foreign { return foreign }
+                            return await engine.looksForeign(text)
+                        },
+                        spellingHints: { text in
+                            if let misspelled { return misspelled.filter { text.contains($0.word) } }
+                            return await engine.spellingHints(text)
+                        },
+                        promptStyle: style)
     }
 
     func handle(_ req: [String: Any]) async {
@@ -138,42 +175,34 @@ actor Brain {
             // The model chosen in Settings, or (none chosen yet) the one the app would start
             // on: a Google model already on this Mac for someone set up before, else the one
             // that suits this Mac (`AppSettings.startingModel`).
-            if let raw = req["model"] as? String, let choice = ModelChoice(rawValue: raw) {
-                await Engine.shared.setPreferred(choice)
+            if let raw = req["model"] as? String, await engine.choose(raw) {
             } else {
                 let setUpBefore = req["onboarded"] as? Bool ?? false
-                await Engine.shared.setPreferred(ModelChoice.starting(setUpBefore: setUpBefore, onDisk: \.isDownloaded, memoryGB: ModelChoice.macMemoryGB))
+                await engine.chooseStarting(setUpBefore: setUpBefore)
             }
             if let minutes = req["idleMinutes"] as? Int {
-                await Engine.shared.setIdleUnload(minutes: minutes)
+                await engine.setIdleUnload(minutes: minutes)
             }
             await sendModels()
 
         case "load":
-            let preferred = await Engine.shared.preferredChoice
-            let choice = (req["model"] as? String).flatMap(ModelChoice.init(rawValue:)) ?? preferred
+            let id = req["model"] as? String
             let allow = req["allowDownload"] as? Bool ?? false
             Task {
-                do { try await Engine.shared.load(choice, allowDownload: allow) } catch {
+                do { try await engine.load(id, allowDownload: allow) } catch {
                     log("load: \(error)")
-                    if case EngineError.notDownloaded = error {
+                    if engine.isNotDownloaded(error) {
                         Out.shared.send(["event": "state", "state": "failed", "failure": encode(ModelFailure.notDownloaded)])
                     }
                 }
             }
 
         case "unload":
-            await Engine.shared.unload()
+            await engine.unload()
 
         case "delete":
-            // `ModelDialogs.delete`: the chosen model is let go of first, then its folders (and
-            // its drafter's, unless another model on disk still needs it) are removed.
-            guard let raw = req["model"] as? String, let choice = ModelChoice(rawValue: raw) else { return }
-            if await Engine.shared.preferredChoice == choice { await Engine.shared.unload() }
-            for folder in choice.cacheDirectories {
-                do { try FileManager.default.removeItem(at: folder) } catch CocoaError.fileNoSuchFile {
-                } catch { log("delete: couldn't remove \(folder.path): \(error)") }
-            }
+            guard let raw = req["model"] as? String else { return }
+            await engine.delete(raw)
             await sendModels()
 
         case "check":
@@ -197,13 +226,15 @@ actor Brain {
                             Out.shared.send(["event": "finished", "id": id, "result": result])
                         }
                     }
-                } catch is CancellationError {
                 } catch {
+                    // Cancelled by the app (`cancel`, or the same id asked again): it isn't
+                    // waiting. Anything else, the engine stopping it too (the model was switched
+                    // or unloaded mid-check), is said, so the panel never waits for ever.
                     if Task.isCancelled { return }
                     log("check \(id): \(error)")
                     // Whether the check itself failed (another try can help) or getting the model did.
-                    Out.shared.send(["event": "failed", "id": id, "problem": encode(ProblemNote(error, draft: text)),
-                                     "checkFailed": error is RewriteError])
+                    Out.shared.send(["event": "failed", "id": id, "problem": encode(engine.problem(error, draft: text)),
+                                     "checkFailed": error is RewriteError || error is CancellationError])
                 }
                 await self.done(id)
             }
@@ -237,40 +268,79 @@ actor Brain {
     func done(_ id: Int) { checks[id] = nil }
 }
 
+/// The app's unknown words as hints, picked as `SpellCheck.hints` picks the Mac's: each word once,
+/// only the ones worth asking about (not a name in mid-sentence), only with guesses, at most
+/// `SpellingHint.limit`. `start` counts UTF-16 units into `text`.
+func flagged(_ words: [[String: Any]], in text: String) -> [SpellingHint] {
+    var hints: [SpellingHint] = []
+    var seen = Set<String>()
+    let utf16 = Array(text.utf16)
+    for w in words where hints.count < SpellingHint.limit {
+        guard let word = w["word"] as? String, let guesses = w["guesses"] as? [String], !guesses.isEmpty,
+              seen.insert(word).inserted else { continue }
+        let start = min(max(0, w["start"] as? Int ?? 0), utf16.count)
+        let before = String(decoding: utf16[..<start], as: UTF16.self)
+        guard SpellingHint.isWorthAsking(word, atSentenceStart: SpellingHint.startsSentence(after: before)) else { continue }
+        hints.append(SpellingHint(word, Array(guesses.prefix(3))))
+    }
+    return hints
+}
+
 /// Which models there are, which are on disk, and the one chosen (setup's step 2 asks).
 func sendModels() async {
-    let models: [[String: Any]] = ModelChoice.offered.map {
-        ["id": $0.rawValue, "downloadSize": $0.downloadSize, "downloadBytes": $0.downloadBytes,
-         "modelBytes": $0.modelBytes, "downloaded": $0.isDownloaded]
+    let models: [[String: Any]] = engine.models().map {
+        ["id": $0.id, "downloadSize": $0.downloadSize, "downloadBytes": $0.downloadBytes,
+         "modelBytes": $0.modelBytes, "downloaded": $0.downloaded]
     }
-    let chosen = await Engine.shared.preferredChoice
-    Out.shared.send(["event": "hello", "models": models, "recommended": ModelChoice.recommended.rawValue,
-                     "chosen": chosen.rawValue])
+    let chosen = await engine.chosen()
+    Out.shared.send(["event": "hello", "models": models, "recommended": engine.recommended,
+                     "chosen": chosen])
 }
 
 // MARK: - Main
 
+// Isolate stdout for JSON-lines IPC before anything in MLX/Foundation can call `print()`.
+_ = Out.shared
 let brain = Brain()
 Task {
-    await Engine.shared.observe { state in
+    await engine.observe { state in
         Out.shared.send(encode(state))
         Task { await sendModels() }
     }
 }
 // Requests in order, each handed to the brain as it arrives; the brain answers when it can.
+// On macOS, a raw Foundation Thread has no RunLoop to drain autoreleased Objective-C objects
+// (e.g. from JSONSerialization), so each request runs inside its own autoreleasepool.
+let processLine: (String) -> Void = { line in
+    guard let data = line.data(using: .utf8),
+          let req = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        log("not JSON: \(line.prefix(80))")
+        return
+    }
+    let sem = DispatchSemaphore(value: 0)
+    Task { await brain.handle(req); sem.signal() }
+    sem.wait()
+}
 let input = Thread {
     while let line = readLine(strippingNewline: true) {
-        guard let data = line.data(using: .utf8),
-              let req = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            log("not JSON: \(line.prefix(80))")
-            continue
-        }
-        let sem = DispatchSemaphore(value: 0)
-        Task { await brain.handle(req); sem.signal() }
-        sem.wait()
+        #if os(macOS)
+        autoreleasepool { processLine(line) }
+        #else
+        processLine(line)
+        #endif
     }
-    // The app went away: so does the brain.
+    // The app went away: so does the brain (and llama.cpp's server with it).
+    if engine.stopsBeforeExit {
+        Task { await engine.unload(); exit(0) }
+        Thread.sleep(forTimeInterval: 4)  // `Server.end` gives a server 3 s before killing it
+    }
+    #if os(macOS)
+    // Without the C++ teardown `exit` runs: MLX's Metal queues destroyed while a check is still
+    // on the GPU trap (1 in 5 quits during a check). The system frees all of it either way.
+    _exit(0)
+    #else
     exit(0)
+    #endif
 }
 input.start()
 dispatchMain()

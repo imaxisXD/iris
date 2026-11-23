@@ -52,6 +52,9 @@ lto = "fat"
 codegen-units = 1
 opt-level = "s"
 
+[profile.release.package.tiny-skia]
+opt-level = 3
+
 # The live test panel refuses the keyboard (see `main.rs`, `refuse_keys`).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -63,3 +66,16 @@ core-graphics = "0.24"
 foreign-types = "0.5"
 objc2-core-graphics = { version = "0.3", features = ["CGColorSpace", "CGImage"] }
 objc2-app-kit = { version = "0.3", features = ["block2", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSRunningApplication", "NSWorkspace", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSResponder", "NSImage", "NSWindow", "NSScreen", "NSAppearance", "NSApplication", "NSCell", "NSButtonCell", "NSGraphics", "NSEvent", "NSOpenPanel", "NSSavePanel", "NSPanel"] }
+
+[build-dependencies]
+# Windows: the program's icon, built into iris.exe (build.rs).
+embed-resource = "3"
+
+# Windows: the notification-area (tray) icon and its menu, the system's own (`tray.rs`).
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.26"
+async-channel = "2"
+# Updates: a release's manifest checked against Iris's own signature (`update_win.rs`).
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+sha2 = "0.10"
+windows = { version = "0.62", features = ["Win32_UI_HiDpi", "Win32_System_Registry", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_UI_Accessibility", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_JobObjects", "Win32_Security", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_SystemInformation", "Win32_Globalization", "Win32_UI_Shell", "Win32_UI_Controls_Dialogs"] }

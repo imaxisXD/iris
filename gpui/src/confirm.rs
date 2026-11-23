@@ -67,6 +67,13 @@ pub fn is_up(window: &Window) -> bool {
     SHOWN.with(|s| s.borrow().get(&id).is_some_and(|x| x.leaving.is_none()))
 }
 
+/// Drops any confirm card state belonging to a window that just closed.
+pub fn forget_window(id: WindowId) {
+    SHOWN.with(|s| {
+        s.borrow_mut().remove(&id);
+    });
+}
+
 /// Puts the card away (Cancel, Esc, a click on the dim).
 pub fn dismiss(window: &mut Window) {
     let id = window.window_handle().window_id();

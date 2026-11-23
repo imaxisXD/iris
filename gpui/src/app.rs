@@ -63,17 +63,9 @@ pub fn tell_keys() {
     crate::slip::set_keys(shortcut_caps(s.open_shortcut), s.quick_fix_shortcut.map(shortcut_caps));
 }
 
-/// A shortcut's keys as caps, the way the Mac prints them (⌃ ⌥ ⇧ ⌘, then the key).
+/// A shortcut's keys as caps, the way this system prints them (`keys::caps`).
 pub fn shortcut_caps(k: store::KeyCombo) -> Vec<String> {
-    use store::carbon::*;
-    let mut caps = vec![];
-    for (bit, cap) in [(CONTROL, "⌃"), (OPTION, "⌥"), (SHIFT, "⇧"), (CMD, "⌘")] {
-        if k.modifiers & bit != 0 {
-            caps.push(cap.to_string());
-        }
-    }
-    caps.push(key_name(k.key_code));
-    caps
+    crate::keys::caps(k)
 }
 
 /// The Carbon key code of a key as GPUI names it (`a`, `5`, `space`, `f3`…), for a recorded
@@ -98,6 +90,11 @@ pub fn key_name(code: u32) -> String {
 
 /// Starts Iris.
 pub fn run() {
+    // Windows: Iris opened again while it runs (the Start menu): the running one shows Settings.
+    #[cfg(windows)]
+    if crate::hotkey::already_running() {
+        return;
+    }
     // Iris's panel and slip take the keyboard (Tab, Return, ↑ ↓) without bringing Iris to the
     // front, as the Swift app's do; under test they never do (someone may be typing).
     if crate::textbridge::under_test() && std::env::var("IRIS_TAKE_KEYS").is_err() {
@@ -114,24 +111,38 @@ pub fn run() {
         crate::brain::start(cx);
         // Once the brain has said which models are on disk: setup at its step if it isn't
         // complete, else the model loads in the background so the first check is fast (never a
-        // download: the model is on disk, or setup would be open).
-        cx.spawn(async move |cx| {
-            for _ in 0..100 {
-                let heard = cx.update(|cx| crate::brain::get(cx).is_none_or(|b| !b.read(cx).models.is_empty() || !b.read(cx).alive));
-                if heard {
-                    break;
-                }
-                cx.background_executor().timer(Duration::from_millis(50)).await;
+        // download: the model is on disk, or setup would be open). Event-driven via observe.
+        let finish_boot = |cx: &mut App| {
+            if !crate::live_setup::progress(cx).is_complete() {
+                crate::live_setup::show(cx);
+            } else if crate::app::settings().load_at_launch {
+                crate::brain::load(false);
             }
-            let _ = cx.update(|cx| {
-                if !crate::live_setup::progress(cx).is_complete() {
-                    crate::live_setup::show(cx);
-                } else if crate::app::settings().load_at_launch {
-                    crate::brain::load(false);
-                }
-            });
-        })
-        .detach();
+        };
+        if let Some(brain) = crate::brain::get(cx) {
+            let ready_now = {
+                let b = brain.read(cx);
+                !b.models.is_empty() || !b.alive
+            };
+            if ready_now {
+                finish_boot(cx);
+            } else {
+                let booted = std::rc::Rc::new(std::cell::Cell::new(false));
+                cx.observe(&brain, move |b, cx| {
+                    if booted.get() {
+                        return;
+                    }
+                    let br = b.read(cx);
+                    if !br.models.is_empty() || !br.alive {
+                        booted.set(true);
+                        finish_boot(cx);
+                    }
+                })
+                .detach();
+            }
+        } else {
+            finish_boot(cx);
+        }
         cx.on_app_quit(|_| async { crate::brain::stop() }).detach();
         if std::env::var("IRIS_OPEN_SETTINGS").is_ok() {
             crate::open_settings(crate::settings::Page::General, cx);
@@ -140,14 +151,16 @@ pub fn run() {
             crate::call_panel(cx);
         }
         crate::hotkey::start(cx);
+        #[cfg(windows)]
+        crate::hotkey::listen();
         // Another app holds the shortcut: said under the menu bar flower, where Iris lives, a
         // moment after launch once the flower has its place (and kept in the slip after).
         if shortcut_taken() {
-            let keys = shortcut_caps(settings().open_shortcut).concat();
+            let keys = crate::keys::inline(settings().open_shortcut);
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let _ = cx.update(|cx| crate::live_hint::show(vec![], Some("shortcut taken".into()),
-                    Some(format!("Another app uses {keys}. Open me to change it.")), cx));
+                    Some(crate::words::ws(format!("Another app uses {keys}. Open me to change it."))), cx));
             })
             .detach();
         }
@@ -161,13 +174,16 @@ pub fn run() {
                     crate::brain::Engine::Ready(_) if downloaded.get() && !crate::live_setup::is_open()
                         && !crate::live_setup::progress(cx).is_complete() => {
                         downloaded.set(false);
-                        crate::live_hint::show(vec![], Some("model's in".into()), Some("Open the menu bar flower to finish setup.".into()), cx);
+                        crate::live_hint::show(vec![], Some("model's in".into()), Some(crate::words::w("Open the menu bar flower to finish setup.").into()), cx);
                     }
                     _ => {}
                 }
             })
             .detach();
         }
+        // Windows: the flower in the tray, opening Settings (no slip there).
+        #[cfg(windows)]
+        crate::tray::install(cx);
         let acx = cx.to_async();
         crate::menubar::install(Box::new(move |frame| {
             let acx = acx.clone();
@@ -219,12 +235,16 @@ fn listen(cx: &mut App) {
             return;
         }
     };
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     let (tx, rx): (Sender<Command>, Receiver<Command>) = channel();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let tx = tx.clone();
             std::thread::spawn(move || {
-                let mut out = stream.try_clone().unwrap();
+                let Ok(mut out) = stream.try_clone() else { return };
                 for line in BufReader::new(stream).lines().map_while(Result::ok) {
                     let (atx, arx) = channel();
                     if tx.send((line, atx)).is_err() {

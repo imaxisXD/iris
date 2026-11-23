@@ -192,7 +192,20 @@ pub fn pointer() -> (f64, f64) {
     (p.x, top - p.y)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows: the pointer, in the points GPUI places windows in.
+#[cfg(windows)]
+pub fn pointer() -> (f64, f64) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut p = POINT::default();
+    if unsafe { GetCursorPos(&mut p) }.is_err() {
+        return (0.0, 0.0);
+    }
+    let s = crate::screen_scale_at(p.x, p.y);
+    (p.x as f64 / s, p.y as f64 / s)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn pointer() -> (f64, f64) {
     (0.0, 0.0)
 }

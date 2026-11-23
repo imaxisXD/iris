@@ -51,10 +51,9 @@ pub fn content(v: &Values, w: f32, cx: &Ctx) -> Vec<Div> {
 
     let open_detail = column().gap(z(4.0))
         .child(t("Checks the box you're typing in.", caption(), hue::I10))
-        .child(row().gap(z(4.0)).items_center()
-            .child(keycap("⌘", s)).child(keycap("Z", s))
+        .child(crate::keys::command("Z").iter().fold(row().gap(z(4.0)).items_center(), |r, k| r.child(keycap(k, s)))
             .child(t("undoes a Replace.", caption(), hue::I10))
-            .id("settings-undo-keys").aria_label("Command Z undoes a Replace."));
+            .id("settings-undo-keys").aria_label(format!("{} Z undoes a Replace.", crate::keys::spoken_cap(&crate::keys::command("Z")[0]))));
     let (open_rec, open_w) = recorder(v, ACTION_OPEN, s);
     let (quick_rec, quick_w) = recorder(v, ACTION_QUICK_FIX, s);
     let quick_detail = para_out("Fixes and replaces at once. Big rewrites still open the panel.", caption(), hue::I10, w - 16.0 - quick_w);
@@ -64,10 +63,13 @@ pub fn content(v: &Values, w: f32, cx: &Ctx) -> Vec<Div> {
         .child(shortcut_row("Quick Fix", quick_detail, quick_rec, quick_w, w));
 
     // 02: the panel's keys, a table of keycaps and what they do.
+    // In this system's keys (`keys.rs`): ⌘C on the Mac is Ctrl+C on Windows, ↵ is Enter.
+    let next_tone = format!("Next tone ({} goes back)", crate::keys::shifted_chip("⇥"));
     let keys = [
-        ("↵", "Replace your text with the result"), ("⇥", "Next tone (⇧⇥ goes back)"),
-        ("1–6", "Jump to a tone"), ("⌘C", "Copy the result"), ("⌘R", "Try again: write a new version"),
-        ("esc", "Close without changing anything"),
+        (crate::keys::key("↵"), "Replace your text with the result"), (crate::keys::key("⇥"), next_tone.as_str()),
+        ("1–6".to_string(), "Jump to a tone"), (crate::keys::command_chip("C"), "Copy the result"),
+        (crate::keys::command_chip("R"), "Try again: write a new version"),
+        (crate::keys::key("esc"), "Close without changing anything"),
     ];
     let mut table = column().w(z(w));
     for (i, (combo, what)) in keys.iter().enumerate() {

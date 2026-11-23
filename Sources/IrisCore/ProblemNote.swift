@@ -63,9 +63,14 @@ public struct ProblemNote: Equatable, Sendable {
     /// Getting the model failed: what to do is `ModelFailure.nextStep`, and Try again is offered
     /// when the failure says another try can work.
     public init(_ failure: ModelFailure) {
+        #if os(Windows)
+        let place = ("open setup from the iris icon by the clock", "this pc")
+        #else
+        let place = ("open setup from the menu bar", "this mac")
+        #endif
         let (note, lead): (String, String) = switch failure {
-        case .notDownloaded: ("i need my model first. open setup from the menu bar", "i need my model first")
-        case .noRoom: ("no room for my model on this mac", "no room for my model")
+        case .notDownloaded: ("i need my model first. \(place.0)", "i need my model first")
+        case .noRoom: ("no room for my model on \(place.1)", "no room for my model")
         case .offline: ("no internet for my model. one more go?", "no internet")
         case .other: ("couldn't finish that. one more go?", "couldn't get the model")
         }
