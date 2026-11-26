@@ -87,6 +87,9 @@ pub struct Settings {
     pub model: Option<String>,
     pub idle_minutes: u32,
     pub load_at_launch: bool,
+    /// "Go easy on this Mac / PC": leaner model memory and quieter motion. `None` picks
+    /// automatically (on for machines with 8 GB of memory or less).
+    pub light_mode: Option<bool>,
     pub onboarded: bool,
     /// How many times the flower has arrived on this Mac (`BudShow`'s `budArrivals`), for
     /// `opening::arrival_is_full`; none: not counted here yet (the Swift app's count is used).
@@ -141,6 +144,7 @@ impl Default for Settings {
             model: None,
             idle_minutes: 30,
             load_at_launch: true,
+            light_mode: None,
             onboarded: false,
             bud_arrivals: None,
             bud_last_day: None,
@@ -149,6 +153,12 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Whether "Go easy on this Mac / PC" is active: the user's explicit choice, or
+    /// automatically on for machines with 8 GB of memory or less.
+    pub fn light_mode_active(&self) -> bool {
+        self.light_mode.unwrap_or_else(|| crate::model_compare::mac_memory_gb() <= 8)
+    }
+
     /// Whether a note shows (problems and one-time notes always do).
     pub fn shows(&self, note: &str) -> bool {
         !self.hidden_notes.iter().any(|n| n == note)
@@ -384,7 +394,16 @@ mod tests {
         let old: Settings = serde_json::from_str(r#"{"glossary":["Northwind"]}"#).unwrap();
         assert_eq!(old.glossary, vec!["Northwind".to_string()]);
         assert_eq!(old.idle_minutes, 30);
+        assert_eq!(old.light_mode, None);
         assert_eq!(old.answer_cache, AnswerCache::Recent);
+        // Explicit lightMode choice overrides the hardware default and round-trips cleanly.
+        let mut explicit = Settings::default();
+        explicit.light_mode = Some(true);
+        assert!(explicit.light_mode_active());
+        let rt: Settings = serde_json::from_str(&serde_json::to_string(&explicit).unwrap()).unwrap();
+        assert_eq!(rt.light_mode, Some(true));
+        explicit.light_mode = Some(false);
+        assert!(!explicit.light_mode_active());
         // AnswerCache serializes cleanly across all three options.
         for (raw, want) in [(r#""off""#, AnswerCache::Off), (r#""whileOpen""#, AnswerCache::WhileOpen), (r#""recent""#, AnswerCache::Recent)] {
             assert_eq!(serde_json::to_string(&want).unwrap(), raw);

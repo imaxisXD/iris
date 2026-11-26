@@ -19,6 +19,15 @@ on:
       - "Sources/IrisLlama/**"
       - ".github/workflows/windows-beta.yml"
   workflow_dispatch:
+    inputs:
+      llama_cpu:
+        description: "Also run llama-cpu replay benchmarks (up to 150 min)"
+        type: boolean
+        default: false
+      windows_app:
+        description: "Also build the full Iris-Setup-x64 installer (up to 120 min)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -125,6 +134,12 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v7
         with:
+          name: iris-brain-windows-x64
+          path: ${{ runner.temp }}/brain/iris-brain.exe
+          if-no-files-found: ignore
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
           name: iris-helper-windows-x64
           path: ${{ runner.temp }}/brain
           if-no-files-found: ignore
@@ -138,8 +153,8 @@ jobs:
           if-no-files-found: ignore
 
   llama-cpu:
-    # Long and billed at Windows rates: only when a commit asks for it, or by hand.
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[llama-cpu]')
+    # Long and billed at Windows rates: only when a commit asks for it, or opted in on dispatch.
+    if: (github.event_name == 'workflow_dispatch' && inputs.llama_cpu) || contains(github.event.head_commit.message, '[llama-cpu]')
     runs-on: windows-latest
     timeout-minutes: 150
     strategy:
@@ -202,7 +217,7 @@ jobs:
   # secrets, nothing published. Long and billed at Windows rates, so only when a commit's
   # message carries the windows-app tag in square brackets, or by hand.
   windows-app:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[windows-app]')
+    if: (github.event_name == 'workflow_dispatch' && inputs.windows_app) || contains(github.event.head_commit.message, '[windows-app]')
     runs-on: windows-latest
     timeout-minutes: 120
     steps:

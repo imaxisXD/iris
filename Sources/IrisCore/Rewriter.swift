@@ -104,19 +104,21 @@ public struct Rewriter: Checker {
     let spellingHints: (@Sendable (String) async -> [SpellingHint])?
     /// How the model is asked: Iris's trained models get the short prompts they learned with.
     public let promptStyle: PromptStyle
-    /// Scales the per-attempt time limit. Tests shrink it; the app leaves it at 1.
-    var timeLimitScale: Double = 1
+    /// Scales the per-attempt time limit. Tests shrink it; CPU engines raise it.
+    public var timeLimitScale: Double = 1
 
     public init(generator: any TextGenerator, glossary: [String] = [], styleRules: [String] = [],
                 isForeign: (@Sendable (String) async -> Bool)? = nil,
                 spellingHints: (@Sendable (String) async -> [SpellingHint])? = nil,
-                promptStyle: PromptStyle = .taught) {
+                promptStyle: PromptStyle = .taught,
+                timeLimitScale: Double = 1) {
         self.generator = generator
         self.promptStyle = promptStyle
         self.protector = Protector(glossary: glossary)
         self.styleRules = styleRules
         self.isForeign = isForeign
         self.spellingHints = spellingHints
+        self.timeLimitScale = timeLimitScale
     }
 
     public var usesModel: Bool { true }
@@ -171,10 +173,23 @@ public struct Rewriter: Checker {
         return "\(mode.id):\(String(hash, radix: 16))"
     }
 
-    /// Time allowed for one attempt once the model is loaded: a fixed allowance plus a
-    /// per-token budget. Loading is never counted.
+    /// Time allowed for the first token once the model is loaded (covers prompt evaluation):
+    /// a fixed allowance plus a per-token budget. Loading is never counted.
     static func deadline(maxTokens: Int, mode: Mode) -> Duration {
         .milliseconds((mode.isFix ? 4000 : 6000) + maxTokens * 45)
+    }
+
+    /// Maximum silence between streamed tokens once output has started: long enough for a
+    /// slow CPU to finish a token, short enough that a hung model still fails promptly.
+    static func stallTimeout(scale: Double) -> Duration {
+        let raw = Duration.seconds(12) * scale
+        return scale >= 1 ? min(raw, .seconds(20)) : raw
+    }
+
+    /// Outer cap on a single attempt even while tokens keep arriving, so a runaway stream
+    /// never hangs forever.
+    static func hardCap(maxTokens: Int, mode: Mode, scale: Double) -> Duration {
+        deadline(maxTokens: maxTokens, mode: mode) * (scale * 4)
     }
 
     public func perform(_ text: String, mode: Mode, retry: Bool = false,
@@ -216,7 +231,9 @@ public struct Rewriter: Checker {
         for temperature in temperatures {
             let output = try await generateWithDeadline(
                 turns, temperature: temperature, maxTokens: maxTokens, cacheKey: cacheKey,
-                deadline: Self.deadline(maxTokens: maxTokens, mode: mode) * timeLimitScale
+                firstTokenTimeout: Self.deadline(maxTokens: maxTokens, mode: mode) * timeLimitScale,
+                stallTimeout: Self.stallTimeout(scale: timeLimitScale),
+                hardCap: Self.hardCap(maxTokens: maxTokens, mode: mode, scale: timeLimitScale)
             ) { partial in
                 onPartial(protector.restoringWhatsThere(Self.answer(in: partial, mode: mode, draft: text), from: masked))
             }
@@ -253,23 +270,61 @@ public struct Rewriter: Checker {
                              verdict: nil, translated: foreign, latencyMs: latency)
     }
 
-    /// Runs one generation, racing it against a deadline. On timeout the generation is
-    /// cancelled (which frees the GPU) and the caller gets `.timedOut`.
+    /// Tracks token arrival so an actively streaming check on a slow CPU isn't killed mid-sentence
+    /// while a stuck or stalled stream still times out promptly.
+    private final class StreamWatch: @unchecked Sendable {
+        private let lock = NSLock()
+        private let started: ContinuousClock.Instant
+        private var lastActivity: ContinuousClock.Instant
+        private var hasToken = false
+
+        init(now: ContinuousClock.Instant = .now) {
+            self.started = now
+            self.lastActivity = now
+        }
+
+        func noteToken(at now: ContinuousClock.Instant = .now) {
+            lock.withLock {
+                hasToken = true
+                lastActivity = now
+            }
+        }
+
+        /// Time left before the current deadline (first-token, inter-token stall, or outer cap)
+        /// expires, or `nil` if already past it.
+        func remaining(now: ContinuousClock.Instant, firstToken: Duration, stall: Duration, hardCap: Duration) -> Duration? {
+            lock.withLock {
+                let capAt = started.advanced(by: hardCap)
+                let idleAt = hasToken ? lastActivity.advanced(by: stall) : started.advanced(by: firstToken)
+                let limit = idleAt < capAt ? idleAt : capAt
+                guard now < limit else { return nil }
+                return limit - now
+            }
+        }
+    }
+
+    /// Runs one generation, racing it against a stream-aware deadline: waits up to
+    /// `firstTokenTimeout` for the first piece, resets a `stallTimeout` whenever tokens arrive,
+    /// and enforces `hardCap` overall. On timeout the generation is cancelled and the caller gets
+    /// `.timedOut`.
     private func generateWithDeadline(
         _ turns: [PromptTurn], temperature: Float, maxTokens: Int, cacheKey: String,
-        deadline: Duration, onPartial: @escaping @Sendable (String) -> Void
+        firstTokenTimeout: Duration, stallTimeout: Duration, hardCap: Duration,
+        onPartial: @escaping @Sendable (String) -> Void
     ) async throws -> String {
         let generator = self.generator
+        let watch = StreamWatch()
         return try await withThrowingTaskGroup(of: String?.self) { group in
             group.addTask {
                 var output = ""
                 var lastEmit = ContinuousClock.Instant.now - .seconds(1)
                 for try await delta in generator.stream(turns, temperature: temperature, maxTokens: maxTokens, cacheKey: cacheKey) {
                     try Task.checkCancellation()
+                    let now = ContinuousClock.Instant.now
+                    watch.noteToken(at: now)
                     output += delta
                     // First delta fires immediately (TTFT); burst tokens within a single speculative
                     // round coalesce to ~60Hz so regex cleaning and JSON IPC don't run 16× per ms.
-                    let now = ContinuousClock.Instant.now
                     if now - lastEmit >= .milliseconds(16) {
                         lastEmit = now
                         onPartial(output)
@@ -280,7 +335,9 @@ public struct Rewriter: Checker {
                 return output
             }
             group.addTask {
-                try await Task.sleep(for: deadline)
+                while let wait = watch.remaining(now: .now, firstToken: firstTokenTimeout, stall: stallTimeout, hardCap: hardCap) {
+                    try await Task.sleep(for: wait)
+                }
                 return nil
             }
             defer { group.cancelAll() }

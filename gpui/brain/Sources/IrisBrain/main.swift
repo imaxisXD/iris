@@ -162,7 +162,8 @@ actor Brain {
                             if let misspelled { return misspelled.filter { text.contains($0.word) } }
                             return await engine.spellingHints(text)
                         },
-                        promptStyle: style)
+                        promptStyle: style,
+                        timeLimitScale: engine.timeLimitScale)
     }
 
     func handle(_ req: [String: Any]) async {
@@ -182,6 +183,9 @@ actor Brain {
             }
             if let minutes = req["idleMinutes"] as? Int {
                 await engine.setIdleUnload(minutes: minutes)
+            }
+            if let light = req["lightMode"] as? Bool {
+                await engine.setLightMode(light)
             }
             await sendModels()
 

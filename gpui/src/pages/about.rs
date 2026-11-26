@@ -1972,7 +1972,7 @@ fn live_meadow(s: f32) -> Option<Pixels> {
 /// The live dispatcher, when this is a live window that moves (none in a snapshot, none under
 /// Reduce Motion: the still meadow then).
 fn moving_live() -> Option<crate::interact::Live> {
-    crate::interact::get().filter(|l| l.view.is_some() && !l.reduce_motion)
+    crate::interact::get().filter(|l| l.view.is_some() && !l.reduce_motion && !crate::app::settings().light_mode_active())
 }
 
 /// The moment the meadow holds at: where the pause button stopped it, or, sealed on the test

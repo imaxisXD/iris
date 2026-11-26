@@ -263,6 +263,58 @@ final class FakeGenerator: TextGenerator, @unchecked Sendable {
         #expect(clock.now - start < .seconds(3))
     }
 
+    @Test func slowSteadyStreamFinishesPastFirstTokenBudget() async throws {
+        // Simulates a slow CPU: first token arrives promptly, then tokens stream steadily for
+        // longer than the initial first-token budget (at scale 0.1, firstToken ≈ 728 ms while
+        // stall ≈ 1.2 s and hardCap ≈ 2.9 s). Must finish instead of being killed mid-sentence.
+        struct SlowStreamer: TextGenerator {
+            func stream(_ turns: [PromptTurn], temperature: Float, maxTokens: Int, cacheKey: String?) -> AsyncThrowingStream<String, Error> {
+                AsyncThrowingStream { c in
+                    let t = Task {
+                        let pieces = ["Hi", " there", ",", " this", " still", " finishes", "."]
+                        for (i, piece) in pieces.enumerated() {
+                            if i > 0 { try? await Task.sleep(for: .milliseconds(160)) }
+                            if Task.isCancelled { break }
+                            c.yield(piece)
+                        }
+                        c.finish()
+                    }
+                    c.onTermination = { _ in t.cancel() }
+                }
+            }
+        }
+        var rewriter = Rewriter(generator: SlowStreamer())
+        rewriter.timeLimitScale = 0.1
+        let result = try await rewriter.perform("hi there this still finish", mode: .fix) { _ in }
+        #expect(result.text == "Hi there, this still finishes.")
+    }
+
+    @Test func midStreamStallTimesOutPromptly() async {
+        // Emits two tokens, then stalls forever: must trip the inter-token stall watchdog.
+        struct MidStall: TextGenerator {
+            func stream(_ turns: [PromptTurn], temperature: Float, maxTokens: Int, cacheKey: String?) -> AsyncThrowingStream<String, Error> {
+                AsyncThrowingStream { c in
+                    let t = Task {
+                        c.yield("Hi ")
+                        try? await Task.sleep(for: .milliseconds(40))
+                        c.yield("there")
+                        try? await Task.sleep(for: .seconds(60))
+                        c.finish()
+                    }
+                    c.onTermination = { _ in t.cancel() }
+                }
+            }
+        }
+        var rewriter = Rewriter(generator: MidStall())
+        rewriter.timeLimitScale = 0.04
+        let clock = ContinuousClock()
+        let start = clock.now
+        await #expect(throws: RewriteError.timedOut) {
+            _ = try await rewriter.perform("hi there", mode: .fix) { _ in }
+        }
+        #expect(clock.now - start < .seconds(2))
+    }
+
     @Test func cacheKeyIgnoresUserTextButNotInstructions() {
         let a = Rewriter.cacheKey(for: Rewriter.turns(for: "one", mode: .fix), mode: .fix)
         let b = Rewriter.cacheKey(for: Rewriter.turns(for: "two", mode: .fix), mode: .fix)
@@ -534,5 +586,38 @@ final class FakeGenerator: TextGenerator, @unchecked Sendable {
     @Test func dropsTheHintLineIfTheModelCopiesIt() {
         #expect(FixGuard.clean("then favouritism\nNot in the dictionary: favourism (maybe favouritism)", keeping: "then favourism")
                 == "then favouritism")
+    }
+}
+
+@Suite struct LlamaBudgetTests {
+    @Test func lightModeRecommendedAtOrBelowEightGB() {
+        #expect(LlamaBudget.recommendedLightMode(memoryGB: 4))
+        #expect(LlamaBudget.recommendedLightMode(memoryGB: 8))
+        #expect(!LlamaBudget.recommendedLightMode(memoryGB: 12))
+        #expect(!LlamaBudget.recommendedLightMode(memoryGB: 16))
+    }
+
+    @Test func sizesServerForTightMidAndRoomyMachines() {
+        // 4 GB always stays on the leanest 1-slot / 64 MB profile, even if light mode is toggled off.
+        let fourOff = LlamaBudget.forMachine(memoryGB: 4, lightMode: false)
+        let fourOn = LlamaBudget.forMachine(memoryGB: 4, lightMode: true)
+        #expect(fourOff == LlamaBudget(slots: 1, contextPerSlot: 6144, cacheRamMB: 64, noRepack: true))
+        #expect(fourOn == fourOff)
+        #expect(fourOff.totalContext == 6144)
+
+        // 8 GB gets 1 slot / 64 MB in light mode (default), or 2 slots / 128 MB with light mode off.
+        #expect(LlamaBudget.forMachine(memoryGB: 8, lightMode: true)
+                == LlamaBudget(slots: 1, contextPerSlot: 6144, cacheRamMB: 64, noRepack: true))
+        #expect(LlamaBudget.forMachine(memoryGB: 8, lightMode: false)
+                == LlamaBudget(slots: 2, contextPerSlot: 6144, cacheRamMB: 128, noRepack: true))
+
+        // 16 GB gets full 4 slots / 512 MB normally (repacked), or 2 slots / 128 MB (--no-repack) in light mode.
+        #expect(LlamaBudget.forMachine(memoryGB: 16, lightMode: false)
+                == LlamaBudget(slots: 4, contextPerSlot: 6144, cacheRamMB: 512, noRepack: false))
+        #expect(LlamaBudget.forMachine(memoryGB: 16, lightMode: true)
+                == LlamaBudget(slots: 2, contextPerSlot: 6144, cacheRamMB: 128, noRepack: true))
+
+        // 10 GB keeps --no-repack when light mode is off.
+        #expect(LlamaBudget.forMachine(memoryGB: 10, lightMode: false).noRepack)
     }
 }

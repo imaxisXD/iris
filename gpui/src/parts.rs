@@ -536,7 +536,8 @@ pub fn ink_dots_at(c: Rgb8, dot: f32, time: f32) -> Div {
 }
 
 pub fn ink_dots(c: Rgb8, dot: f32) -> Div {
-    ink_dots_at(c, dot, crate::clock())
+    let time = if crate::live_slip::reduce_motion() || crate::app::settings().light_mode_active() { 0.0 } else { crate::clock() };
+    ink_dots_at(c, dot, time)
 }
 
 // MARK: - Tone tabs

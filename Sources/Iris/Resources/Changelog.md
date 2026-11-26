@@ -12,6 +12,18 @@ date: <YYYY-MM-DD>
 - <a small thing, also in this version>
 -->
 
+# 0.6.0 · Room to breathe
+date: 2026-11-25
+
+## Smoother on slower computers
+Iris uses far less memory and processor time while writing an answer, and finishes long drafts on slower computers without cutting off partway through. A new switch in Settings › Model & memory (on by default with 8 GB or less) keeps motion quieter and leaves more room for your other apps.
+
+## The panel grows with your answer
+While an answer comes in word by word, the panel grows a line at a time to fit it, so the words never run over its buttons, even on a slower computer. A very long answer fills up to about half your screen and scrolls for the rest, with the tones always in view.
+
+- A long answer shows a small ink scrollbar beside it and fades softly into the paper where there's more to read, so you always know to scroll; drag the scrollbar, or use the up and down arrow keys.
+- Pointing at "Use this one" in Settings › Model & memory previews the pink ring around that model before you switch, and the page's corner lettering is easier to read.
+
 # 0.5.0 · Right there
 date: 2026-11-24
 

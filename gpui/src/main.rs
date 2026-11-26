@@ -722,6 +722,67 @@ pub fn give_up_keys(window: &Window) {
     let _ = window;
 }
 
+/// Grows `window` by `up` points at its top and `down` at its bottom, in one step from its frame
+/// as it is then, just after this frame (a frame change inside one would re-enter GPUI). GPUI's
+/// own `resize` keeps a different corner on each platform.
+pub fn grow_window<V: 'static>(window: &Window, up: f64, down: f64, cx: &mut Context<V>) {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Ok(h) = HasWindowHandle::window_handle(window) else { return };
+        let RawWindowHandle::AppKit(a) = h.as_raw() else { return };
+        let view = a.ns_view.as_ptr() as *mut AnyObject;
+        let ns_window: *mut AnyObject = unsafe { msg_send![view, window] };
+        if ns_window.is_null() {
+            return;
+        }
+        let (ptr, view) = (ns_window as usize, view as usize);
+        cx.spawn(async move |this, _| {
+            if this.upgrade().is_none() {
+                return;
+            }
+            unsafe {
+                let w = ptr as *mut AnyObject;
+                // Cocoa's frame counts up from the bottom: the bottom edge goes down by `down`.
+                let mut r: objc2_foundation::NSRect = msg_send![w, frame];
+                r.origin.y -= down;
+                r.size.height += up + down;
+                let _: () = msg_send![w, setFrame: r, display: objc2::runtime::Bool::NO];
+                // Drawn for the new size before the screen shows it.
+                let _: () = msg_send![view as *mut AnyObject, displayIfNeeded];
+            }
+        })
+        .detach();
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{HWND, RECT};
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER};
+        let Some(hwnd) = win32_handle(window) else { return };
+        let (h, k) = (hwnd.0 as isize, window.scale_factor() as f64);
+        cx.spawn(async move |this, _| {
+            if this.upgrade().is_none() {
+                return;
+            }
+            let hwnd = HWND(h as _);
+            let mut r = RECT::default();
+            unsafe {
+                if GetWindowRect(hwnd, &mut r).is_err() {
+                    return;
+                }
+                let (up, down) = ((up * k).round() as i32, (down * k).round() as i32);
+                let _ = SetWindowPos(hwnd, None, r.left, r.top - up, r.right - r.left, r.bottom - r.top + up + down,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            }
+        })
+        .detach();
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = (window, up, down, cx);
+}
+
 /// Where `window`'s top left is, in screen points from the top left of the first screen (GPUI
 /// only gives a window's place on its own display).
 pub fn window_origin(window: &Window) -> Option<(f64, f64)> {

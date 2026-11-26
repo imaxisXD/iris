@@ -9,7 +9,8 @@
 // - a tone's fixed prompt, filled once, is saved to disk and restored in milliseconds, so a
 //   tone is slow once per install, never once per launch. Only warm-ups are saved (their only
 //   words are the prompt's): a person's draft never goes to disk.
-// - Foundation on Windows has no URLSession.bytes: answers stream through a data delegate.
+// - FoundationNetworking's URLSession on Windows polled libcurl at ~50% CPU while streaming
+//   SSE; loopback requests to llama-server go over direct blocking sockets (LoopbackSocket.swift).
 
 import Foundation
 #if canImport(FoundationNetworking)
@@ -144,17 +145,32 @@ public actor LlamaEngine {
     /// newer one has started (one that already failed has set its own state).
     private var loads = 0
     private var idleMinutes = 30
+    private var lightMode = LlamaBudget.recommendedLightMode(memoryGB: LlamaModel.memoryGB)
     private var lastUse = Date()
     private var idleTimer: Task<Void, Never>?
     let slots = SlotMap()
 
     public var preferredModel: LlamaModel { preferred }
 
+    private var currentBudget: LlamaBudget {
+        LlamaBudget.forMachine(memoryGB: LlamaModel.memoryGB, lightMode: lightMode)
+    }
+
     public func setPreferred(_ model: LlamaModel) async {
         guard model != preferred else { return }
         preferred = model
         // A model still downloading or starting is let go of too, so the new one starts its own.
         if server != nil || loading != nil { await unload() }
+    }
+
+    public func setLightMode(_ on: Bool) async {
+        guard on != lightMode else { return }
+        lightMode = on
+        // If a running server was started with a different KV / cache-ram budget, unload it so
+        // the leaner (or roomier) configuration takes effect cleanly on the next load.
+        if let server, server.budget != currentBudget {
+            await unload()
+        }
     }
 
     public func setIdleUnload(minutes: Int) { idleMinutes = max(1, minutes) }
@@ -192,7 +208,7 @@ public actor LlamaEngine {
             // A download that finished as it was cancelled doesn't say "loading" after `unload`.
             try Task.checkCancellation()
             set(.loading)
-            let started = try await Server.start(model: model, slots: slots.count)
+            let started = try await Server.start(model: model, budget: currentBudget)
             if Task.isCancelled {
                 started.stop()
                 throw CancellationError()
@@ -326,8 +342,10 @@ public struct LlamaGenerator: TextGenerator {
             guard await LlamaEngine.shared.slots.claimSave(cacheKey) else { return }
             for _ in 0..<40 {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
+                if !server.process.isRunning { return }
                 if await LlamaEngine.shared.slots.isQuiet() { break }
             }
+            guard server.process.isRunning else { return }
             let (slot, _) = await LlamaEngine.shared.slots.slot(for: cacheKey, server: server)
             await fillAndSave(promptOnly, cacheKey: cacheKey, slot: slot, server: server)
         }
@@ -362,7 +380,7 @@ public struct LlamaGenerator: TextGenerator {
 /// first, as the Mac's prefix cache keeps four. A slot given a prompt saved before is restored
 /// from disk instead of filled.
 actor SlotMap {
-    nonisolated let count = 4
+    private(set) var count = 4
     private var order: [String] = []
     private var slotOf: [String: Int] = [:]
     private var saved: Set<String> = []
@@ -371,6 +389,7 @@ actor SlotMap {
     private let maxSavedFiles = 20
 
     func reset(for server: Server) async {
+        count = server.budget.slots
         order = []
         slotOf = [:]
         claimed.removeAll()
@@ -448,18 +467,20 @@ actor SlotMap {
 /// One running llama-server: its process, port and key.
 final class Server: @unchecked Sendable {
     let process: Process
-    let base: URL
+    let port: Int
     let key: String
     let slotDirectory: URL
+    let budget: LlamaBudget
 
-    private init(process: Process, base: URL, key: String, slotDirectory: URL) {
+    private init(process: Process, port: Int, key: String, slotDirectory: URL, budget: LlamaBudget) {
         self.process = process
-        self.base = base
+        self.port = port
         self.key = key
         self.slotDirectory = slotDirectory
+        self.budget = budget
     }
 
-    static func start(model: LlamaModel, slots: Int) async throws -> Server {
+    static func start(model: LlamaModel, budget: LlamaBudget) async throws -> Server {
         guard let binary = LlamaEngine.serverBinary else { throw LlamaError.noServer("llama-server not found") }
         let key = (0..<4).map { _ in String(UInt64.random(in: 0...UInt64.max), radix: 36) }.joined()
         // Saved prompts belong to this model file and this llama.cpp: an update starts afresh.
@@ -483,7 +504,7 @@ final class Server: @unchecked Sendable {
             let p = Process()
             p.executableURL = binary
             var args = ["-m", model.file.path, "--host", "127.0.0.1", "--port", String(port), "--api-key", key,
-                        "-np", String(slots), "-c", String(slots * 6144), "--cache-ram", "512",
+                        "-np", String(budget.slots), "-c", String(budget.totalContext), "--cache-ram", String(budget.cacheRamMB),
                         "--slot-save-path", slotDirectory.path, "--no-webui"]
             let env = ProcessInfo.processInfo.environment
             // CPU unless told otherwise (a graphics card only after a self-test proves it: later).
@@ -491,13 +512,13 @@ final class Server: @unchecked Sendable {
             #if os(macOS)
             if env["IRIS_LLAMA_GPU_LAYERS"] == nil { args += ["-dev", "none"] }
             #endif
-            // Below 12 GB, the weights aren't copied again for speed: 0.9 GB less, a little slower.
-            if LlamaModel.memoryGB < 12 { args.append("--no-repack") }
+            // Below 12 GB (or in light mode), weights aren't repacked in RAM: ~0.9 GB less memory.
+            if budget.noRepack { args.append("--no-repack") }
             p.arguments = args
             p.standardOutput = FileHandle.nullDevice
             p.standardError = FileHandle.nullDevice
             try p.run()
-            let server = Server(process: p, base: URL(string: "http://127.0.0.1:\(port)")!, key: key, slotDirectory: slotDirectory)
+            let server = Server(process: p, port: port, key: key, slotDirectory: slotDirectory, budget: budget)
             // Loading a model file takes about a second from disk; give it up to two minutes (by
             // the clock: a check that gets no answer takes its own two seconds). Terminate and reap
             // `p` if startup is cancelled so no multi-GB `llama-server` process is leaked.
@@ -540,26 +561,20 @@ final class Server: @unchecked Sendable {
         p.waitUntilExit()
     }
 
-    private func request(_ path: String, body: [String: Any]? = nil) -> URLRequest {
-        var r = URLRequest(url: base.appendingPathComponent(path))
-        r.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        if let body {
-            r.httpMethod = "POST"
-            r.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            r.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        }
-        r.timeoutInterval = 600
-        return r
-    }
-
     func healthy() async -> Bool {
-        await Fetch.status(request("health"), within: 2) == 200
+        await LoopbackClient.status(port: port, method: "GET", path: "/health", key: key, within: 2) == 200
     }
 
     func slotAction(_ action: String, slot: Int, file: String) async -> Bool {
-        var r = request("slots/\(slot)", body: ["filename": file])
-        r.url = URL(string: base.absoluteString + "/slots/\(slot)?action=\(action)")
-        return await Fetch.status(r, within: 60) == 200
+        let body = try? JSONSerialization.data(withJSONObject: ["filename": file])
+        return await LoopbackClient.status(
+            port: port,
+            method: "POST",
+            path: "/slots/\(slot)?action=\(action)",
+            key: key,
+            body: body,
+            within: 60
+        ) == 200
     }
 
     /// Streams the answer's text, piece by piece, from llama-server's server-sent events.
@@ -571,97 +586,8 @@ final class Server: @unchecked Sendable {
             "chat_template_kwargs": ["enable_thinking": false],
         ]
         if slot >= 0 { body["id_slot"] = slot }
-        return Events.stream(request("v1/chat/completions", body: body))
-    }
-}
-
-// MARK: - HTTP without URLSession.bytes
-
-enum Fetch {
-    /// The answer's status code, or nil when there's none within `seconds`. Each request has a
-    /// session and a deadline of its own: on Windows, a request to a port nobody listens on yet
-    /// (the server still starting, slowly on a first run while it's scanned) never finished, and
-    /// the model never became ready.
-    static func status(_ request: URLRequest, within seconds: Double) async -> Int? {
-        var r = request
-        r.timeoutInterval = seconds
-        let session = URLSession(configuration: .ephemeral)
-        defer { session.invalidateAndCancel() }
-        return await withCheckedContinuation { (c: CheckedContinuation<Int?, Never>) in
-            let once = Once(c)
-            let task = session.dataTask(with: r) { _, response, error in
-                once.resume(error == nil ? (response as? HTTPURLResponse)?.statusCode : nil)
-            }
-            task.resume()
-            DispatchQueue.global().asyncAfter(deadline: .now() + seconds) {
-                task.cancel()
-                once.resume(nil)
-            }
-        }
-    }
-
-    /// A continuation resumed once, by whichever comes first.
-    private final class Once: @unchecked Sendable {
-        private var continuation: CheckedContinuation<Int?, Never>?
-        private let lock = NSLock()
-        init(_ c: CheckedContinuation<Int?, Never>) { continuation = c }
-        func resume(_ value: Int?) {
-            lock.lock()
-            let c = continuation
-            continuation = nil
-            lock.unlock()
-            c?.resume(returning: value)
-        }
-    }
-}
-
-/// Server-sent events through a data delegate: each `data:` line's text as it arrives.
-final class Events: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    private var buffer = Data()
-    private let continuation: AsyncThrowingStream<String, Error>.Continuation
-    private var status = 200
-    private var errorBody = ""
-
-    private init(_ c: AsyncThrowingStream<String, Error>.Continuation) { continuation = c }
-
-    static func stream(_ request: URLRequest) -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream { c in
-            let events = Events(c)
-            let session = URLSession(configuration: .ephemeral, delegate: events, delegateQueue: nil)
-            let task = session.dataTask(with: request)
-            c.onTermination = { _ in task.cancel(); session.invalidateAndCancel() }
-            task.resume()
-        }
-    }
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
-                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        status = (response as? HTTPURLResponse)?.statusCode ?? -1
-        completionHandler(.allow)
-    }
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        buffer.append(data)
-        while let nl = buffer.firstIndex(of: 0x0A) {
-            let line = String(decoding: buffer[buffer.startIndex..<nl], as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            buffer.removeSubrange(buffer.startIndex...nl)
-            if status != 200 { errorBody += line; continue }
-            guard line.hasPrefix("data: ") else { continue }
-            let payload = line.dropFirst(6)
-            if payload == "[DONE]" { continue }
-            guard let obj = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any],
-                  let choices = obj["choices"] as? [[String: Any]],
-                  let delta = choices.first?["delta"] as? [String: Any],
-                  let text = delta["content"] as? String, !text.isEmpty else { continue }
-            continuation.yield(text)
-        }
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if let error { continuation.finish(throwing: error) }
-        else if status != 200 { continuation.finish(throwing: LlamaError.noServer("HTTP \(status): \(errorBody.prefix(200))")) }
-        else { continuation.finish() }
-        session.finishTasksAndInvalidate()
+        let payload = (try? JSONSerialization.data(withJSONObject: body)) ?? Data("{}".utf8)
+        return LoopbackClient.stream(port: port, path: "/v1/chat/completions", key: key, body: payload)
     }
 }
 

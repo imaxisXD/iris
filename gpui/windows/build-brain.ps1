@@ -21,14 +21,18 @@ Get-ChildItem -Recurse Sources\IrisCore\*.swift | ForEach-Object {
   '    products: [.executable(name: "iris-brain", targets: ["IrisBrain"])],',
   '    targets: [',
   '        .target(name: "IrisCore"),',
-  '        .target(name: "IrisLlama", dependencies: ["IrisCore"]),',
+  '        .target(name: "IrisLlama", dependencies: ["IrisCore"], linkerSettings: [.linkedLibrary("ws2_32", .when(platforms: [.windows]))]),',
   '        .executableTarget(name: "IrisBrain", dependencies: ["IrisCore", "IrisLlama"], path: "gpui/brain/Sources/IrisBrain"),',
   '    ],',
   '    swiftLanguageModes: [.v5]',
   ')'
 ) -join "`n" | Set-Content -NoNewline -Encoding utf8NoBOM Package.swift
 Remove-Item Package.resolved -ErrorAction SilentlyContinue
-swift build -c $Configuration --product iris-brain
+# The checkout's folder (on CI, the private repository's name) is written as C:\iris in the
+# brain's file names and debug info, as build-app.sh writes /iris on the Mac.
+$root = (Get-Location).Path
+swift build -c $Configuration --product iris-brain `
+  -Xswiftc -file-prefix-map -Xswiftc "$root=C:\iris" -Xcc "-ffile-prefix-map=$root=C:\iris"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $bin = swift build -c $Configuration --show-bin-path
 "brain: $bin\iris-brain.exe"

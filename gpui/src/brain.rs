@@ -330,9 +330,11 @@ fn handle(v: Value, brain: &Entity<Brain>, cx: &mut App) -> bool {
                 // the first real check) and four slots, so more tones would push the one the
                 // panel opens on out; a tone used once is saved and comes back from disk in ms.
                 #[cfg(not(windows))]
-                for m in &tones {
-                    if m.id != first.id {
-                        prewarm(m);
+                if !crate::app::settings().light_mode_active() {
+                    for m in &tones {
+                        if m.id != first.id {
+                            prewarm(m);
+                        }
                     }
                 }
             }
@@ -395,6 +397,11 @@ fn handle(v: Value, brain: &Entity<Brain>, cx: &mut App) -> bool {
     false
 }
 
+/// Someone is still listening for check `id` (it hasn't finished or been cancelled).
+pub fn waiting(id: i64) -> bool {
+    CHECKS.with(|c| c.borrow().contains_key(&id))
+}
+
 /// Hands check `id`'s news to whoever asked (nobody, once it's finished or cancelled).
 pub fn deliver(id: i64, event: Event, cx: &mut App) {
     let last = !matches!(event, Event::Partial(_));
@@ -448,7 +455,7 @@ fn problem(p: &Value) -> Problem {
 /// Hands the settings the brain needs to it: the model, when to free memory, and the tones.
 pub fn configure(_cx: &mut App) {
     let s = crate::app::settings();
-    send(json!({"op": "configure", "model": s.model, "idleMinutes": s.idle_minutes, "onboarded": s.onboarded}));
+    send(json!({"op": "configure", "model": s.model, "idleMinutes": s.idle_minutes, "onboarded": s.onboarded, "lightMode": s.light_mode_active()}));
     tones(None);
 }
 

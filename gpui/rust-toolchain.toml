@@ -1,5 +1,5 @@
 # The Rust every Mac builds Iris with, so an update builds the same way here and on a Mac that
 # has never built it (rustup fetches this version on the first build: lib.sh, iris_ensure_rust).
 [toolchain]
-channel = "1.99.0"
+channel = "1.100.0"
 profile = "minimal"

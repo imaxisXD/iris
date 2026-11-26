@@ -273,7 +273,9 @@ public actor Engine: TextGenerator {
     /// it uses is unloaded or switched stops at its next token instead of finishing on a model
     /// that's gone, which kept both models in memory until it ended.
     private let unloads = UnloadCount()
-    let prefixes = PrefixStore(capacity: 12)
+    let prefixes = PrefixStore(capacity: LlamaBudget.recommendedLightMode(memoryGB: ModelChoice.macMemoryGB) ? 2 : 12)
+    /// Lean memory mode ("Go easy on this Mac"): smaller MLX buffer cache and fewer cached tone prompts.
+    private var lightMode = LlamaBudget.recommendedLightMode(memoryGB: ModelChoice.macMemoryGB)
     /// How the last request went, for local tools that measure the pipeline.
     private(set) var lastStats: GenerationStats?
 
@@ -335,6 +337,16 @@ public actor Engine: TextGenerator {
         scheduleIdleUnload()
     }
 
+    public func setLightMode(_ on: Bool) {
+        guard on != lightMode else { return }
+        lightMode = on
+        prefixes.setCapacity(on ? 2 : 12)
+        if isLoaded {
+            MLX.Memory.cacheLimit = on ? 64 * 1024 * 1024 : preferredChoice.cacheLimitBytes
+            if on { MLX.Memory.clearCache() }
+        }
+    }
+
     public func setPreferred(_ choice: ModelChoice) {
         guard choice != preferredChoice else { return }
         preferredChoice = choice
@@ -372,7 +384,7 @@ public actor Engine: TextGenerator {
         unload()
         // Keep MLX's buffer cache modest; the weights themselves are not affected.
         // Set here, not in init, so creating the engine never touches the GPU.
-        MLX.Memory.cacheLimit = choice.cacheLimitBytes
+        MLX.Memory.cacheLimit = lightMode ? 64 * 1024 * 1024 : choice.cacheLimitBytes
 
         let id = UUID()
         state = configurationOverride != nil || choice.isDownloaded ? .loading : .downloading(0)
@@ -908,13 +920,20 @@ final class PrefixStore: @unchecked Sendable {
         let cache: [KVCache]
     }
 
-    private let capacity: Int
+    private var capacity: Int
     private var entries: [String: Entry] = [:]
     private var order: [String] = []
     private var generation: UInt64 = 0
     private let lock = NSLock()
 
     init(capacity: Int) { self.capacity = capacity }
+
+    func setCapacity(_ newCapacity: Int) {
+        lock.withLock {
+            capacity = max(1, newCapacity)
+            while order.count > capacity { entries[order.removeFirst()] = nil }
+        }
+    }
 
     func currentGeneration() -> UInt64 {
         lock.withLock { generation }

@@ -64,7 +64,7 @@ impl Page {
     /// The Swift picture's height in points (a snapshot draws the page whole), for a snapshot
     /// that doesn't give its size. These move with the pages (Updates with every changelog entry).
     pub fn snapshot_height(self) -> f32 {
-        [1715.0, 936.0, 1111.0, 729.0, 829.0, 1172.5, 627.0, 1180.0, 1118.0][self.index()]
+        [1715.0, 936.0, 1111.0, 729.0, 829.0, 1252.0, 627.0, 1180.0, 1118.0][self.index()]
     }
     fn icon(self) -> Icon {
         [Icon::General, Icon::Shortcuts, Icon::Tones, Icon::Words, Icon::Apps, Icon::Model, Icon::Privacy, Icon::Updates, Icon::About][self.index()]
@@ -84,7 +84,7 @@ impl Page {
     }
     fn lettering(self) -> (&'static str, &'static str, Ghost) {
         [("Habits", "Basics", Ghost::Khaki), ("Touch", "Press", Ghost::Sky), ("Sound", "Tones", Ghost::Pink), ("Words", "Keep", Ghost::Tan),
-         ("Places", "Where", Ghost::Sky), ("Local", "Model", Ghost::Khaki), ("Yours", "Private", Ghost::Pink), ("New", "Latest", Ghost::Sky),
+         ("Places", "Where", Ghost::Sky), ("Own", "Model", Ghost::Khaki), ("Yours", "Private", Ghost::Pink), ("New", "Latest", Ghost::Sky),
          ("Story", "Thanks", Ghost::Tan)][self.index()]
     }
 }
@@ -127,6 +127,7 @@ pub struct Values {
     pub model: Option<crate::pages::model::Live>,
     pub idle_minutes: u32,
     pub load_at_launch: bool,
+    pub light_mode: bool,
     /// The text fields, live (none in a snapshot: an empty well).
     pub fields: Option<Fields>,
     /// What Check for Updates came back with, live.
@@ -176,7 +177,7 @@ impl Default for Values {
             open_shortcut: crate::keys::open_default(), quick_fix: Some(crate::keys::quick_fix_default()), recording: None,
             tones: tone_rows(&s), style_rules: vec![], glossary: vec![],
             excluded: s.excluded_apps.iter().map(|a| (a.bundle_id.clone(), a.name.clone())).collect(), per_app: vec![],
-            model: None, idle_minutes: 30, load_at_launch: true, fields: None, update_check: None,
+            model: None, idle_minutes: 30, load_at_launch: true, light_mode: false, fields: None, update_check: None,
         }
     }
 }

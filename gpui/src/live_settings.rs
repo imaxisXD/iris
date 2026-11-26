@@ -100,7 +100,8 @@ fn values(anim: &Anim, reduce_motion: bool, page: Page, cx: &App) -> Values {
     v.open_at_login = page == Page::General && crate::login_item::enabled();
     v.login_problem = crate::login_item::problem();
     let landed = |i: usize| notes::landed(NOTES[i]);
-    let (i, t) = anim.demo.playing(Instant::now(), notes::LENGTH, NOTES.len(), if reduce_motion { Some(&landed) } else { None });
+    let quiet = reduce_motion || s.light_mode_active();
+    let (i, t) = anim.demo.playing(Instant::now(), notes::LENGTH, NOTES.len(), if quiet { Some(&landed) } else { None });
     v.demo = Some((NOTES[i], t));
     v.demo_keys = crate::tones::caps(s.quick_fix_shortcut.unwrap_or(s.open_shortcut));
     v.open_shortcut = s.open_shortcut;
@@ -112,6 +113,7 @@ fn values(anim: &Anim, reduce_motion: bool, page: Page, cx: &App) -> Values {
     v.per_app = tones.per_app.clone();
     v.idle_minutes = s.idle_minutes;
     v.load_at_launch = s.load_at_launch;
+    v.light_mode = s.light_mode_active();
     MOMENT.with(|m| {
         let m = m.borrow();
         v.recording = m.recording.clone();
@@ -160,8 +162,8 @@ impl Render for SettingsView {
         let (anim, values, page_) = (self.anim.clone(), &self.values, self.page);
         let page = interact::build(&anim, self.reduce_motion, window, cx, || settings::window_live(page_, values, &turn, &Ctx { scale }));
         let t_build = began.elapsed().as_secs_f64() * 1000.0;
-        // The note demo plays: draw the next frame too.
-        if self.page == Page::General && !self.reduce_motion {
+        // The note demo plays: draw the next frame too (held still under Reduce Motion or light mode).
+        if self.page == Page::General && !self.reduce_motion && !crate::app::settings().light_mode_active() {
             window.request_animation_frame();
         }
         // `IRIS_TRACE`: the main thread's time for this frame, building to painting.

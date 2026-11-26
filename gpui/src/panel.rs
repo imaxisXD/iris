@@ -2,7 +2,7 @@
 //! answer with Iris's words printed on a pink marker and removals struck through, and the
 //! bottom row: what you need to know, the app Replace types into, and the one button.
 
-use gpui::{Role, AnyElement, BoxShadow, Div, HighlightStyle, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
+use gpui::{Role, AnyElement, BoxShadow, Div, HighlightStyle, InteractiveElement, IntoElement, ParentElement, ScrollHandle, StatefulInteractiveElement,
            StrikethroughStyle, Styled, StyledText, canvas, div, point};
 
 use crate::model::{Action, AppLabel, Note, Panel, Phase, Seg, TONES};
@@ -16,6 +16,40 @@ const TEXT_W: f32 = WIDTH - 32.0;
 const SUB: f32 = 13.5;
 const LINE: f32 = 17.0;
 const LINE_GAP: f32 = 5.0;
+/// The paper without its answer: the tones, the rules and the bottom row (measured live as
+/// `panel_chrome_h`; this is its usual height).
+pub const CHROME: f32 = 137.0;
+/// How far the words fade into the paper at a scrolling answer's edge.
+const FADE: f32 = 26.0;
+/// The paper under the answer, above the rule over the bottom row.
+const BELOW_ANSWER: f32 = 12.0;
+
+/// A scrolling answer's window onto its words: its room and the paper under it, so the words
+/// run on to the rule over the bottom row and fade into the paper there, with no blank strip.
+fn viewport() -> f32 {
+    MAX_BODY.get() + BELOW_ANSWER
+}
+
+thread_local! {
+    /// The most of the answer the paper shows before it scrolls (`set_max_body`): unlimited
+    /// until a live panel says how much of the screen it may take.
+    static MAX_BODY: std::cell::Cell<f32> = const { std::cell::Cell::new(f32::INFINITY) };
+}
+
+/// The answer's room on a screen `screen_h` points tall: the paper grows with the answer to
+/// about half the screen (never less than the panel's own window holds), and a longer answer
+/// scrolls inside it.
+pub fn max_body(screen_h: f32) -> f32 {
+    // Always ending halfway through a line, so the cut line says there's more on any screen.
+    let room = (screen_h * 0.5).max(308.0) - CHROME;
+    let lines = ((room - LINE / 2.0) / (LINE + LINE_GAP)).floor().max(1.0);
+    lines * (LINE + LINE_GAP) + LINE / 2.0
+}
+
+/// The room the next panels' answers get (`max_body`).
+pub fn set_max_body(h: f32) {
+    MAX_BODY.set(h);
+}
 
 /// What a view needs from the app besides the panel: the scale, the app icons, and what a
 /// click on a tone does (none in a snapshot).
@@ -65,7 +99,7 @@ pub fn panel_with_body_h(p: &Panel, look: &Look, body_h_override: Option<(f32, b
     // with a calm in-place simultaneous dissolve (`95 ms` out / `160 ms` in, `0 ms` queue).
     let (cur_h, height_moving) = match body_h_override {
         Some(v) => v,
-        None if l.view.is_some() => l.spring("panel-body-h", body_height(p), 0.24, 0.0),
+        None if l.view.is_some() => l.spring("panel-body-h", body_height(p), body_spring(p), 0.0),
         None => (body_height(p), false),
     };
     let swap_dur = if l.reduce_motion { 0.14 } else { 0.16 };
@@ -74,6 +108,7 @@ pub fn panel_with_body_h(p: &Panel, look: &Look, body_h_override: Option<(f32, b
     } else {
         None
     };
+    let scrolls = !(height_moving || swap.is_some()) && natural_height(p) > MAX_BODY.get() + 0.5;
     let body = if height_moving || swap.is_some() {
         let mut stage = div().relative().w(z(TEXT_W)).h(z(cur_h.max(0.0))).overflow_hidden();
         let (in_alpha, in_dy) = match swap {
@@ -81,14 +116,14 @@ pub fn panel_with_body_h(p: &Panel, look: &Look, body_h_override: Option<(f32, b
                 if l.reduce_motion {
                     let a = ds_curve((elapsed / 0.14).clamp(0.0, 1.0));
                     if a < 0.996 {
-                        stage = stage.child(at(content(&out_panel, scale).opacity(1.0 - a), 0.0, 0.0));
+                        stage = stage.child(at(content(&out_panel, scale).opacity(1.0 - a), 0.0, scrolled(&out_panel)));
                     }
                     (a, 0.0)
                 } else {
                     let out_k = ds_curve((elapsed / 0.095).clamp(0.0, 1.0));
                     let in_k = ds_curve((elapsed / 0.16).clamp(0.0, 1.0));
                     if out_k < 0.996 {
-                        stage = stage.child(at(content(&out_panel, scale).opacity(1.0 - out_k), 0.0, -1.5 * out_k));
+                        stage = stage.child(at(content(&out_panel, scale).opacity(1.0 - out_k), 0.0, scrolled(&out_panel) - 1.5 * out_k));
                     }
                     (in_k, 2.5 * (1.0 - in_k))
                 }
@@ -100,16 +135,37 @@ pub fn panel_with_body_h(p: &Panel, look: &Look, body_h_override: Option<(f32, b
         } else {
             content(p, scale)
         };
-        stage.child(at(incoming, 0.0, in_dy))
+        stage.child(at(incoming, 0.0, in_dy)).into_any_element()
+    } else if scrolls {
+        let handle = answer_scroll(p, selected, &l);
+        let room = viewport();
+        // The words fade into the paper at an edge with more past it: the bottom while there's
+        // more below, the top once some has scrolled up out of view; each fades in over its
+        // first line of travel. Paper over the words, so the grain printed over the paper keeps
+        // its tooth through it.
+        let travel = (natural_height(p) - room).max(0.0);
+        let y = (-f32::from(handle.offset().y) / zoom()).clamp(0.0, travel);
+        let fade = |a: f32, down: bool| {
+            let (clear, paper) = (gpui::Rgba { a: 0.0, ..col(ink::PAPER) }, gpui::Rgba { a: 0.95 * a, ..col(ink::PAPER) });
+            let (from, to) = if down { (clear, paper) } else { (paper, clear) };
+            div().absolute().left_0().w(z(TEXT_W)).h(z(FADE))
+                .bg(gpui::linear_gradient(180.0, gpui::linear_color_stop(from, 0.0), gpui::linear_color_stop(to, 1.0)))
+        };
+        div().relative().w(z(TEXT_W)).h(z(room))
+            .child(div().id("answer-scroll").w(z(TEXT_W)).h(z(room)).overflow_y_scroll().track_scroll(&handle).child(content(p, scale)))
+            .child(fade((y / (LINE + LINE_GAP)).min(1.0), false).top_0())
+            .child(fade(((travel - y) / (LINE + LINE_GAP)).min(1.0), true).bottom_0())
+            .into_any_element()
     } else {
-        content(p, scale)
+        content(p, scale).into_any_element()
     };
 
     let paper = div().relative().flex().flex_col().w(z(WIDTH)).bg(col(ink::PAPER))
         .shadow(vec![BoxShadow { color: gpui::black().opacity(0.10), offset: point(z(0.0), z(1.0)), blur_radius: z(1.2), spread_radius: z(0.0), inset: false }])
         .child(div().pl(z(16.0)).pt(z(14.0)).pb(z(10.0)).child(tabs))
         .child(div().pl(z(6.0)).child(pen_rule(11, WIDTH - 12.0, over(hue::I12, 0.85, ink::PAPER), 1.2)))
-        .child(div().pl(z(16.0)).pr(z(16.0)).pt(z(14.0)).pb(z(12.0)).child(div().id("answer").role(Role::Label).aria_label(spoken(p)).child(body)))
+        .child(div().relative().pl(z(16.0)).pr(z(16.0)).pt(z(14.0)).pb(z(if scrolls { 0.0 } else { BELOW_ANSWER })).child(div().id("answer").role(Role::Label).aria_label(spoken(p)).child(body))
+            .children(scrollbar(p, selected, &l, scale).map(|bar| at(bar, 16.0 + TEXT_W + 3.0, 14.0))))
         .child(div().pl(z(16.0)).child(pen_rule(29, TEXT_W, over(hue::I12, 0.3, ink::PAPER), 1.0)))
         .child(footer(p, look))
         // The paper's tooth over everything on it, sized at paint time to the paper.
@@ -145,13 +201,183 @@ fn grain_canvas(scale: f32, height_moving: bool) -> AnyElement {
     .size_full().into_any_element()
 }
 
-/// Deterministic height of `content(p, ...)` in points, used to drive the critically damped
-/// body height spring synchronously before layout so `opening::scene` keeps the paper's bottom
-/// edge anchored `10 pt` above the text box with zero frame lag.
+/// How long the paper takes to reach a new height (critically damped, no bounce). While an
+/// answer streams in it keeps up with the words (160 ms): the newest line is laid out at once and
+/// only shows as the paper opens to it. A new tone or the finished answer eases over 240 ms.
+pub fn body_spring(p: &Panel) -> f32 {
+    if matches!(p.phase, Phase::Generating(_)) { 0.16 } else { 0.24 }
+}
+
+thread_local! {
+    /// The answer's scroll position, and what it was showing (`answer_scroll`).
+    static SCROLL: std::cell::RefCell<(ScrollHandle, String)> = std::cell::RefCell::new((ScrollHandle::new(), String::new()));
+}
+
+/// The answer's scrollbar, in the paper's right margin, when the answer scrolls: a faint pen
+/// line for the track and a short printed ink stroke for the part in view, as long as that part
+/// is of the whole, where it is. Always there while the answer scrolls (you read the panel once:
+/// the sign of more can't wait to be found). The grey pen wash under the pointer; drag the stroke,
+/// or press the line to jump there. Drawn the same on the Mac and on Windows.
+fn scrollbar(p: &Panel, selected: usize, l: &crate::interact::Live, scale: f32) -> Option<AnyElement> {
+    let room = viewport();
+    let whole = natural_height(p);
+    if !room.is_finite() || whole <= room + 0.5 {
+        return None;
+    }
+    const W: f32 = 10.0;
+    let travel = whole - room;
+    // Where it is: the answer's own scroll while it shows this answer, the top otherwise (a
+    // new answer coming in).
+    let shown = SCROLL.with(|s| {
+        let s = s.borrow();
+        (s.1 == body_swap_key(p, selected)).then(|| (-f32::from(s.0.offset().y) / zoom()).clamp(0.0, travel)).unwrap_or(0.0)
+    });
+    let len = (room * room / whole).max(28.0).min(room);
+    let top = shown / travel * (room - len);
+    let hv = if l.view.is_some() { l.hover("answer-scrollbar") } else { 0.0 };
+    let track = drawn(W, room, crate::pen::hand_line_vertical(53, 0.5, W / 2.0, 0.0, room), Some(1.0), over(hue::I12, 0.3, ink::PAPER));
+    let stroke = scroll_stroke(len, scale);
+    let mut bar = div().id("answer-scrollbar").relative().w(z(W)).h(z(room))
+        .child(at(crate::controls::wash(59, W, room, hv, false), 0.0, 0.0))
+        .child(at(track, 0.0, 0.0))
+        .child(at(stroke, W / 2.0 - 3.0, top));
+    if l.view.is_some() {
+        bar = bar.on_hover(l.hover_handler("answer-scrollbar", None));
+    }
+    // Press, drag and let go, followed wherever the pointer goes once pressed.
+    let (grab_len, grab_travel) = (len, travel);
+    let drag = gpui::canvas(|_, _, _| (), move |b, _, window, _| {
+        let k = zoom();
+        let (y0, h) = (f32::from(b.origin.y) / k, f32::from(b.size.height) / k);
+        let to = move |y: f32, grab: f32| {
+            let t = ((y - y0 - grab) / (h - grab_len)).clamp(0.0, 1.0);
+            SCROLL.with(|s| s.borrow().0.set_offset(point(z(0.0), z(-t * grab_travel))));
+        };
+        window.on_mouse_event(move |e: &gpui::MouseDownEvent, phase, window, _| {
+            if phase != gpui::DispatchPhase::Bubble || e.button != gpui::MouseButton::Left || !b.contains(&e.position) {
+                return;
+            }
+            let y = f32::from(e.position.y) / k;
+            // On the stroke: hold it where it was taken; on the line: its middle jumps there.
+            let grab = if y >= y0 + top && y <= y0 + top + grab_len { y - y0 - top } else { grab_len / 2.0 };
+            DRAG.set(Some(grab));
+            to(y, grab);
+            window.refresh();
+        });
+        window.on_mouse_event(move |e: &gpui::MouseMoveEvent, _, window, _| {
+            if let (Some(grab), true) = (DRAG.get(), e.dragging()) {
+                to(f32::from(e.position.y) / k, grab);
+                window.refresh();
+            }
+        });
+        window.on_mouse_event(|_: &gpui::MouseUpEvent, _, _, _| DRAG.set(None));
+    }).absolute().top_0().left_0().size_full();
+    Some(bar.role(Role::ScrollBar).aria_label("Scroll the answer").child(drag).into_any_element())
+}
+
+thread_local! {
+    /// Where the scrollbar's stroke was taken, from its top, while it's held.
+    static DRAG: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The scrollbar's stroke, `len` points: an ink ribbon pressed in at the top and lifted off,
+/// frayed, at the bottom, printed through the riso screen.
+fn scroll_stroke(len: f32, scale: f32) -> AnyElement {
+    let (w, len) = (6.0, len.round());
+    let plate = Plate { w, h: len, scale };
+    let img = riso::cached(format!("scroll-stroke-{len}"), &plate, || {
+        let line: Vec<[f32; 2]> = (0..=12).map(|i| {
+            let t = i as f32 / 12.0;
+            [w / 2.0 + 0.35 * (t * 5.0).sin(), 1.5 + t * (len - 5.0)]
+        }).collect();
+        let mask = plate.fill(&crate::settings_kit::ribbon(&line, 3.4, 0.55, 0.35, true).skia().unwrap());
+        riso::print(&plate, ink::INK, 61, &mask, 0.85)
+    });
+    printed(w, len, &img)
+}
+
+/// Scrolls the answer `dy` points (down when positive), when it scrolls (↑ ↓ in the panel).
+pub fn scroll_answer(p: &Panel, dy: f32) {
+    let travel = natural_height(p) - viewport();
+    if !(travel > 0.0) {
+        return;
+    }
+    SCROLL.with(|s| {
+        let s = s.borrow();
+        let y = (-f32::from(s.0.offset().y) / zoom() + dy).clamp(0.0, travel);
+        s.0.set_offset(point(z(0.0), z(-y)));
+    });
+}
+
+/// How far the answer `p` was scrolled, in points (0 when it fit), so its copy fading out as the
+/// next one comes in stays where it was being read.
+fn scrolled(p: &Panel) -> f32 {
+    if natural_height(p) <= MAX_BODY.get() + 0.5 {
+        return 0.0;
+    }
+    SCROLL.with(|s| f32::from(s.borrow().0.offset().y) / zoom())
+}
+
+/// The answer's scroll position, kept while the panel shows the same thing: while it streams
+/// (or the model wakes) the newest line stays in sight; a new tone or a finished answer starts
+/// at the top.
+fn answer_scroll(p: &Panel, selected: usize, l: &crate::interact::Live) -> ScrollHandle {
+    SCROLL.with(|s| {
+        let mut s = s.borrow_mut();
+        let key = body_swap_key(p, selected);
+        if s.1 != key {
+            s.1 = key;
+            s.0.set_offset(point(z(0.0), z(0.0)));
+            // A new answer follows from the top, at rest.
+            l.spring_reset("panel-scroll");
+            if l.view.is_some() {
+                l.spring("panel-scroll", 0.0, 0.16, 0.0);
+            }
+        }
+        // Down to the last streamed line (not the bottom of the draft holding the height).
+        let shown = match &p.phase {
+            Phase::Generating(partial) => para_height(&plain(partial)),
+            Phase::Preparing => natural_height(p),
+            _ => 0.0,
+        };
+        let room = viewport();
+        if shown > room {
+            // Eased up a line at a time as the words arrive (snapped under Reduce Motion).
+            let target = room - shown;
+            let y = if l.view.is_some() {
+                l.spring("panel-scroll", target, 0.16, 0.0).0
+            } else {
+                target
+            };
+            s.0.set_offset(point(z(0.0), z(y)));
+        }
+        s.0.clone()
+    })
+}
+
+/// How tall the paper for a draft of `text` is likely to stand on a screen `screen_h` points
+/// tall: as tall as the draft and a line (an answer often runs a line longer), within what the
+/// answer may take (`max_body`), for choosing above or below its box.
+pub fn paper_guess(text: &str, screen_h: f32) -> f32 {
+    CHROME + (para_height(&plain(text)) + LINE + LINE_GAP).min(max_body(screen_h))
+}
+
+/// Deterministic height of the answer's room (`content`, up to where it scrolls) in points,
+/// used to drive the critically damped body height spring synchronously before layout so
+/// `opening::scene` keeps the paper's bottom edge anchored `10 pt` above the text box with zero
+/// frame lag.
 pub fn body_height(p: &Panel) -> f32 {
+    natural_height(p).min(MAX_BODY.get())
+}
+
+/// How tall `content(p, ...)` lays out, all of it.
+fn natural_height(p: &Panel) -> f32 {
     match &p.phase {
         Phase::Preparing => para_height(&plain(&p.original)) + 8.0 + 11.0 * MONO_LINE,
-        Phase::Generating(_) | Phase::Failed(_) => para_height(&plain(&p.original)),
+        // The draft holds the height while the answer streams in; an answer that runs past it
+        // grows the paper a line at a time (Swift's `ZStack` is as tall as the taller of the two).
+        Phase::Generating(partial) => para_height(&plain(&p.original)).min(MAX_BODY.get()).max(para_height(&plain(partial))),
+        Phase::Failed(_) => para_height(&plain(&p.original)),
         Phase::Done(a) => {
             let mut h = para_height(&runs(p));
             if a.translated {
@@ -341,13 +567,15 @@ fn content(p: &Panel, scale: f32) -> Div {
             .child(paragraph(&plain(&p.original), hue::I9, scale))
             .child(div().flex().flex_row().gap(z(6.0)).items_center().child(ink_dots(hue::I11, 4.0)).child(t("Loading the model…", caption(), hue::I11))),
         Phase::Generating(partial) => {
-            // The draft, unseen, holds the panel's height while the answer streams in.
-            let held = paragraph(&plain(&p.original), hue::I12, scale);
+            // The draft's height is held while the answer streams in (up to what the paper shows,
+            // so a long draft leaves nothing blank to scroll into); once the answer runs past it,
+            // the answer so far holds it (as `body_height` says).
+            let held = para_height(&plain(&p.original)).min(MAX_BODY.get());
             let shown = if partial.is_empty() {
                 // `WaitingText`: breathe gently (1.0 ↔ 0.45 over 0.8 s each way) while waiting
                 // for the first word; still in snapshots and under Reduce Motion.
                 let waiting = paragraph(&plain(&p.original), hue::I9, scale);
-                if let Some(l) = crate::interact::get().filter(|l| l.view.is_some() && !l.reduce_motion) {
+                if let Some(l) = crate::interact::get().filter(|l| l.view.is_some() && !l.reduce_motion && !crate::app::settings().light_mode_active()) {
                     let t = l.pulse_elapsed();
                     let wave = 0.5 + 0.5 * (std::f32::consts::PI * t / 0.8).cos();
                     waiting.opacity(0.45 + 0.55 * wave)
@@ -357,7 +585,7 @@ fn content(p: &Panel, scale: f32) -> Div {
             } else {
                 paragraph(&plain(partial), hue::I12, scale)
             };
-            div().relative().w(z(TEXT_W)).child(held.opacity(0.0)).child(at(shown, 0.0, 0.0))
+            div().w(z(TEXT_W)).min_h(z(held)).child(shown)
         }
         Phase::Done(a) => {
             let mut c = div().flex().flex_col().gap(z(12.0)).child(paragraph(&runs(p), hue::I12, scale));
@@ -599,6 +827,33 @@ mod tests {
         p.phase = Phase::Done(Answer::tone(&p.original, three, false));
         let h3 = body_height(&p);
         assert!(h3 >= 3.0 * LINE + 2.0 * LINE_GAP - 1e-3, "expected 3+ line height, got {h3}");
+
+        // Streaming: the draft's height until the answer runs past it, then the answer's.
+        let short = crate::model::Panel { original: "can u send teh invoice for order 4471 before friday".into(), ..p.clone() };
+        let mut s = short.clone();
+        s.phase = Phase::Generating("Could you".into());
+        assert!((body_height(&s) - LINE).abs() < 1e-3, "a short stream keeps the draft's one line");
+        s.phase = Phase::Generating(three.into());
+        assert!(body_height(&s) >= 3.0 * LINE + 2.0 * LINE_GAP - 1e-3, "a stream past the draft grows the paper");
+
+        // A long answer grows the paper to about half the screen, then scrolls inside it.
+        let long = "the two combi boilers left our warehouse this morning and i have checked the tracking. ".repeat(20);
+        s.phase = Phase::Generating(long.clone());
+        assert!(body_height(&s) > 8.0 * (LINE + LINE_GAP), "unlimited until a live panel says");
+        let room = super::max_body(1080.0);
+        assert!(room <= 540.0 - super::CHROME && room > 540.0 - super::CHROME - (LINE + LINE_GAP));
+        // Ending halfway through a line on any screen, so the cut line says there's more.
+        for screen in [700.0, 900.0, 1000.0, 1080.0, 1117.0, 1440.0] {
+            let r = super::max_body(screen);
+            assert!(((r - LINE / 2.0) / (LINE + LINE_GAP)).fract().abs() < 1e-3, "{screen}: {r}");
+        }
+        assert!(super::max_body(400.0) >= 7.0 * (LINE + LINE_GAP), "never less than seven lines");
+        super::set_max_body(room);
+        assert!((body_height(&s) - room).abs() < 1e-3);
+        s.phase = Phase::Done(Answer::tone(&s.original, &long, false));
+        assert!((body_height(&s) - room).abs() < 1e-3);
+        assert!(super::paper_guess(&long, 1080.0) <= 540.0 + 1e-3);
+        super::set_max_body(f32::INFINITY);
 
         // Preparing adds the "Loading the model…" row below the draft.
         p.phase = Phase::Failed(crate::model::Failure { note: "oops".into(), can_retry: true });

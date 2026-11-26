@@ -103,8 +103,9 @@ mod win {
     use super::{Action, APP_CX};
     use crate::store::{carbon, KeyCombo};
     use windows::core::w;
-    use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
     };
@@ -139,10 +140,39 @@ mod win {
         format!("IrisHotkeys-{}", crate::store::bundle_id()).encode_utf16().chain([0]).collect()
     }
 
+    /// Held for the lifetime of this process so a second launch while GPUI is still starting up
+    /// (before `HWND_MESSAGE` exists) never races into running two copies and two llama-servers.
+    static INSTANCE_MUTEX: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+
     /// Whether this copy of Iris is already running: if so it's asked to show Settings.
     pub fn already_running() -> bool {
+        let mutex_name: Vec<u16> = format!("Local\\IrisInstance-{}", crate::store::bundle_id())
+            .encode_utf16()
+            .chain([0])
+            .collect();
         let class = class();
         unsafe {
+            if let Ok(handle) = CreateMutexW(None, false, windows::core::PCWSTR(mutex_name.as_ptr())) {
+                let existed = GetLastError() == ERROR_ALREADY_EXISTS;
+                if existed {
+                    let _ = CloseHandle(handle);
+                    // Wait briefly in case the first copy is still finishing GPUI startup before
+                    // creating its message-only window, then ask it to open Settings.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while std::time::Instant::now() < deadline {
+                        if let Ok(h) = FindWindowExW(Some(HWND_MESSAGE), None, windows::core::PCWSTR(class.as_ptr()), None)
+                            && !h.0.is_null()
+                        {
+                            let _ = PostMessageW(Some(h), SHOW_SETTINGS, WPARAM(0), LPARAM(0));
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    return true;
+                }
+                let _ = INSTANCE_MUTEX.set(handle.0 as isize);
+                return false;
+            }
             match FindWindowExW(Some(HWND_MESSAGE), None, windows::core::PCWSTR(class.as_ptr()), None) {
                 Ok(h) if !h.0.is_null() => {
                     let _ = PostMessageW(Some(h), SHOW_SETTINGS, WPARAM(0), LPARAM(0));

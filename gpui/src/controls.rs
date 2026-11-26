@@ -545,11 +545,12 @@ pub fn button_face(b: &Button, st: Interaction, reduce_motion: bool, scale: f32)
                 .child(at(faded(printed(w, h, &drier), hover), 0.0, 0.0));
         }
         Kind::Secondary => {
-            // The keycap: paper face, pen outline, a small drop that flattens on press.
+            // The keycap: paper face warming to the pen wash on hover, pen outline deepening,
+            // and a small drop that flattens on press.
             face = face
                 .child(at(hand_fill(seed + 9, 0.3, w, h, drop(0.18)), 0.0, 1.2 - 0.7 * pressed))
-                .child(at(hand_fill(seed + 3, 0.4, w, h, col(mix(ink::PAPER, CONTROL_HOVER, hover))), 0.0, 0.0))
-                .child(at(hand_outline(seed, 0.45, 2.0, w, h, over(hue::I12, 0.75, ink::PAPER), 1.1), 0.0, 0.0));
+                .child(at(hand_fill(seed + 3, 0.4, w, h, col(mix(ink::PAPER, hue::I3, hover))), 0.0, 0.0))
+                .child(at(hand_outline(seed, 0.45, 2.0, w, h, over(hue::I12, 0.75 + 0.25 * hover, ink::PAPER), 1.1), 0.0, 0.0));
         }
         Kind::Ghost => {
             // The one hover in Iris: a pen-drawn grey ink wash.
@@ -607,6 +608,7 @@ pub fn button(b: &Button, scale: f32, act: Act) -> (AnyElement, f32) {
             let (l1, l2, l3, l4) = (l.clone(), l.clone(), l.clone(), l.clone());
             let (i1, i2, i3, i4) = (id.clone(), id.clone(), id.clone(), id.clone());
             el = el
+                .cursor_pointer()
                 .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| l1.set_pressed(&i1, true, cx))
                 .on_mouse_up(gpui::MouseButton::Left, move |_, _, cx| l2.set_pressed(&i2, false, cx))
                 .on_mouse_up_out(gpui::MouseButton::Left, move |_, _, cx| l3.set_pressed(&i3, false, cx))

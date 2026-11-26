@@ -388,6 +388,11 @@ impl Live {
     /// A value driven by an analytical damped spring (`DS.Motion.pill`), preserving live velocity
     /// when retargeted mid-flight. Under Reduce Motion it lands immediately with no travel.
     /// Returns `(current_value, still_moving)`.
+    /// Forgets spring `id`: its next `spring` call starts at rest on its target.
+    pub fn spring_reset(&self, id: &str) {
+        self.anim.borrow_mut().springs.remove(id);
+    }
+
     pub fn spring(&self, id: &str, target: f32, duration: f32, bounce: f32) -> (f32, bool) {
         if self.reduce_motion {
             return (target, false);

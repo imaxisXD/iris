@@ -310,8 +310,9 @@ fn show_with(captured: Captured, frame: Option<[f64; 4]>, make: impl FnOnce(Capt
     let s = crate::app::settings();
     // `PanelController.show`: above or below the box as set (the other side when there's no
     // room), or by the pointer; kept on the screen.
+    let visible = crate::visible_frame_at(at.0, at.1);
     let ((x, y), below) = crate::opening::screen_place(frame, s.placement == crate::store::Placement::BelowField,
-        s.placement == crate::store::Placement::NearPointer, pointer, crate::visible_frame_at(at.0, at.1), 200.0);
+        s.placement == crate::store::Placement::NearPointer, pointer, visible, crate::panel::paper_guess(&captured.text, visible[3] as f32) as f64);
     if below {
         news("panel below the box");
     }

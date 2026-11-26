@@ -95,10 +95,25 @@ pub fn rig_clock(t: f64, script: &Script) -> RigClock {
     }
 }
 
-/// Whether the flower is still moving at `t`: after its bloom has settled (2.1 s on, when its
-/// line stops boiling and its idle sway has faded) it holds still until the panel goes.
-pub fn rig_moving(t: f64, script: &Script) -> bool {
-    t < script.bloom + 2.15 || t >= script.replace
+/// When the bud's initial arrival animation has settled (`full`: drop + stem + leaf; `quick`: quick rise).
+pub fn arrival_done(full: bool) -> f64 {
+    if full { 0.85 } else { 0.35 }
+}
+
+/// Whether the flower is in a fast transition that needs display frame rate: arriving, blooming,
+/// or leaving. While waiting for a slow answer after arrival (`!bloom.is_finite()`), it only
+/// gently nods at 8 Hz (or holds still under Reduce Motion / light mode) so the UI never
+/// competes with the model on CPU-bound machines.
+pub fn rig_active(t: f64, script: &Script) -> bool {
+    t < arrival_done(script.full)
+        || (script.bloom.is_finite() && t < script.bloom + 2.15)
+        || (script.replace.is_finite() && t >= script.replace)
+}
+
+/// Whether the panel is waiting to unroll or mid-unroll spring (0.75 s covers the spring cleanly,
+/// including its slight overshoot past 1.0).
+pub fn is_unrolling(t: f64, script: &Script) -> bool {
+    !script.replace.is_finite() && t < unfold_at(script) + 0.75
 }
 
 /// Where the rig's picture goes in the scene, in points: (left, top, width, height).
@@ -122,10 +137,16 @@ fn place(paper_h: f32) -> (f32, f32, (f32, f32), (f32, f32)) {
     let lowest = 8.0 + REACH_LEFT + room;
     let highest = SCENE.0 - 8.0 - panel::WIDTH;
     let x = 8.0f32.max(BOX.0.max(lowest).min(highest));
+    let r = ROOM.get();
+    // On the screen whatever its height (`PanelLayout.place`): its top kept on, then its bottom.
+    let fit = |top: f32| top.max(r.top).min(r.bottom - paper_h);
     let (paper_top, foot) = if BELOW.get() {
-        (BELOW_TOP, (x - room, BELOW_TOP + FLOWER_H))
+        let top = fit(BELOW_TOP + r.above);
+        (top, (x - room, top + FLOWER_H))
     } else {
-        (BOX.1 - 10.0 - paper_h, (x - room, BOX.1 - 10.0 + 10.0 - 2.0))
+        // The flower stands on the box's top edge, beside the paper's foot.
+        let top = fit(BOX.1 + r.above - 10.0 - paper_h);
+        (top, (x - room, top + paper_h + 10.0 - 2.0))
     };
     let hinge = (x, foot.1 - HEADROOM);
     (x, paper_top, foot, hinge)
@@ -134,6 +155,52 @@ fn place(paper_h: f32) -> (f32, f32, (f32, f32), (f32, f32)) {
 thread_local! {
     /// The panel opens below its box (`PanelLayout.Side.below`).
     static BELOW: Cell<bool> = const { Cell::new(false) };
+    /// The room the live panel's window has (`set_room`): the drawn scene's own until then.
+    static ROOM: Cell<Room> = const { Cell::new(Room::SCENE) };
+}
+
+/// How much a live panel's window has grown past the scene (above the box when the paper is
+/// above it, below when it's below), and how far up and down the screen lets the paper go, in
+/// the scene's points.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Room {
+    pub above: f32,
+    pub below: f32,
+    pub top: f32,
+    pub bottom: f32,
+}
+
+impl Room {
+    pub const SCENE: Room = Room { above: 0.0, below: 0.0, top: f32::NEG_INFINITY, bottom: f32::INFINITY };
+
+    /// The scene's height in this room.
+    pub fn height(self) -> f32 {
+        SCENE.1 + self.above + self.below
+    }
+}
+
+/// The room the next scenes are drawn in (a live panel says so before each frame).
+pub fn set_room(r: Room) {
+    ROOM.set(r);
+}
+
+/// The panel opens below its box.
+pub fn below() -> bool {
+    BELOW.get()
+}
+
+/// A paper `paper_h` tall needs its window `(up, down)` points taller than it is (it has grown
+/// `grown` past the scene, and the drawing sits `shift_y` down in it), or `None` when it fits.
+/// Asked for two lines ahead, so the window is there before the paper reaches its edge.
+pub fn more_room(paper_h: f32, shift_y: f32, grown: f32) -> Option<(f32, f32)> {
+    const AHEAD: f32 = 44.0;
+    if BELOW.get() {
+        let need = shift_y + BELOW_TOP + paper_h + MARGIN.2 - SCENE.1;
+        (need > grown).then(|| (0.0, need + AHEAD - grown))
+    } else {
+        let need = paper_h + 10.0 + MARGIN.1 - shift_y - BOX.1;
+        (need > grown).then(|| (need + AHEAD - grown, 0.0))
+    }
 }
 
 /// Below the box: where the paper's top is in the scene (room above for the bloom).
@@ -261,7 +328,7 @@ pub fn scene(t: f64, script: &Script, shown: &Panel, look: &panel::Look, paper_h
     let live = crate::interact::get().filter(|l| l.view.is_some());
     let (body_override, effective_paper_h) = match &live {
         Some(l) => {
-            let (cur_body_h, height_moving) = l.spring("panel-body-h", panel::body_height(shown), 0.24, 0.0);
+            let (cur_body_h, height_moving) = l.spring("panel-body-h", panel::body_height(shown), panel::body_spring(shown), 0.0);
             let chrome_h = l.anim.borrow().panel_chrome_h.unwrap_or(137.0);
             (Some((cur_body_h, height_moving)), chrome_h + cur_body_h)
         }
@@ -270,7 +337,7 @@ pub fn scene(t: f64, script: &Script, shown: &Panel, look: &panel::Look, paper_h
     let (x, paper_top, _foot, hinge) = place(effective_paper_h);
     let (u, fade) = unroll(t, script);
 
-    let mut s = div().relative().w(px(SCENE.0)).h(px(SCENE.1)).overflow_hidden();
+    let mut s = div().relative().w(px(SCENE.0)).h(px(ROOM.get().height())).overflow_hidden();
     if script.backdrop {
         let sans = |size: f32, bold: bool| {
             let d = div().font_family(".SystemUIFont").text_size(px(size)).line_height(px(size * 1.2)).text_color(col((0, 0, 0)));
@@ -430,5 +497,21 @@ mod tests {
         assert!(!arrival_is_full(5, false, 7));
         assert!(arrival_is_full(101, true, 7));
         assert!(arrival_is_full(101, false, 0));
+    }
+
+    #[test]
+    fn slow_streaming_does_not_keep_rig_active_at_full_frame_rate() {
+        use super::{is_unrolling, rig_active};
+        let waiting = so_far(false, None, None);
+        // Active while arriving, calm after arrival while still streaming.
+        assert!(rig_active(0.1, &waiting));
+        assert!(!rig_active(2.5, &waiting));
+        // Unrolling until unfold_at (1.1) + 0.75 = 1.85, then settled.
+        assert!(is_unrolling(1.2, &waiting));
+        assert!(!is_unrolling(2.0, &waiting));
+        // Once bloom lands, active again for 2.15 s, then settled.
+        let bloomed = so_far(false, Some(4.0), None);
+        assert!(rig_active(4.5, &bloomed));
+        assert!(!rig_active(6.5, &bloomed));
     }
 }

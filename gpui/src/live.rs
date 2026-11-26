@@ -44,6 +44,7 @@ pub struct RigFeed {
     jobs: Sender<Job>,
     done: Arc<Mutex<Option<Drawn>>>,
     in_flight: Arc<AtomicUsize>,
+    threads: usize,
     seq: u64,
     shown: Option<Drawn>,
     /// How long a picture takes from asking to ready (smoothed), so it's asked for the moment
@@ -56,6 +57,7 @@ pub struct RigFeed {
 
 impl RigFeed {
     pub fn new(threads: usize) -> RigFeed {
+        let threads = threads.max(1);
         let (jobs, rx) = channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
         let done = Arc::new(Mutex::new(None::<Drawn>));
@@ -81,7 +83,7 @@ impl RigFeed {
                 in_flight.fetch_sub(1, Ordering::SeqCst);
             }).unwrap();
         }
-        RigFeed { jobs, done, in_flight, seq: 0, shown: None, lead: 0.03, interval: 1.0 / 60.0, last_frame: None }
+        RigFeed { jobs, done, in_flight, threads, seq: 0, shown: None, lead: 0.03, interval: 1.0 / 60.0, last_frame: None }
     }
 
     fn ask(&mut self, t: f64, script: &Script, scale: f32) {
@@ -90,9 +92,10 @@ impl RigFeed {
         let _ = self.jobs.send(Job { seq: self.seq, t, script: *script, scale, asked: Instant::now() });
     }
 
-    /// The picture to show at `t`. While the flower moves, keeps two pictures on the way, each
-    /// asked for the moment it'll be ready; once it's still, asks for the still pose once.
-    fn at(&mut self, t: f64, script: &Script, scale: f32, window: &mut Window) -> Option<Img> {
+    /// The picture to show at `t`. Fast transitions (arriving, blooming, leaving) keep frames on
+    /// the way at display rate; while waiting/streaming after arrival, paces to 8 Hz (matching
+    /// the riso line boil) or holds the settled bud still when `quiet` or `!waiting_active`.
+    fn at(&mut self, t: f64, script: &Script, scale: f32, window: &mut Window, waiting_active: bool, quiet: bool) -> Option<Img> {
         let now = Instant::now();
         if let Some(last) = self.last_frame.replace(now) {
             let gap = (now - last).as_secs_f64();
@@ -116,24 +119,44 @@ impl RigFeed {
             self.seq += 1;
             self.shown = Some(Drawn { seq: self.seq, t, img: crate::riso::image(w, h, rgba), asked: Instant::now() });
         }
-        if opening::rig_moving(t, script) {
-            // As many pictures on the way as it takes to have one each frame: one at 60 Hz (a
-            // picture takes about 11 ms), two at 120.
-            let want = ((self.lead / self.interval).ceil() as usize).clamp(1, 2);
+        if opening::rig_active(t, script) {
+            // Fast transitions (arrival, bloom, leaving): keep up with the display, capped by thread count.
+            let want = ((self.lead / self.interval).ceil() as usize).clamp(1, self.threads.min(2));
             while self.in_flight.load(Ordering::SeqCst) < want {
                 let ahead = self.lead + self.interval * self.in_flight.load(Ordering::SeqCst) as f64;
                 self.ask(t + ahead, script, scale);
             }
-        } else {
-            // Still: the settled pose, drawn once.
+        } else if script.bloom.is_finite() {
+            // Bloom settled: draw the still open flower once.
             let still = script.bloom + 2.15;
             let have = self.shown.as_ref().is_some_and(|s| s.t >= still);
             if !have && self.in_flight.load(Ordering::SeqCst) == 0 {
                 self.ask(still, script, scale);
             }
+        } else if waiting_active && !quiet {
+            // Waiting / streaming on a normal machine: gentle 8 Hz reading nod (matches 8 Hz boil)
+            // on a single worker slot so we never starve the local model.
+            let stale = self.shown.as_ref().is_none_or(|s| (t - s.t) >= 0.12);
+            if stale && self.in_flight.load(Ordering::SeqCst) == 0 {
+                self.ask(t, script, scale);
+            }
+        } else {
+            // Quiet waiting (Reduce Motion / light mode) or failed check: draw the settled bud once.
+            let still_bud = opening::arrival_done(script.full);
+            let have = self.shown.as_ref().is_some_and(|s| s.t >= still_bud);
+            if !have && self.in_flight.load(Ordering::SeqCst) == 0 {
+                self.ask(still_bud, script, scale);
+            }
         }
         self.shown.as_ref().map(|s| s.img.clone())
     }
+}
+
+/// Worker thread count for `RigFeed`: one thread on ≤ 4-core CPUs or in light mode so background
+/// rasterization never competes with local CPU inference.
+fn rig_threads() -> usize {
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    if cores <= 4 || crate::app::settings().light_mode_active() { 1 } else { 2 }
 }
 
 /// The live moment.
@@ -170,6 +193,10 @@ pub struct OpeningView {
     /// When there was first something else to read with the flower shut: a failure, or the
     /// model waking up.
     pub readable: Option<f64>,
+    /// How tall this window has been asked to be (it grows for a long answer, never shrinks).
+    pub asked_h: f32,
+    /// Whether an 8 Hz waiting tick is already scheduled (prevents 60 FPS spin while streaming).
+    pub tick_scheduled: bool,
 }
 
 const MEMO_LIMIT: usize = 32;
@@ -242,6 +269,9 @@ thread_local! {
 /// An Iris that moved over from the Swift app carries on from that app's count.
 pub fn next_arrival() -> bool {
     let s = crate::app::settings();
+    if s.light_mode_active() {
+        return false;
+    }
     let (count, last_day) = match s.bud_arrivals {
         Some(n) => (n, s.bud_last_day),
         None => {
@@ -324,7 +354,7 @@ impl OpeningView {
             copied_gen: 0,
             focus: cx.focus_handle(),
             paper_h: Rc::new(Cell::new(173.0)),
-            feed: RigFeed::new(2),
+            feed: RigFeed::new(rig_threads()),
             check: None,
             captured: None,
             anim: Default::default(),
@@ -333,6 +363,8 @@ impl OpeningView {
             full: true,
             bloomed: None,
             readable: None,
+            asked_h: 0.0,
+            tick_scheduled: false,
         }
     }
 
@@ -639,6 +671,11 @@ impl OpeningView {
                 }
             }
             "enter" | "return" => self.accept(window, cx),
+            // A long answer scrolls a line at a time (← → are the tones).
+            "up" | "down" => {
+                crate::panel::scroll_answer(&self.panel, if name == "up" { -22.0 } else { 22.0 });
+                cx.notify();
+            }
             "cmd-c" => self.copy(cx),
             "escape" => self.go(false, window, cx),
             "cmd-r" => {
@@ -675,7 +712,10 @@ impl Render for OpeningView {
         let t = self.t();
         let script = self.script();
         let scale = window.scale_factor();
-        let rig = self.feed.at(t, &script, scale, window);
+        let reduce = crate::live_slip::reduce_motion();
+        let quiet = reduce || crate::app::settings().light_mode_active();
+        let working = matches!(self.panel.phase, Phase::Preparing | Phase::Generating(_));
+        let rig = self.feed.at(t, &script, scale, window, working && self.went.is_none(), quiet);
         if self.went.is_none() && opening::unroll(t, &script).0 > 0.0
             && let Some(at) = self.pressed.take()
         {
@@ -694,18 +734,36 @@ impl Render for OpeningView {
             crate::interact::act(move |window, cx| e.update(cx, |v, cx| v.accept(window, cx)))
         };
         let look = crate::panel::Look { scale, icon: &crate::app_icon, pick: Some(&pick_fn), act: Some(act) };
+        self.room(window, cx);
         let anim = self.anim.clone();
         let (panel, paper_h) = (self.panel.clone(), self.paper_h.clone());
-        let body = crate::interact::build(&anim, crate::live_slip::reduce_motion(), window, cx, || opening::scene(t, &script, &panel, &look, paper_h.get(), paper_h.clone(), rig.as_ref()));
+        let body = crate::interact::build(&anim, reduce, window, cx, || opening::scene(t, &script, &panel, &look, paper_h.get(), paper_h.clone(), rig.as_ref()));
 
-        // Keep drawing while anything moves: the flower, the unroll, the waiting dots, the going.
-        let working = matches!(self.panel.phase, Phase::Preparing | Phase::Generating(_));
-        let unrolling = opening::unroll(t, &script).0 < 0.9999 && self.went.is_none();
-        if opening::rig_moving(t, &script) || unrolling || working || self.went.is_some() {
+        // Drive fast transitions (arrival, unroll, bloom, going) at full frame rate. Once the
+        // panel is open and waiting/streaming, never spin at 60 FPS: pace waiting motion to 8 Hz
+        // (matching the riso line boil) on normal machines, or stay event-driven (0 Hz idle) under
+        // Reduce Motion / "Go easy on this Mac / PC" so incoming tokens and height springs still
+        // animate smoothly without starving local inference.
+        let rig_active = opening::rig_active(t, &script);
+        let unrolling = opening::is_unrolling(t, &script);
+        let waiting_still_flower = !rig_active && script.bloom.is_finite()
+            && self.feed.shown.as_ref().is_none_or(|s| s.t < script.bloom + 2.15);
+        let waiting_still_bud = !rig_active && !script.bloom.is_finite() && (quiet || !working)
+            && self.feed.shown.as_ref().is_none_or(|s| s.t < opening::arrival_done(script.full));
+        if rig_active || unrolling || self.went.is_some() || waiting_still_flower || waiting_still_bud {
             window.request_animation_frame();
-        } else if self.feed.shown.as_ref().is_none_or(|s| s.t < script.bloom + 2.15) {
-            // The still flower is on its way.
-            window.request_animation_frame();
+        } else if working && !quiet && !self.tick_scheduled {
+            self.tick_scheduled = true;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(125)).await;
+                let _ = this.update(cx, |v, cx| {
+                    v.tick_scheduled = false;
+                    if matches!(v.panel.phase, Phase::Preparing | Phase::Generating(_)) && v.went.is_none() {
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
         }
         static TRACE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let trace = *TRACE_ENV.get_or_init(|| std::env::var("IRIS_TRACE").is_ok());
@@ -732,6 +790,45 @@ impl Render for OpeningView {
             }))
             .child(div().relative().left(px(self.shift.0)).top(px(self.shift.1)).child(body))
             .child(done)
+    }
+}
+
+impl OpeningView {
+    /// The room this window gives the paper, read from its size now (so the drawing always
+    /// matches the window it's in), and, when the answer is about to outgrow it, a taller window:
+    /// grown towards the paper's open side, as far as the screen allows, once per need. Past the
+    /// screen's edge the paper slides over the box instead (`opening::place`), as Swift's did.
+    fn room(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let b = window.bounds();
+        let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
+        let grown = (h - opening::SCENE.1).max(0.0);
+        let (ox, oy) = crate::window_origin(window).unwrap_or((f32::from(b.origin.x) as f64, f32::from(b.origin.y) as f64));
+        let [_, vy, _, vh] = crate::visible_frame_at(ox + w as f64 / 2.0, oy + h as f64 / 2.0);
+        let (oy, vy, vh) = (oy as f32, vy as f32, vh as f32);
+        let below = opening::below();
+        let sy = self.shift.1;
+        crate::panel::set_max_body(crate::panel::max_body(vh));
+        opening::set_room(opening::Room {
+            above: if below { 0.0 } else { grown },
+            below: if below { grown } else { 0.0 },
+            top: (vy + 8.0).max(oy) - oy - sy,
+            bottom: (vy + vh - 8.0).min(oy + h) - oy - sy,
+        });
+        if self.went.is_some() {
+            return;
+        }
+        let chrome = self.anim.borrow().panel_chrome_h.unwrap_or(crate::panel::CHROME);
+        let paper = chrome + crate::panel::body_height(&self.panel);
+        let Some((up, down)) = opening::more_room(paper, sy, grown) else { return };
+        let up = up.min((oy - vy).max(0.0));
+        let down = down.min((vy + vh - oy - h).max(0.0));
+        let want = h + up + down;
+        if up + down < 1.0 || want <= self.asked_h + 0.5 {
+            return;
+        }
+        self.asked_h = want;
+        news(&format!("panel window grows {up:.0} up, {down:.0} down"));
+        crate::grow_window(window, up as f64, down as f64, cx);
     }
 }
 

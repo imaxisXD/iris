@@ -16,6 +16,10 @@
 //! The brain is never started (`brain::start`): its entity is seeded as a Mac that has finished
 //! setup (the five built-in tones, a model on disk), and each check (`brain::check`) is answered
 //! here after `DELAY`.
+//!
+//! `--mock-pace <ms>`: a slow computer. The answer streams in a word every `<ms>` milliseconds
+//! (`Event::Partial`, as the model's does) before it finishes, and a check that runs out of time
+//! streams half the draft first, so the panel's streaming can be watched and driven.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -57,6 +61,32 @@ thread_local! {
     static APP: RefCell<Option<AsyncApp>> = const { RefCell::new(None) };
 }
 
+/// Time between streamed words, `--mock-pace <ms>`: none streams the answer whole.
+pub fn pace() -> Option<Duration> {
+    static PACE: OnceLock<u64> = OnceLock::new();
+    let ms = *PACE.get_or_init(|| {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter().position(|a| a == "--mock-pace").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+/// `text` as it streams in a word at a time: each prefix ending at the end of a word.
+pub fn word_prefixes(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_word = false;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() && in_word {
+            out.push(text[..i].to_string());
+        }
+        in_word = !c.is_whitespace();
+    }
+    if in_word {
+        out.push(text.to_string());
+    }
+    out
+}
+
 /// Seeds the brain's entity as a set-up Mac's, and keeps a handle for answering later.
 pub fn start(brain: &Entity<Brain>, cx: &mut App) {
     APP.with(|a| *a.borrow_mut() = Some(cx.to_async()));
@@ -72,19 +102,43 @@ pub fn start(brain: &Entity<Brain>, cx: &mut App) {
     });
 }
 
-/// Answers check `id` after `DELAY` (unless it's cancelled first: `brain::deliver` finds no one).
+/// Answers check `id` after `DELAY` (unless it's cancelled first: `brain::deliver` finds no one),
+/// a word at a time at `pace()` when that's set.
 pub fn answer_later(id: i64, text: &str, mode: &Mode) {
     let Some(acx) = APP.with(|a| a.borrow().clone()) else { return };
     let (text, mode) = (text.to_string(), mode.clone());
+    let pace = pace();
     acx.clone().foreground_executor().spawn(async move {
         acx.background_executor().timer(DELAY).await;
-        if let Some(p) = failure(&text) {
-            let _ = acx.update(|cx| brain::deliver(id, Event::Failed(p), cx));
-            return;
-        }
+        let failed = failure(&text);
         let foreign = looks_non_english(&text);
         let (a, changed) = answer(&text, &mode, foreign);
-        let _ = acx.update(|cx| brain::deliver(id, Event::Finished(a, changed), cx));
+        if let Some(pace) = pace {
+            // A check that runs out of time has written some of it first.
+            let streamed = match &failed {
+                Some(p) if p.can_retry => {
+                    let words = word_prefixes(&text);
+                    words[..words.len() / 2].to_vec()
+                }
+                Some(_) => vec![],
+                None => word_prefixes(&a.text),
+            };
+            for partial in streamed {
+                let gone = acx.update(|cx| {
+                    brain::deliver(id, Event::Partial(partial), cx);
+                    !brain::waiting(id)
+                });
+                if gone {
+                    return;
+                }
+                acx.background_executor().timer(pace).await;
+            }
+        }
+        let event = match failed {
+            Some(p) => Event::Failed(p),
+            None => Event::Finished(a, changed),
+        };
+        let _ = acx.update(|cx| brain::deliver(id, event, cx));
     }).detach();
 }
 
@@ -214,7 +268,7 @@ fn english_share(_text: &str) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{REWRITTEN, answer, looks_non_english, tones};
+    use super::{REWRITTEN, answer, looks_non_english, tones, word_prefixes};
     use crate::brain::Mode;
     use crate::model::Verdict;
 
@@ -227,6 +281,13 @@ mod tests {
 
     fn fix() -> Mode {
         Mode::fix()
+    }
+
+    #[test]
+    fn a_slow_answer_streams_a_word_at_a_time() {
+        assert_eq!(word_prefixes("Hey  there,\nlead "), vec!["Hey", "Hey  there,", "Hey  there,\nlead"]);
+        assert!(word_prefixes("   ").is_empty());
+        assert_eq!(word_prefixes(FIXED).last().map(String::as_str), Some(FIXED));
     }
 
     #[test]

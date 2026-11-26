@@ -225,9 +225,10 @@ impl Render for SlipView {
         let began = Instant::now();
         crate::riso::let_go_of_last_frame(window);
         let scale = window.scale_factor();
-        // The garden lives while the slip is up; Reduce Motion holds it still, as Swift's does.
-        let t = if self.reduce_motion { 1000.0 } else { 1000.0 + self.start.elapsed().as_secs_f64() };
-        if !self.reduce_motion {
+        // The garden lives while the slip is up; Reduce Motion and light mode hold it still.
+        let quiet = self.reduce_motion || crate::app::settings().light_mode_active();
+        let t = if quiet { 1000.0 } else { 1000.0 + self.start.elapsed().as_secs_f64() };
+        if !quiet {
             window.request_animation_frame();
         }
         let entity = cx.entity();

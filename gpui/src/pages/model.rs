@@ -94,24 +94,26 @@ struct Look {
     chosen: String,
     offered: Vec<(&'static Choice, bool)>,
     crossing: Option<String>,
+    previewing: Option<String>,
     recommended: String,
 }
 
 impl Look {
     /// As the Swift snapshot finds this Mac: both of Iris's models on disk, Best quality
-    /// chosen. `IRIS_MODEL_STATE=downloading`, `delete-hover`, `earlier` or `not-downloaded`
-    /// draws the others.
+    /// chosen. `IRIS_MODEL_STATE=downloading`, `delete-hover`, `use-hover`, `earlier` or
+    /// `not-downloaded` draws the others.
     fn snapshot() -> Look {
         let both = |a: bool, b: bool| vec![(&CHOICES[0], a), (&CHOICES[1], b)];
-        let (engine, chosen, offered, crossing) = match std::env::var("IRIS_MODEL_STATE").as_deref() {
-            Ok("downloading") => (Engine::Downloading(0.62), "lighter", both(true, false), None),
-            Ok("delete-hover") => (Engine::Ready, "best", both(true, true), Some("lighter".to_string())),
+        let (engine, chosen, offered, crossing, previewing) = match std::env::var("IRIS_MODEL_STATE").as_deref() {
+            Ok("downloading") => (Engine::Downloading(0.62), "lighter", both(true, false), None, None),
+            Ok("delete-hover") => (Engine::Ready, "best", both(true, true), Some("lighter".to_string()), None),
+            Ok("use-hover") => (Engine::Ready, "best", both(true, true), None, Some("lighter".to_string())),
             // Someone who used Iris before the trained models: on Google's model still.
-            Ok("earlier") => (Engine::Ready, "e4b", vec![(&CHOICES[0], false), (&CHOICES[1], false), (&CHOICES[2], true), (&CHOICES[3], true)], None),
-            Ok("not-downloaded") => (Engine::Resting, "lighter", both(true, false), None),
-            _ => (Engine::Resting, "best", both(true, true), None),
+            Ok("earlier") => (Engine::Ready, "e4b", vec![(&CHOICES[0], false), (&CHOICES[1], false), (&CHOICES[2], true), (&CHOICES[3], true)], None, None),
+            Ok("not-downloaded") => (Engine::Resting, "lighter", both(true, false), None, None),
+            _ => (Engine::Resting, "best", both(true, true), None, None),
         };
-        Look { engine, chosen: chosen.into(), offered, crossing, recommended: "best".into() }
+        Look { engine, chosen: chosen.into(), offered, crossing, previewing, recommended: "best".into() }
     }
 
     fn live(l: &Live) -> Look {
@@ -132,7 +134,7 @@ impl Look {
             E::Ready(_) => Engine::Resting,
             E::Failed(f) => Engine::Failed(f.sentence.clone()),
         };
-        Look { engine, chosen: l.chosen.clone(), offered, crossing: l.crossing.clone(), recommended: l.recommended.clone() }
+        Look { engine, chosen: l.chosen.clone(), offered, crossing: l.crossing.clone(), previewing: None, recommended: l.recommended.clone() }
     }
 
     fn on_disk(&self, id: &str) -> bool {
@@ -225,11 +227,20 @@ pub fn content(v: &Values, w: f32, cx: &Ctx) -> Vec<Div> {
         crate::brain::configure(cx);
     });
     let load = crate::controls::toggle(v.load_at_launch, "Load when Iris starts", s, crate::interact::change(|s| s.load_at_launch = !s.load_at_launch));
+    let light_title = crate::words::w("Go easy on this Mac");
+    let light_detail = crate::words::w("Uses less memory and quieter motion, so this Mac stays responsive while Iris writes.");
+    let light = crate::controls::toggle(v.light_mode, light_title, s, crate::interact::act(|window, cx| {
+        crate::app::change(|s| s.light_mode = Some(!s.light_mode_active()));
+        crate::brain::configure(cx);
+        window.refresh();
+    }));
     let memory = column().w(z(w)).gap(z(12.0))
         .child(setting_row("Load when Iris starts", None, load, 50.0, w))
         // `PenRule()` takes the line it's called on as its seed.
         .child(hairline(861, w))
-        .child(setting_row("Free memory after", None, free_after, 132.0, w));
+        .child(setting_row("Free memory after", None, free_after, 132.0, w))
+        .child(hairline(865, w))
+        .child(setting_row(light_title, Some(light_detail), light, 50.0, w));
     out.push(section_wrapped(1, "Which model", Some(crate::words::w("Each runs on this Mac. Download a model here once before using it.")), None, which, w, s));
     out.push(section_wrapped(2, "Memory", None, None, memory, w, s));
     out
@@ -400,18 +411,30 @@ fn model(look: &Look, c: &'static Choice, on_disk: bool, i: usize, big: bool, w:
     let chosen = look.chosen == c.id;
     let first = i == 0;
 
-    // The drawing: the chip (turned, printed whole), its ring if chosen, the red X while Delete
-    // is under the pointer, each fading in on `DS.easeOut`.
+    // The drawing: the chip (turned, printed whole), its ring if chosen (or a soft preview ring
+    // while pointing at "Use this one" or the unchosen drawing), the red X while Delete is under
+    // the pointer, each fading in on `DS.easeOut`.
     let size = if big { if first { 92.0 } else { 74.0 } } else if first { 74.0 } else { 60.0 };
     let (fw, fh) = if big { (130.0, 116.0) } else { (104.0, 88.0) };
     let mut figure = sized(fw, fh)
         .child(at(chip(size as u32, if first { -6.0 } else { 5.0 }, scale), (fw - size) / 2.0, (fh - size) / 2.0));
-    let ring_k = l.track(&format!("model-ring-{}", c.id), chosen as u8 as f32, Curve::FAST);
-    if ring_k > 0.001 {
-        let (rw, rh) = if big { (124.0, 112.0) } else { (98.0, 86.0) };
-        figure = figure.child(crate::settings_kit::faded(ring(13 + i as i64, rw, rh, fw / 2.0, fh / 2.0, scale), ring_k));
-    }
+    let use_id = format!("use-{}", c.id);
+    let card_id = format!("model-card-{}", c.id);
     let crossed = look.crossing.as_deref() == Some(c.id);
+    let previewed = !chosen && !crossed
+        && (look.previewing.as_deref() == Some(c.id) || l.is_hovered(&use_id) || l.is_hovered(&card_id));
+    let ring_k = l.track(&format!("model-ring-{}", c.id), chosen as u8 as f32, Curve::FAST);
+    let preview_k = l.track(&format!("model-preview-{}", c.id), previewed as u8 as f32, Curve::FAST);
+    let (rw, rh) = if big { (124.0, 112.0) } else { (98.0, 86.0) };
+    if ring_k > 0.001 {
+        figure = figure.child(crate::settings_kit::faded(ring(13 + i as i64, rw, rh, fw / 2.0, fh / 2.0, scale), ring_k));
+    } else if preview_k > 0.001 {
+        // Soft preview of the chosen ring while pointing at "Use this one" or the drawing itself,
+        // lighter than the chosen state so hover never reads as already selected.
+        let k = if l.reduce_motion { 1.0 } else { 0.90 + 0.10 * preview_k };
+        let preview = with_zoom(zoom() * k, || ring(13 + i as i64, rw, rh, fw / (2.0 * k), fh / (2.0 * k), scale));
+        figure = figure.child(crate::settings_kit::faded(preview, 0.45 * preview_k));
+    }
     let x_k = l.track(&format!("model-x-{}", c.id), crossed as u8 as f32, Curve::FAST);
     if x_k > 0.001 {
         let (xw, xh) = if first { (132.0, 114.0) } else { (116.0, 100.0) };
@@ -436,11 +459,14 @@ fn model(look: &Look, c: &'static Choice, on_disk: bool, i: usize, big: bool, w:
             window.refresh();
         })
     };
-    let mut option = option.id(gpui::SharedString::from(format!("settings-model-{}", c.id))).role(Role::RadioButton)
+    let mut option = option.relative().id(gpui::SharedString::from(format!("settings-model-{}", c.id))).role(Role::RadioButton)
         .aria_label(format!("{}, {}. {}", c.name, c.size(), crate::words::w(c.line))).aria_selected(chosen);
     if l.view.is_some() {
         let ch = choose.clone();
         option = option.cursor_pointer().on_click(move |_, window, cx| ch(window, cx));
+        if !chosen {
+            option = option.child(live::bounds_marker(&l, &card_id)).on_hover(l.hover_handler(&card_id, None));
+        }
     }
 
     let downloading = matches!(look.engine, Engine::Downloading(_));
@@ -451,8 +477,13 @@ fn model(look: &Look, c: &'static Choice, on_disk: bool, i: usize, big: bool, w:
     }
     let mut buttons = row().gap(z(14.0)).items_center().min_h(z(30.0));
     if !chosen {
-        let b = Button::secondary("Use this one").compact().id(format!("use-{}", c.id)).label(format!("Use {}", c.name.to_lowercase()));
-        buttons = buttons.child(ctl::button(&b, scale, choose).0);
+        let b = Button::secondary("Use this one").compact().id(use_id).label(format!("Use {}", c.name.to_lowercase()));
+        let btn = if look.previewing.as_deref() == Some(c.id) {
+            live::forcing(live::Interaction::HOVER, || ctl::button(&b, scale, choose).0)
+        } else {
+            ctl::button(&b, scale, choose).0
+        };
+        buttons = buttons.child(btn);
     } else if !on_disk && !downloading && !loading {
         let b = Button::primary(format!("Download ({})", c.size())).compact().id(format!("download-{}", c.id))
             .label(format!("Download {} ({})", c.name.to_lowercase(), c.size()));

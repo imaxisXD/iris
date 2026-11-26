@@ -45,6 +45,9 @@ protocol BrainEngine: Sendable {
     /// No model chosen yet: the one the app would start on.
     func chooseStarting(setUpBefore: Bool) async
     func setIdleUnload(minutes: Int) async
+    func setLightMode(_ on: Bool) async
+    /// Multiplier for Rewriter's per-attempt timeouts (higher on CPU-only inference).
+    var timeLimitScale: Double { get }
     func load(_ id: String?, allowDownload: Bool) async throws
     func isNotDownloaded(_ error: Error) -> Bool
     func unload() async
@@ -94,6 +97,10 @@ struct MLXBrainEngine: BrainEngine {
     }
 
     func setIdleUnload(minutes: Int) async { await Engine.shared.setIdleUnload(minutes: minutes) }
+
+    func setLightMode(_ on: Bool) async { await Engine.shared.setLightMode(on) }
+
+    var timeLimitScale: Double { 1.0 }
 
     func load(_ id: String?, allowDownload: Bool) async throws {
         let preferred = await Engine.shared.preferredChoice
@@ -172,6 +179,10 @@ struct LlamaBrainEngine: BrainEngine {
     }
 
     func setIdleUnload(minutes: Int) async { await LlamaEngine.shared.setIdleUnload(minutes: minutes) }
+
+    func setLightMode(_ on: Bool) async { await LlamaEngine.shared.setLightMode(on) }
+
+    var timeLimitScale: Double { 2.0 }
 
     func load(_ id: String?, allowDownload: Bool) async throws {
         let preferred = await LlamaEngine.shared.preferredModel
